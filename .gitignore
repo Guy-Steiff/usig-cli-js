@@ -1,0 +1,138 @@
+# ============================================================
+# USIG CLI JS
+# Git ignore rules
+# ============================================================
+
+
+# ------------------------------------------------------------
+# Node dependencies
+# ------------------------------------------------------------
+
+node_modules/
+.npm/
+.pnpm-store/
+.yarn/
+
+
+# ------------------------------------------------------------
+# Build / generated output
+# ------------------------------------------------------------
+
+dist/
+build/
+out/
+
+*.tsbuildinfo
+
+
+# ------------------------------------------------------------
+# Runtime caches
+# ------------------------------------------------------------
+
+.cache/
+.cache-*/
+.tmp/
+tmp/
+
+*.cache
+
+
+# ------------------------------------------------------------
+# Logs
+# ------------------------------------------------------------
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+*.log
+
+
+# ------------------------------------------------------------
+# Environment / secrets
+# ------------------------------------------------------------
+
+.env
+.env.*
+!.env.example
+
+
+# ------------------------------------------------------------
+# OS / editors
+# ------------------------------------------------------------
+
+.DS_Store
+.idea/
+.vscode/
+
+*.swp
+*.swo
+
+
+# ------------------------------------------------------------
+# USIG generated containers and analysis output
+# ------------------------------------------------------------
+
+# Binary IR containers
+*.bin
+
+# Generated CSV reports
+*_report.csv
+*_output.csv
+
+# Generated figures
+figures/
+plots/
+
+# Debug dumps
+debug/
+artifacts/
+
+
+# ------------------------------------------------------------
+# Regression data
+#
+# Keep fixtures that are intentionally committed.
+# Ignore accidental large captures.
+# ------------------------------------------------------------
+
+*.raw
+*.wave
+*.wfm
+
+# Large oscilloscope captures
+*.h5
+*.hdf5
+
+
+# ------------------------------------------------------------
+# Temporary backups
+#
+# Do NOT accidentally commit historical scratch files.
+# Git history replaces these.
+# ------------------------------------------------------------
+
+*.backup*
+*.bak
+*.old
+
+
+# ------------------------------------------------------------
+# Python future wrapper
+# (future-proofing)
+# ------------------------------------------------------------
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+
+# ------------------------------------------------------------
+# Package manager locks
+#
+# Keep package-lock.json committed.
+# ------------------------------------------------------------
+
+# package-lock.json   <-- intentionally NOT ignored
