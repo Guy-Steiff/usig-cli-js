@@ -1,0 +1,36 @@
+{
+  "name": "image_site",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev --turbopack",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "docs": "node scripts/md-to-ts.js",
+    "test:shio-plugin": "node scripts/test-shio-plugin.mjs",
+    "usig": "node usig.mjs"
+  },
+  "dependencies": {
+    "@vercel/blob": "^2.3.3",
+    "esbuild": "^0.28.0",
+    "exceljs": "^4.4.0",
+    "fft.js": "^4.0.4",
+    "next": "^16.0.8",
+    "react": "^19.2.1",
+    "react-dom": "^19.2.1",
+    "recharts": "^3.8.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.1.11",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "autoprefixer": "^10.4.21",
+    "baseline-browser-mapping": "^2.10.10",
+    "postcss": "^8.5.6",
+    "raw-loader": "^4.0.2",
+    "tailwindcss": "^4.1.11",
+    "typescript": "^5"
+  }
+}
