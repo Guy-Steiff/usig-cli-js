@@ -25,5 +25,5 @@ export {
   deserializeFrame,
   serializeFrameBundle,
   deserializeFrameBundle,
+  unpackSerializedIR,
 } from './serializer';
-

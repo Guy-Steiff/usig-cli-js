@@ -1,24 +1,257 @@
 #!/usr/bin/env node
+/**
+ * usig.mjs
+ *
+ * Unified Signal Investigation Generator (USIG)
+ *
+ * Primary command-line entry point.
+ *
+ * Overview
+ * --------
+ *
+ * usig.mjs orchestrates every high-level workflow supported by the USIG CLI.
+ *
+ * Rather than implementing DSP itself, it coordinates:
+ *
+ *   • input ingestion
+ *   • metadata collection
+ *   • IR construction
+ *   • plugin execution
+ *   • format conversion
+ *   • serialization
+ *   • export
+ *
+ * Individual plugins and mappers remain responsible for domain-specific logic.
+ *
+ *
+ * High-Level Architecture
+ * -----------------------
+ *
+ *                         command line
+ *                              │
+ *                              ▼
+ *                        parse arguments
+ *                              │
+ *                              ▼
+ *                     determine execution mode
+ *                              │
+ *          ┌───────────────────┼────────────────────┐
+ *          │                   │                    │
+ *          ▼                   ▼                    ▼
+ *     plugin execution    format conversion     metadata probe
+ *          │                   │
+ *          ▼                   ▼
+ *       ingest input      ingest input
+ *          │                   │
+ *          └───────────────┬───┘
+ *                          ▼
+ *                    Canonical IR Packet
+ *                          │
+ *          +---------------+---------------+
+ *          |               |               |
+ *          ▼               ▼               ▼
+ *      plugins        serializers     exporters
+ *
+ *
+ * Canonical IR
+ * ------------
+ *
+ * One of the major architectural goals of USIG is that every supported input
+ * format eventually becomes the same internal representation.
+ *
+ * Examples:
+ *
+ *      instrument BIN
+ *      USIG BIN
+ *      CSV
+ *      XLSX
+ *      legacy text
+ *
+ * all become:
+ *
+ *      Canonical IR Packet
+ *
+ * Plugins therefore operate on IR rather than file formats.
+ *
+ *
+ * Conversion Pipeline
+ * -------------------
+ *
+ * The CLI now supports bidirectional conversion between supported container
+ * formats.
+ *
+ * Current supported workflows include combinations of:
+ *
+ *      BIN
+ *      CSV
+ *      XLSX
+ *
+ * Conversion intentionally passes through IR rather than implementing
+ * format-to-format translators.
+ *
+ * Therefore:
+ *
+ *      CSV
+ *        │
+ *        ▼
+ *       IR
+ *        ▼
+ *      XLSX
+ *
+ * rather than:
+ *
+ *      CSV ---> XLSX
+ *
+ * This guarantees that every format shares identical semantics and metadata
+ * handling.
+ *
+ *
+ * Metadata Philosophy
+ * -------------------
+ *
+ * Metadata is accumulated throughout ingestion instead of existing as a single
+ * authoritative source.
+ *
+ * Possible contributors include:
+ *
+ *   • table metadata
+ *   • binary mapper
+ *   • filename inference
+ *   • CLI user overrides
+ *   • plugin-generated metadata
+ *   • processing history
+ *
+ * Metadata provenance is preserved using metadataSources whenever possible.
+ *
+ * User-specified CLI parameters always represent explicit intent and therefore
+ * override inferred values while still preserving provenance.
+ *
+ *
+ * Binary Ingestion
+ * ----------------
+ *
+ * Previous revisions maintained separate ingestion paths for:
+ *
+ *   • instrument-produced binaries
+ *   • USIG-produced binaries
+ *
+ * After extensive testing the hypothesis-based binary mapper demonstrated
+ * compatibility with both classes of files.
+ *
+ * The duplicate ingestion implementations were therefore retired in favor of a
+ * single canonical binary ingestion path.
+ *
+ * Binary ingestion now follows:
+ *
+ *      binary
+ *         │
+ *         ▼
+ *   hypothesis mapper
+ *         │
+ *         ▼
+ *     canonical IR
+ *
+ * If the mapper cannot interpret a binary file, the file is considered outside
+ * the supported interchange format. This is an expected and acceptable outcome;
+ * USIG targets simple and instrument-aligned binary waveform containers rather
+ * than arbitrary proprietary formats.
+ *
+ *
+ * Current CLI Features
+ * --------------------
+ *
+ *   • plugin execution
+ *   • automatic conversion mode
+ *   • metadata probing
+ *   • filename metadata generation
+ *   • metadata embedding into exported containers
+ *   • parameter overrides (-p key=value)
+ *   • multiple plugin execution
+ *   • waveform subrange extraction
+ *
+ *
+ * Current Limitations
+ * -------------------
+ *
+ * The parser currently assumes a single logical input.
+ *
+ * Options such as:
+ *
+ *      --channel-index
+ *      --start-sample
+ *      --end-sample
+ *
+ * are stored globally and therefore apply to only one input.
+ *
+ * The intended future architecture mirrors FFmpeg.
+ *
+ * Example:
+ *
+ *      --channel 0 --start-sample 100 -i left.bin
+ *      --channel 1 --start-sample 250 -i right.bin
+ *
+ * should become:
+ *
+ *      inputs = [
+ *          {
+ *              file: left.bin,
+ *              channelIndex: 0,
+ *              startSample: 100
+ *          },
+ *          {
+ *              file: right.bin,
+ *              channelIndex: 1,
+ *              startSample: 250
+ *          }
+ *      ]
+ *
+ * where each "-i" consumes the currently pending input options.
+ *
+ * This enables future support for:
+ *
+ *   • multi-file analysis
+ *   • synchronized acquisitions
+ *   • channel pairing
+ *   • per-input trimming
+ *   • future merge and comparison plugins
+ *
+ *
+ * Design Philosophy
+ * -----------------
+ *
+ * usig.mjs is intentionally an orchestrator rather than a processing engine.
+ *
+ * New functionality should preferably be introduced by extending:
+ *
+ *   • mappers
+ *   • plugins
+ *   • serializers
+ *   • exporters
+ *
+ * while keeping the CLI responsible primarily for routing data through the
+ * canonical IR pipeline.
+ */
 import fs from 'node:fs/promises';
 import fsRaw from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import readline from 'node:readline';
 import * as esbuild from 'esbuild';
+import { stdin as input, stdout as output } from 'node:process';
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const nodeModulesDir = path.join(scriptDir, 'node_modules');
 
 const SUPPORTED_FORMATS = new Set(['text', 'json', 'csv', 'yaml']);
 
-const USIG_BIN_MAGIC = Buffer.from('USIGIR1\n', 'ascii');
+// const USIG_BIN_MAGIC = Buffer.from('USIGIR1\n', 'ascii');
 
-function isUsigBinaryContainer(buf) {
-  return (
-    buf.length >= 8 &&
-    buf.subarray(0, 8).equals(USIG_BIN_MAGIC)
-  );
-}
+// function isUsigBinaryContainer(buf) {
+//   return (
+//     buf.length >= 8 &&
+//     buf.subarray(0, 8).equals(USIG_BIN_MAGIC)
+//   );
+// }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Argument parsing
@@ -29,16 +262,109 @@ function parseArgs(args) {
   // - repeated flags are accepted
   // - plugin ids can be comma-separated or space-separated after -plugin
   // - a trailing bare token is treated as positional output path
+
+  /*
+ * TODO: Extend CLI parser to support multiple input files and per-input options.
+ *
+ * Current model:
+ *   - The parser assumes exactly one input file (`result.inputFile`).
+ *   - Options such as:
+ *       --channel-index
+ *       --start-sample
+ *       --end-sample
+ *     are stored globally in `result` and therefore apply to only a single input.
+ *
+ * Proposed model (similar to FFmpeg):
+ *
+ *   Introduce:
+ *
+ *     result.inputs = [
+ *       {
+ *         file: "left.wav",
+ *         channelIndex: 0,
+ *         startSample: 100,
+ *         endSample: 500
+ *       },
+ *       {
+ *         file: "right.wav",
+ *         channelIndex: 1,
+ *         startSample: 0,
+ *         endSample: null
+ *       }
+ *     ];
+ *
+ * Parsing strategy:
+ *
+ *   Maintain a temporary "pending input options" object while parsing.
+ *
+ *     let pendingInput = {
+ *       channelIndex: null,
+ *       startSample: null,
+ *       endSample: null,
+ *     };
+ *
+ *   As input-related switches are encountered, populate pendingInput instead
+ *   of writing directly into result.
+ *
+ *   When "-i <file>" is encountered:
+ *
+ *     result.inputs.push({
+ *       file: <file>,
+ *       ...pendingInput
+ *     });
+ *
+ *     pendingInput = defaultPendingInput();
+ *
+ *   Thus each "-i" consumes the currently pending input options, exactly as
+ *   FFmpeg parses command lines.
+ *
+ * Example:
+ *
+ *     mytool \
+ *         --channel 0 --start-sample 100 -i left.wav \
+ *         --channel 1 --start-sample 250 -i right.wav
+ *
+ * becomes:
+ *
+ *     inputs = [
+ *       {
+ *         file: "left.wav",
+ *         channelIndex: 0,
+ *         startSample: 100,
+ *         endSample: null
+ *       },
+ *       {
+ *         file: "right.wav",
+ *         channelIndex: 1,
+ *         startSample: 250,
+ *         endSample: null
+ *       }
+ *     ];
+ *
+ * Backwards compatibility:
+ *
+ *   During migration, continue exposing:
+ *
+ *       result.inputFile = result.inputs[0]?.file ?? null;
+ *
+ *   so existing single-input code continues to function while newer code
+ *   iterates over result.inputs.
+ *
+ * NOTE:
+ *   This is a parser architecture change rather than simply adding support
+ *   for repeated "-i" flags, since input-related options become associated
+ *   with individual inputs rather than being global.
+ */
   const result = {
     inputFile: null,
+    outputFile: null,
     pluginId: null,   // kept for compat; populated from pluginIds[0] after parse
     pluginIds: [],    // all requested plugin ids (supports -plugin smeas,sinl,hsioalpha)
-    outputFile: null, // deprecated positional compatibility
     params: {},
     verbose: false,
     format: 'text',
-    muxFormat: null,
-    demuxFormat: null,
+    // muxFormat: null,
+    // demuxFormat: null,
     inferMetaFromFilename: false,
     metaToFilename: false,
     help: false,
@@ -46,6 +372,7 @@ function parseArgs(args) {
     channelIndex: null,
     startSample: null,
     endSample: null,
+    overwrite: false,
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -86,20 +413,21 @@ function parseArgs(args) {
     } else if ((arg === '--channel-index' || arg === '--channel') && i + 1 < args.length) {
       const idx = Number(args[++i]);
       if (Number.isInteger(idx) && idx >= 0) result.channelIndex = idx;
-    } else if (arg === '--start-sample' && i + 1 < args.length) {
+    } else if ((arg === '--start-sample' || arg === 'ss') && i + 1 < args.length) {
       const idx = Number(args[++i]);
       if (Number.isInteger(idx) && idx >= 0) result.startSample = idx;
-    } else if (arg === '--end-sample' && i + 1 < args.length) {
+    } else if ((arg === '--end-sample' || arg === 'to') && i + 1 < args.length) {
       const idx = Number(args[++i]);
       if (Number.isInteger(idx) && idx >= 0) result.endSample = idx;
     } else if ((arg === '-of' || arg === '--format' || arg === '-print_format') && i + 1 < args.length) {
       result.format = String(args[++i]).toLowerCase();
+    } else if (arg === '-y') {
+      result.overwrite = true;
     } else if (arg === '-v' || arg === 'verbose' || arg === '--verbose') {
       result.verbose = true;
     } else if (arg === '-h' || arg === '--help') {
       result.help = true;
-    } else if (!arg.startsWith('-')) {
-      // Backward compatibility with old positional output path.
+    } else if (!arg.startsWith('-') && result.inputFile && !result.outputFile) {
       result.outputFile = arg;
     }
   }
@@ -228,9 +556,10 @@ async function loadIrEngineModule() {
       bundle: true,
       format: 'esm',
       target: 'es2020',
+      platform: 'node',
       loader: { '.tsx': 'tsx', '.ts': 'ts' },
       outfile: tmpPath,
-      external: ['react', 'react-dom', 'fft.js', 'recharts'],
+      external: ['react', 'react-dom', 'fft.js', 'recharts', 'fs', 'path'],
       sourcemap: false,
       absWorkingDir: scriptDir,
       nodePaths: [nodeModulesDir],
@@ -239,6 +568,111 @@ async function loadIrEngineModule() {
     return await import(pathToFileURL(tmpPath).href + `?t=${Date.now()}`);
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+}
+
+async function loadBinMapperModule() {
+  const tmpDir = path.join(scriptDir, `.tmp_usig_bin_mapper_${Date.now()}`);
+  const tmpPath = path.join(tmpDir, 'bin-mapper.mjs');
+
+  await fs.mkdir(tmpDir, { recursive: true });
+
+  try {
+    await esbuild.build({
+      entryPoints: [
+        path.join(scriptDir, 'app/lib/ir/binMapper.ts')
+      ],
+      bundle: true,
+      // IMPORTANT:
+      // mapper depends on Node APIs through hypothesis_gen_for_ir_from_bin.js
+      platform: 'node',
+      format: 'cjs',
+      target: 'node20',
+      loader: {
+        '.ts': 'ts',
+      },
+      outfile: tmpPath.replace('.mjs', '.cjs'),
+      sourcemap: false,
+      absWorkingDir: scriptDir,
+      nodePaths: [nodeModulesDir],
+      external: ['fs', 'path'],
+    });
+
+    const mod = await import(
+        pathToFileURL(tmpPath.replace('.mjs', '.cjs')).href +`?t=${Date.now()}`);
+    return mod;
+
+  } finally {
+    await fs.rm(tmpDir, {
+      recursive: true,
+      force: true,
+    });
+  }
+}
+
+async function loadCsvXlsxMapperModule() {
+  const tmpDir = path.join(
+    scriptDir,
+    `.tmp_usig_csvxlsx_mapper_${Date.now()}`
+  );
+
+  const tmpPath = path.join(
+    tmpDir,
+    'csvxlsx-mapper.mjs'
+  );
+
+  await fs.mkdir(tmpDir, {
+    recursive: true,
+  });
+
+  try {
+    await esbuild.build({
+      entryPoints: [
+        path.join(
+          scriptDir,
+          'app/lib/ir/csvxlsxMapper.ts'
+        )
+      ],
+
+      bundle: true,
+
+      platform: 'node',
+
+      format: 'esm',
+
+      target: 'node20',
+
+      loader: {
+        '.ts': 'ts',
+      },
+
+      outfile: tmpPath,
+
+      sourcemap: false,
+
+      absWorkingDir: scriptDir,
+
+      nodePaths: [
+        nodeModulesDir
+      ],
+
+      external: [
+        'fs',
+        'path',
+        'exceljs'
+      ],
+    });
+
+    return await import(
+      pathToFileURL(tmpPath).href +
+      `?t=${Date.now()}`
+    );
+
+  } finally {
+    await fs.rm(tmpDir, {
+      recursive: true,
+      force: true,
+    });
   }
 }
 
@@ -439,6 +873,16 @@ function extractStrictInferenceTokens(filename) {
 
   return out;
 }
+
+// async function askConfirmation(message) {
+//   const rl = readline.createInterface({ input, output });
+//
+//   const answer = await rl.question(message);
+//
+//   rl.close();
+//
+//   return answer;
+// }
 
 function slugifyToken(value) {
   return String(value ?? '')
@@ -766,33 +1210,6 @@ function packSerializedIR(meta, waveform) {
   return Buffer.concat([magic, lenBuf, metaBuf, Buffer.from(waveform)]);
 }
 
-function unpackSerializedIR(buf) {
-  const magic = Buffer.from('USIGIR1\n', 'ascii');
-
-  if (buf.length < 12 || !buf.subarray(0, 8).equals(magic)) {
-    throw new Error('Not a supported usig IR binary container (missing USIGIR1 header).');
-  }
-
-  const metaLen = buf.readUInt32LE(8);
-  const metaStart = 12;
-  const metaEnd = metaStart + metaLen;
-
-  if (metaEnd > buf.length) {
-    throw new Error('Corrupt usig IR container: metadata length is out of range.');
-  }
-
-  const meta = buf.subarray(metaStart, metaEnd).toString('utf8');
-  const waveBytes = buf.subarray(metaEnd);
-
-  return {
-    meta,
-    waveBytes: waveBytes.buffer.slice(
-      waveBytes.byteOffset,
-      waveBytes.byteOffset + waveBytes.byteLength
-    )
-  };
-}
-
 function inferMetadataFromFilename(inputFileName, capturedVars = {}) {
   const inferred = {};
 
@@ -914,26 +1331,6 @@ async function probeXlsxColumnsStream(inputFile) {
   return { headers, ...summarizeUniqueSets(headers, uniqueSets) };
 }
 
-async function readSerializedIRMetadata(inputFile) {
-  const handle = await fs.open(inputFile, 'r');
-  try {
-    const head = Buffer.alloc(12);
-    const headRead = await handle.read(head, 0, head.length, 0);
-    if (headRead.bytesRead < 12) return null;
-    if (head.subarray(0, 8).toString('ascii') !== 'USIGIR1\n') return null;
-    const metaLen = head.readUInt32LE(8);
-    if (!Number.isFinite(metaLen) || metaLen <= 0 || metaLen > 16 * 1024 * 1024) return null;
-    const metaBuf = Buffer.alloc(metaLen);
-    const metaRead = await handle.read(metaBuf, 0, metaLen, 12);
-    if (metaRead.bytesRead !== metaLen) return null;
-    const parsed = JSON.parse(metaBuf.toString('utf8'));
-    console.log('readUsigContainerMetadata parsed keys:', Object.keys(parsed));
-    console.log('readUsigContainerMetadata metadata:', parsed.metadata);
-    return parsed?.metadata ?? parsed?.packet?.metadata ?? null;
-  } finally {
-    await handle.close();
-  }
-}
 
 function toArrayBuffer(buf, bytesRead = buf.length) {
   return buf.buffer.slice(buf.byteOffset, buf.byteOffset + bytesRead);
@@ -984,7 +1381,7 @@ async function runProbeMetadataMode({
   // Probe with minimal reads: stream tabular files, parse BIN headers first.
   if (ext === '.bin') {
     try {
-      const usigMeta = await readSerializedIRMetadata(inputFile);
+      const usigMeta = await deserializeFrame(inputFile);
       irMetadata = usigMeta ?? await readExternalBinMetadata(inputFile, inputFileName);
     } catch (err) {
       ingestError = String(err?.message ?? err);
@@ -1133,32 +1530,60 @@ async function exportIRFrame({
   metaToFilename,
   verbose,
 }) {
-  const wf = frame.packet.waveform;
+  const packet = frame.packet;
+  console.log('[exportIRFrame debug]', {
+  hasPacket: !!packet,
+  waveformType: packet?.waveform?.constructor?.name,
+  waveformLength: packet?.waveform?.length,
+  channels: packet?.channels?.length,
+  metadata: packet?.metadata,
+  });
+  const channels =
+      packet.channels ??
+      packet.arrays ??
+      null;
+  const wf =
+      packet.waveform ??
+      channels?.[0]?.waveform;
 
-  const metadata = frame.packet.metadata ?? {};
+  const metadata = packet.metadata ?? {};
 
-  const metadataKeys = Object.keys(metadata)
-    .filter(k =>
+  const metadataKeys = Object.keys(metadata).filter(k =>
       typeof metadata[k] !== 'object' &&
       metadata[k] !== undefined &&
       metadata[k] !== null
-    );
+  );
 
-  const rows = [];
+const rows = [];
+
+if (channels && channels.length > 0) {
 
   rows.push([
-    'index',
-    'value',
+    ...channels.map(ch => ch.label),
     ...metadataKeys
   ]);
 
-  for (let i = 0; i < wf.length; i++) {
+  const length = Math.max(
+    ...channels.map(ch => ch.waveform.length)
+  );
+
+  for (let i = 0; i < length; i++) {
     rows.push([
-      i,
-      wf[i],
+      ...channels.map(ch => ch.waveform[i] ?? ''),
       ...metadataKeys.map(k => metadata[k])
     ]);
   }
+} else {
+  rows.push([
+      ...metadataKeys
+  ]);
+  for (let i = 0; i < wf.length; i++) {
+    rows.push([
+        wf[i],
+      ...metadataKeys.map(k => metadata[k])
+    ]);
+  }
+}
 
   let outPath = outputFile;
 
@@ -1226,15 +1651,16 @@ async function exportIRFrame({
 }
 
 async function runConversionMode({
-  inputFile,
-  outputFile,
-  outputFormat,
-  params,
-  inferMetaFromFilename,
-  metaToFilename,
-  verbose,
-  startSample,
-  endSample,
+                                   inputFile,
+                                   outputFile,
+                                   outputFormat,
+                                   params,
+                                   inferMetaFromFilename,
+                                   metaToFilename,
+                                   verbose,
+                                   startSample,
+                                   endSample,
+                                   overwrite
 }) {
   const inputExt = path.extname(inputFile).toLowerCase();
   const outputExt = path.extname(outputFile).toLowerCase();
@@ -1259,12 +1685,13 @@ async function runConversionMode({
   const {
   frame,
   inputFileName,
-} = await ingestInputToIR({
-  irMod,
-  inputFile,
-  startSample,
-  endSample,
-});
+  } = await ingestInputToIR({
+    irMod,
+    inputFile,
+    startSample,
+    endSample,
+    params,
+  });
 
 const mergedMetadata = buildConversionMetadata({
   frame,
@@ -1280,6 +1707,17 @@ const frameForExport = {
     metadata: mergedMetadata,
   },
 };
+
+if (!overwrite) {
+  try {
+    await fs.access(outputFile);
+    throw new Error(
+      `Output exists: ${outputFile}. Use -y to overwrite.`
+    );
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+  }
+}
 
 await exportIRFrame({
   irMod,
@@ -1302,7 +1740,7 @@ function resolvePluginId(pluginId, verbose) {
   return pluginId;
 }
 
-function inferConversionModeFromOutput(inputFile, outputFile) {
+function inferConversionModeFromOutput(outputFile) {
   if (!outputFile) return {};
 
   const ext = path.extname(outputFile)
@@ -1318,99 +1756,100 @@ function inferConversionModeFromOutput(inputFile, outputFile) {
   };
 }
 
-function ingestRawBinaryBuffer(
-  buffer,
-  inputFileName,
-  hints = {}
-) {
-  const bytesPerSample =
-    Number(hints.bytesPerSample ?? 2);
+// function ingestRawBinaryBuffer(
+//   buffer,
+//   inputFileName,
+//   hints = {}
+// ) {
+//   const bytesPerSample =
+//     Number(hints.bytesPerSample ?? 2);
+//
+//   const encoding =
+//     hints.encoding ?? 'int16';
+//
+//   let waveform;
+//
+//   if (
+//     encoding === 'int16' &&
+//     bytesPerSample === 2
+//   ) {
+//     waveform = new Int16Array(
+//       buffer.buffer,
+//       buffer.byteOffset,
+//       Math.floor(buffer.byteLength / 2)
+//     );
+//   }
+//   else if (
+//     encoding === 'float32' &&
+//     bytesPerSample === 4
+//   ) {
+//     waveform = new Float32Array(
+//       buffer.buffer,
+//       buffer.byteOffset,
+//       Math.floor(buffer.byteLength / 4)
+//     );
+//   }
+//   else {
+//     throw new Error(
+//       `Unsupported raw binary encoding: ${encoding}`
+//     );
+//   }
+//
+//
+//   return {
+//     frame: {
+//       packet: {
+//         waveform,
+//         metadata: {
+//           sourceFormat: 'raw-bin',
+//
+//           encoding,
+//           bytesPerSample,
+//
+//           endian:
+//             hints.endian ?? 'little',
+//
+//           numSamples:
+//             waveform.length,
+//
+//           numWaveforms:
+//             Number(hints.channels ?? 1),
+//
+//           sampleRateHz:
+//             hints.sampleRateHz ?? null,
+//
+//           metadataSources: {
+//             bin: true
+//           }
+//         }
+//       },
+//
+//       capturedVars:{}
+//     },
+//
+//     inputFileName
+//   };
+// }
 
-  const encoding =
-    hints.encoding ?? 'int16';
-
-  let waveform;
-
-  if (
-    encoding === 'int16' &&
-    bytesPerSample === 2
-  ) {
-    waveform = new Int16Array(
-      buffer.buffer,
-      buffer.byteOffset,
-      Math.floor(buffer.byteLength / 2)
-    );
-  }
-  else if (
-    encoding === 'float32' &&
-    bytesPerSample === 4
-  ) {
-    waveform = new Float32Array(
-      buffer.buffer,
-      buffer.byteOffset,
-      Math.floor(buffer.byteLength / 4)
-    );
-  }
-  else {
-    throw new Error(
-      `Unsupported raw binary encoding: ${encoding}`
-    );
-  }
-
-
-  return {
-    frame: {
-      packet: {
-        waveform,
-        metadata: {
-          sourceFormat: 'raw-bin',
-
-          encoding,
-          bytesPerSample,
-
-          endian:
-            hints.endian ?? 'little',
-
-          numSamples:
-            waveform.length,
-
-          numWaveforms:
-            Number(hints.channels ?? 1),
-
-          sampleRateHz:
-            hints.sampleRateHz ?? null,
-
-          metadataSources: {
-            bin: true
-          }
-        }
-      },
-
-      capturedVars:{}
-    },
-
-    inputFileName
+async function ingestInputToIR({ irMod,
+                                 inputFile,
+                                 startSample,
+                                 endSample,
+                                 params,
+                               }) {
+  const hints = {
+    ...(params ?? {}),
   };
-}
-
-async function ingestInputToIR({
-  irMod,
-  inputFile,
-  startSample,
-  endSample,
-}) {
+  console.log('[debug ingestInputToIR params]', params);
   const IREngine = irMod?.IREngine;
-
   if (!IREngine) {
     throw new Error(
-      'IREngine export missing in app/lib/ir/index.ts bundle.'
+        'IREngine export missing in app/lib/ir/index.ts bundle.'
     );
   }
 
   const raw = await fs.readFile(inputFile);
   const inputFileName = path.basename(inputFile);
-
-  const hints = {};
 
   if (Number.isInteger(startSample))
     hints.startSample = startSample;
@@ -1421,37 +1860,61 @@ async function ingestInputToIR({
   const ext = path.extname(inputFile).toLowerCase();
 
   if (ext === '.bin') {
-
-    if (isUsigBinaryContainer(raw)) {
-      const {
-        meta,
-        waveBytes
-      } = unpackSerializedIR(raw);
-
-      const metadata = JSON.parse(meta);
-
-      console.log(JSON.parse(meta));
-      console.log("bytes:", waveBytes.byteLength);
-
-      return {
-        frame: {
-          packet: {
-            waveform: deserializeWaveform(waveBytes, metadata),
-            metadata
-          },
-          capturedVars: {}
-        },
-        inputFileName
-      };
-    }
-
-    return ingestRawBinaryBuffer(
-      raw,
-      inputFileName,
+    const mapperMod = await loadBinMapperModule();
+    console.log('[debug] bin mapper exports:', Object.keys(mapperMod));
+    console.log('[debug] bin mapper module:', mapperMod);
+    const packet = await mapperMod.mapBinaryToIRCandidate({
+      inputPath: inputFile,
+      filename: inputFileName,
       hints
-    );
+    });
+    console.log('[debug] mapped packet keys:', Object.keys(packet));
+    return {
+      frame: {
+        ...packet,
+        headers: [],
+        singleValueColumns: {},
+        cacheKey: null,
+        hintsKey: null,
+        ingestedAt: Date.now(),
+        schemaVersion: 1,
+      },
+      inputFileName,
+    };
   }
 
+  if (ext === '.csv' || ext === '.xlsx') {
+    const mapperMod = await loadCsvXlsxMapperModule();
+
+    const packet = await mapperMod.mapCsvXlsxToIRCandidate({
+        inputPath: inputFile,
+        filename: inputFileName,
+        hints,
+    });
+
+    console.log(packet.packet.channels);
+    console.log(packet.packet.metadata);
+
+    console.log(
+        '[debug] mapped table packet keys:',
+        Object.keys(packet)
+    );
+
+    return {
+        frame: {
+            ...packet,
+            headers: [],
+            singleValueColumns: {},
+            cacheKey: null,
+            hintsKey: null,
+            ingestedAt: Date.now(),
+            schemaVersion: 1,
+        },
+        inputFileName,
+    };
+}
+
+  // TXT and other legacy formats
   const file = new File(
     [raw],
     inputFileName,
@@ -1531,31 +1994,31 @@ function buildConversionMetadata({
   };
 }
 
-function deserializeWaveform(buffer, metadata = {}) {
-  const encoding =
-    metadata.waveformEncoding ??
-    metadata.waveformType ??
-    metadata.encoding;
-
-  switch (String(encoding).toLowerCase()) {
-    case 'int16array':
-    case 'int16':
-      return new Int16Array(buffer);
-
-    case 'float32array':
-    case 'float32':
-      return new Float32Array(buffer);
-
-    case 'float64array':
-    case 'float64':
-      return new Float64Array(buffer);
-
-    default:
-      throw new Error(
-        `Unknown waveform encoding in USIG container: ${encoding}`
-      );
-  }
-}
+// function deserializeWaveform(buffer, metadata = {}) {
+//   const encoding =
+//     metadata.waveformEncoding ??
+//     metadata.waveformType ??
+//     metadata.encoding;
+//
+//   switch (String(encoding).toLowerCase()) {
+//     case 'int16array':
+//     case 'int16':
+//       return new Int16Array(buffer);
+//
+//     case 'float32array':
+//     case 'float32':
+//       return new Float32Array(buffer);
+//
+//     case 'float64array':
+//     case 'float64':
+//       return new Float64Array(buffer);
+//
+//     default:
+//       throw new Error(
+//         `Unknown waveform encoding in USIG container: ${encoding}`
+//       );
+//   }
+// }
 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1563,15 +2026,16 @@ function deserializeWaveform(buffer, metadata = {}) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function main() {
-  const args = process.argv.slice(2);
+  const args = process.argv.slice(2); // split by space starting from index 2, first two are node path
+  // process.argv[0] → the Node executable path
+  // process.argv[1] → the script path
+  // similar to python's [2:] notion
   const {
     inputFile,
     pluginId,
     pluginIds,
     outputFile,
     params,
-    muxFormat,
-    demuxFormat,
     inferMetaFromFilename,
     metaToFilename,
     verbose,
@@ -1580,20 +2044,21 @@ async function main() {
     probeMetadata,
     startSample,
     endSample,
+    overwrite,
   } = parseArgs(args);
 
   // console.log(inferConversionModeFromOutput.toString());
 
-  const inferredConversion =
-    inferConversionModeFromOutput(
-      inputFile,
-      outputFile
-    );
+  const inferredConversion = inferConversionModeFromOutput(outputFile);
 
-  const effectiveConversionFormat =
-    muxFormat ??
-    demuxFormat ??
-    inferredConversion.format;
+  const effectiveConversionFormat = inferredConversion.format;
+
+  console.error('[conversion debug]', {
+  argv: process.argv,
+  outputFile,
+  inferredConversion,
+  effectiveConversionFormat,
+});
 
 
   if (help || args.length === 0) {
@@ -1621,6 +2086,7 @@ async function main() {
     verbose,
     startSample,
     endSample,
+    overwrite
   });
   return;
 }
@@ -1753,6 +2219,16 @@ async function main() {
   // ffprobe-style default: stdout. Keep deprecated positional output for compatibility.
   if (outputFile) {
     if (verbose) console.log('[usig] writing output:', outputFile);
+
+  if (fs.existsSync(outputFile) && !args.overwrite) {
+      const answer = await askConfirmation(
+        `File exists: ${outputFile}. Overwrite? (y/N) `
+      );
+
+      if (answer.toLowerCase() !== 'y') {
+        throw new Error('Output file exists; operation cancelled');
+      }
+    }
     await fs.writeFile(outputFile, report, 'utf8');
     console.log(`[usig] wrote result to ${outputFile}`);
   } else {

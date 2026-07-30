@@ -136,3 +136,4 @@ venv/
 # ------------------------------------------------------------
 
 # package-lock.json   <-- intentionally NOT ignored
+.aider*

@@ -86,3 +86,33 @@ export function deserializeFrameBundle(
   }
   return metas.map((meta, i) => deserializeFrame(meta, waveforms[i]));
 }
+
+export function unpackSerializedIR(buf: Buffer) {
+  const magic = Buffer.from('USIGIR1\n', 'ascii');
+
+  if (buf.length < 12 || !buf.subarray(0, 8).equals(magic)) {
+    throw new Error('Not a USIG IR binary container.');
+  }
+
+  const metaLen = buf.readUInt32LE(8);
+
+  const metaStart = 12;
+  const metaEnd = metaStart + metaLen;
+
+  if (metaEnd > buf.length) {
+    throw new Error('Corrupt USIG IR container.');
+  }
+
+  const waveformBuffer = Buffer.from(
+  buf.subarray(metaEnd)
+);
+
+  return {
+    meta: buf.subarray(metaStart, metaEnd).toString('utf8'),
+
+    waveform: waveformBuffer.buffer.slice(
+      waveformBuffer.byteOffset,
+      waveformBuffer.byteOffset + waveformBuffer.byteLength
+    ) as ArrayBuffer,
+  };
+}

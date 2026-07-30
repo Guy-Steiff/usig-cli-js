@@ -54,6 +54,7 @@ import { ingestFile, ingestAllColumns } from '../ingest';
 import type { IngestHints, IngestColumnsResult } from '../ingest/ingest';
 import type { SignalFrame, IRManifestEntry } from './types';
 import { IRCache, fileFingerprint, hintsKey as makeHintsKey } from './cache';
+import { ingestMappedBinary } from './binMapper';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Stats
