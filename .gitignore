@@ -89,6 +89,14 @@ plots/
 debug/
 artifacts/
 
+# ------------------------------------------------------------
+# Test execution results
+#
+# Generated regression outputs.
+# Golden datasets remain committed.
+# ------------------------------------------------------------
+
+test/results/
 
 # ------------------------------------------------------------
 # Regression data

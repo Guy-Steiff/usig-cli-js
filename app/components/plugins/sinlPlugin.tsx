@@ -88,6 +88,22 @@ export interface SinlParams {
   maxCode: number;
 }
 
+export interface SinlInference {
+  adcBits?: number;
+  minCode?: number;
+  maxCode?: number;
+  inputMode?: 'codes' | 'voltage';
+
+  sampleColumn?: string;
+
+  source: {
+    adcBits?: 'metadata' | 'filename' | 'default';
+    minCode?: 'metadata' | 'filename' | 'default';
+    maxCode?: 'metadata' | 'filename' | 'default';
+    inputMode?: 'metadata' | 'filename' | 'default';
+  };
+}
+
 // ─── Helpers (numpy equivalents) ──────────────────────────────────────────────
 
 /** Build integer histogram over bins [0, 1, …, numBins-1].
@@ -383,6 +399,10 @@ function runInlTool(
 }
 
 // ─── Plugin Helpers ──────────────────────────────────────────────────────────
+
+function normalizeKey(v: string): string {
+  return v.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
 
 /** Derive adcRes from the full-scale code range */
 function deriveAdcRes(minCode: number, maxCode: number): number {
