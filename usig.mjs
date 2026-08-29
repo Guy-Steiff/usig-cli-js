@@ -237,21 +237,11 @@ import path from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import readline from 'node:readline';
 import * as esbuild from 'esbuild';
-import { stdin as input, stdout as output } from 'node:process';
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const nodeModulesDir = path.join(scriptDir, 'node_modules');
 
 const SUPPORTED_FORMATS = new Set(['text', 'json', 'csv', 'yaml']);
-
-// const USIG_BIN_MAGIC = Buffer.from('USIGIR1\n', 'ascii');
-
-// function isUsigBinaryContainer(buf) {
-//   return (
-//     buf.length >= 8 &&
-//     buf.subarray(0, 8).equals(USIG_BIN_MAGIC)
-//   );
-// }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Argument parsing
@@ -761,6 +751,7 @@ function applyRegexToString(str, pattern, replacements) {
 }
 
 function applyRegexToFilename(filename, pattern, replacements) {
+
   if (!pattern?.trim()) return '';
   // Strict mode: only infer from compact underscore-delimited tokens.
   for (const token of extractStrictInferenceTokens(filename)) {
@@ -874,16 +865,6 @@ function extractStrictInferenceTokens(filename) {
   return out;
 }
 
-// async function askConfirmation(message) {
-//   const rl = readline.createInterface({ input, output });
-//
-//   const answer = await rl.question(message);
-//
-//   rl.close();
-//
-//   return answer;
-// }
-
 function slugifyToken(value) {
   return String(value ?? '')
     .trim()
@@ -968,8 +949,12 @@ function buildProposedFileName(inputSummary) {
     const token = normalizeValueToken(row.value);
     if (!token) continue;
     const keyInfo = fileNameParamKey(row.key);
-    // If name is empty the value is emitted bare (e.g. signalType → 'prbs2')
-    parts.push(`${keyInfo.name}${token}${keyInfo.unit}`);
+    if (typeof row.value === 'number') {
+      parts.push(`${keyInfo.name}${token}${keyInfo.unit}`);
+    }
+    else if (typeof row.value === 'string') {
+      parts.push(`${keyInfo.name}~${token}`);
+    }
   }
   return parts.filter(Boolean).join('_');
 }
@@ -983,10 +968,7 @@ function describeSource(key, detail) {
   return `${key}: ${detail.value}`;
 }
 
-// function inferFsGhzFromFilename(filename) {
-//   void filename;
-//   return '';
-// }
+
 function inferStrictMetadataFromFilename(filename) {
   const inferred = {};
 
@@ -1043,63 +1025,327 @@ function collectDisplayFields(plugin) {
   return deduped;
 }
 
-function resolveFieldValue(field, explicitParams, fileName, headers, derivedHints = {}) {
-  const hasOverride = Object.prototype.hasOwnProperty.call(explicitParams, field.key);
-  if (hasOverride) {
-    return { value: explicitParams[field.key], source: 'override' };
+function fieldMatchesFilenameToken(field, token) {
+  if (!field?.key || !token?.key) return false;
+
+  const fieldKey = normalizeMetadataKey(field.key);
+  if (!fieldKey) return false;
+
+  const candidates = buildFilenameTokenCandidates(token);
+
+  // Direct match:
+  //
+  // filename: fs2p25ghz
+  // token:    fs + 2.25 + ghz
+  // field:    fsGhz
+  //
+  // => fsg hz == fsghz
+  if (candidates.has(fieldKey)) {
+    return true;
   }
 
-  if (field.type === 'column-select') {
-    // Prefer defaultValue when it names a column that actually exists in the file.
-    // This ensures plugins with named signal columns (e.g. voltage_v) land on the
-    // right column even when it isn't the first one.
-    if (field.defaultValue && headers?.includes(field.defaultValue)) {
-      return { value: field.defaultValue, source: 'column' };
+  // Also allow a field key to carry a unit suffix while the filename
+  // token supplies that unit separately.
+  //
+  // This remains generic: no knowledge of "fs", "ghz", "v", etc.
+  if (token.unit) {
+    const unit = normalizeMetadataKey(token.unit);
+
+    if (
+      fieldKey.endsWith(unit) &&
+      fieldKey.slice(0, -unit.length) ===
+        normalizeMetadataKey(token.key)
+    ) {
+      return true;
     }
-    const chosen = headers?.[0] ?? field.defaultValue ?? '';
-    if (chosen !== '') return { value: chosen, source: headers?.[0] ? 'column' : 'default' };
-    return { value: '', source: 'default' };
   }
 
-  const compactInferred = '';
-  if (compactInferred !== '') {
-    return { value: compactInferred, source: 'filename' };
+  return false;
+}
+
+function resolveFilenameTokenForField(field, filename) {
+  const tokens = extractStrictInferenceTokens(filename);
+
+  for (const token of tokens) {
+    if (!fieldMatchesFilenameToken(field, token)) continue;
+
+    let value;
+
+    if (token.value !== undefined && token.value !== '') {
+      value = token.value;
+    } else {
+      continue;
+    }
+
+    let normalized = String(value);
+
+    if (/^m\d/i.test(normalized)) {
+      normalized = `-${normalized.slice(1)}`;
+    } else if (/^p\d/i.test(normalized)) {
+      normalized = normalized.slice(1);
+    }
+
+    normalized = normalized.replace(/p(?=\d)/gi, '.');
+
+    const numeric = Number(normalized);
+
+    if (Number.isFinite(numeric)) {
+      return {
+        value: numeric,
+        source: 'filename',
+        token: token.token,
+        unit: token.unit ?? '',
+      };
+    }
+
+    return {
+      value,
+      source: 'filename',
+      token: token.token,
+      unit: token.unit ?? '',
+    };
   }
 
-  const fromFilename = applyRegexToFilename(fileName, field.defaultRegex, field.defaultReplace);
-  if (fromFilename) {
-    return { value: field.transform ? field.transform(fromFilename) : fromFilename, source: 'filename' };
+  return null;
+}
+
+function resolveFieldValue(
+  field,
+  explicitParams,
+  fileName,
+  headers,
+  derivedHints = {},
+  pluginDefaultParams = {}
+) {
+  const hasOverride =
+    Object.prototype.hasOwnProperty.call(
+      explicitParams,
+      field.key
+    );
+
+  // 1. Explicit -p always wins.
+  if (hasOverride) {
+    return {
+      value: explicitParams[field.key],
+      source: 'override',
+    };
   }
 
-  if (Object.prototype.hasOwnProperty.call(derivedHints, field.key)) {
+  // 2. Column selector.
+  if (field.type === 'column-select') {
+    if (
+      field.defaultValue &&
+      headers?.includes(field.defaultValue)
+    ) {
+      return {
+        value: field.defaultValue,
+        source: 'column',
+      };
+    }
+
+    const chosen =
+      headers?.[0] ??
+      field.defaultValue ??
+      '';
+
+    if (chosen !== '') {
+      return {
+        value: chosen,
+        source:
+          headers?.[0]
+            ? 'column'
+            : 'default',
+      };
+    }
+
+    return {
+      value: '',
+      source: 'default',
+    };
+  }
+
+  // 3. Generic filename inference.
+  const filenameInferred =
+    resolveFilenameTokenForField(
+      field,
+      fileName
+    );
+
+  if (filenameInferred) {
+    return {
+      ...filenameInferred,
+      value: coerceFieldValue(
+        field,
+        filenameInferred.value
+      ),
+    };
+  }
+
+  // 4. Legacy field-specific filename regex.
+  const filenamePattern =
+    field.defaultPattern ??
+    pluginDefaultParams?.[
+      `${field.key}Regex`
+    ] ??
+    '';
+
+  const filenameReplacements =
+    field.defaultReplacements ??
+    pluginDefaultParams?.[
+      `${field.key}Replace`
+    ] ??
+    '';
+
+  if (filenamePattern?.trim()) {
+    const fromFilename =
+      applyRegexToFilename(
+        fileName,
+        filenamePattern,
+        filenameReplacements
+      );
+
+    if (fromFilename) {
+      const transformed =
+        field.transform
+          ? field.transform(fromFilename)
+          : fromFilename;
+
+      return {
+        value: transformed,
+        source: 'filename',
+      };
+    }
+  }
+
+  // 5. Derived IR metadata.
+  if (
+    Object.prototype.hasOwnProperty.call(
+      derivedHints,
+      field.key
+    )
+  ) {
     return derivedHints[field.key];
   }
 
-  if (field.defaultValue !== undefined) {
-    return { value: field.defaultValue, source: 'default' };
+  // 6. Plugin default.
+  if (
+    field.defaultValue !== undefined
+  ) {
+    return {
+      value: field.defaultValue,
+      source: 'default',
+    };
   }
 
-  return { value: '', source: 'default' };
+  return {
+    value: '',
+    source: 'default',
+  };
 }
 
-function buildInputSummary(plugin, finalParams, explicitParams, fileName, headers, derivedHints = {}) {
-  const fields = collectDisplayFields(plugin);
-  const fieldMap = new Map(fields.map(field => [field.key, field]));
+function buildInputSummary(
+  plugin,
+  finalParams,
+  explicitParams,
+  inputFileName,
+  headers,
+  derivedHints,
+  strictFilenameInference,
+  verbose
+) {
+  if (verbose) console.error(
+    '[DEBUG buildInputSummary entry]',
+    {
+      inputFileName,
+      pluginDefaultParams:
+        plugin?.defaultParams,
+      explicitParams,
+      strictFilenameInference,
+    }
+  );
+
+  const fields =
+    collectDisplayFields(plugin);
+
+  const fieldMap =
+    new Map(
+      fields.map(field => [
+        field.key,
+        field
+      ])
+    );
+
   const summary = [];
 
   for (const field of fields) {
-    const resolved = resolveFieldValue(field, explicitParams, fileName, headers, derivedHints);
-    const value = resolved.value === '' ? finalParams[field.key] ?? '' : resolved.value;
-    if (value === '' || value === undefined) continue;
-    summary.push({ key: field.key, value, source: resolved.source });
+    const resolved =
+      resolveFieldValue(
+        field,
+        explicitParams,
+        inputFileName,
+        headers,
+        derivedHints,
+        plugin?.defaultParams ?? {}
+      );
+
+    const value =
+      resolved.value === ''
+        ? finalParams[field.key] ?? ''
+        : resolved.value;
+
+    if (
+      value === '' ||
+      value === undefined
+    ) {
+      continue;
+    }
+
+    summary.push({
+      key: field.key,
+      value,
+      source: resolved.source,
+      ...(resolved.token
+        ? { token: resolved.token }
+        : {}),
+      ...(resolved.unit
+        ? { unit: resolved.unit }
+        : {}),
+    });
   }
 
-  for (const key of Object.keys(finalParams ?? {})) {
+  // Preserve explicit parameters which aren't
+  // represented by plugin display fields.
+  for (
+    const key of Object.keys(
+      finalParams ?? {}
+    )
+  ) {
     if (fieldMap.has(key)) continue;
-    if (!Object.prototype.hasOwnProperty.call(explicitParams, key)) continue;
-    const value = finalParams[key];
-    if (value === '' || value === undefined) continue;
-    summary.push({ key, value, source: 'override' });
+
+    if (
+      !Object.prototype.hasOwnProperty.call(
+        explicitParams,
+        key
+      )
+    ) {
+      continue;
+    }
+
+    const value =
+      finalParams[key];
+
+    if (
+      value === '' ||
+      value === undefined
+    ) {
+      continue;
+    }
+
+    summary.push({
+      key,
+      value,
+      source: 'override',
+    });
   }
 
   return summary;
@@ -1176,14 +1422,11 @@ function formatReport(payload, format) {
   return lines.join('\n') + '\n';
 }
 
-
-// function buildMetadataStem(inputFileName, metadata = {}, capturedVars = {}, metadataToEmbed = {}) {
 function buildMetadataStem(inputFileName, metadata = {}, capturedVars = {}) {
   const parts = [];
   const merged = {
     ...capturedVars,
     ...metadata,
-    // ...metadataToEmbed,
   };
 
   for (const key of Object.keys(merged).sort()) {
@@ -1218,17 +1461,12 @@ function inferMetadataFromFilename(inputFileName, capturedVars = {}) {
   for (const [key, entry] of Object.entries(tokens)) {
     if (entry.valueNum !== undefined) {
       inferred[key] = entry.valueNum;
-      continue;
-    }
-
-    if (entry.valueRaw !== undefined) {
+    } else if (entry.valueRaw !== undefined) {
       inferred[key] = entry.valueRaw;
-      continue;
     }
   }
 
   // Captured variables are lower priority than filename inference.
-  // Preserve them only when filename did not provide a value.
   for (const [key, value] of Object.entries(capturedVars ?? {})) {
     if (
       inferred[key] === undefined &&
@@ -1242,7 +1480,6 @@ function inferMetadataFromFilename(inputFileName, capturedVars = {}) {
 
   return inferred;
 }
-
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Probe Metadata Mode
@@ -1664,10 +1901,6 @@ async function runConversionMode({
 }) {
   const inputExt = path.extname(inputFile).toLowerCase();
   const outputExt = path.extname(outputFile).toLowerCase();
-  // const inputExt = path.extname(inputFile).toLowerCase();
-  // console.log({ inputExt, demuxFormat });
-  // const packed = await fs.readFile(inputFile);
-  // const { meta, waveform } = unpackSerializedIR(packed);
   if (!inputFile) {
     console.error('Usage: node usig.mjs -i <input-file> (--mux bin | --demux csv) [flags] [output_path]');
     process.exit(1);
@@ -1755,81 +1988,6 @@ function inferConversionModeFromOutput(outputFile) {
     format: ext,
   };
 }
-
-// function ingestRawBinaryBuffer(
-//   buffer,
-//   inputFileName,
-//   hints = {}
-// ) {
-//   const bytesPerSample =
-//     Number(hints.bytesPerSample ?? 2);
-//
-//   const encoding =
-//     hints.encoding ?? 'int16';
-//
-//   let waveform;
-//
-//   if (
-//     encoding === 'int16' &&
-//     bytesPerSample === 2
-//   ) {
-//     waveform = new Int16Array(
-//       buffer.buffer,
-//       buffer.byteOffset,
-//       Math.floor(buffer.byteLength / 2)
-//     );
-//   }
-//   else if (
-//     encoding === 'float32' &&
-//     bytesPerSample === 4
-//   ) {
-//     waveform = new Float32Array(
-//       buffer.buffer,
-//       buffer.byteOffset,
-//       Math.floor(buffer.byteLength / 4)
-//     );
-//   }
-//   else {
-//     throw new Error(
-//       `Unsupported raw binary encoding: ${encoding}`
-//     );
-//   }
-//
-//
-//   return {
-//     frame: {
-//       packet: {
-//         waveform,
-//         metadata: {
-//           sourceFormat: 'raw-bin',
-//
-//           encoding,
-//           bytesPerSample,
-//
-//           endian:
-//             hints.endian ?? 'little',
-//
-//           numSamples:
-//             waveform.length,
-//
-//           numWaveforms:
-//             Number(hints.channels ?? 1),
-//
-//           sampleRateHz:
-//             hints.sampleRateHz ?? null,
-//
-//           metadataSources: {
-//             bin: true
-//           }
-//         }
-//       },
-//
-//       capturedVars:{}
-//     },
-//
-//     inputFileName
-//   };
-// }
 
 async function ingestInputToIR({ irMod,
                                  inputFile,
@@ -1994,32 +2152,58 @@ function buildConversionMetadata({
   };
 }
 
-// function deserializeWaveform(buffer, metadata = {}) {
-//   const encoding =
-//     metadata.waveformEncoding ??
-//     metadata.waveformType ??
-//     metadata.encoding;
-//
-//   switch (String(encoding).toLowerCase()) {
-//     case 'int16array':
-//     case 'int16':
-//       return new Int16Array(buffer);
-//
-//     case 'float32array':
-//     case 'float32':
-//       return new Float32Array(buffer);
-//
-//     case 'float64array':
-//     case 'float64':
-//       return new Float64Array(buffer);
-//
-//     default:
-//       throw new Error(
-//         `Unknown waveform encoding in USIG container: ${encoding}`
-//       );
-//   }
-// }
+function buildFilenameParamHints(
+  plugin,
+  inputFileName
+) {
+  const hints = {};
 
+  const fields =
+    collectDisplayFields(plugin);
+
+  for (const field of fields) {
+    const inferred =
+      resolveFilenameTokenForField(
+        field,
+        inputFileName
+      );
+
+    if (!inferred) continue;
+
+    hints[field.key] =
+      inferred.value;
+  }
+
+  return hints;
+}
+
+function normalizeMetadataKey(value) {
+  return String(value ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '');
+}
+
+function buildFilenameTokenCandidates(token) {
+  const key =
+    normalizeMetadataKey(token.key);
+
+  const unit =
+    normalizeMetadataKey(token.unit);
+
+  const candidates =
+    new Set();
+
+  if (key) {
+    candidates.add(key);
+  }
+
+  if (key && unit) {
+    candidates.add(`${key}${unit}`);
+  }
+
+  return candidates;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Main
@@ -2052,14 +2236,6 @@ async function main() {
   const inferredConversion = inferConversionModeFromOutput(outputFile);
 
   const effectiveConversionFormat = inferredConversion.format;
-
-  console.error('[conversion debug]', {
-  argv: process.argv,
-  outputFile,
-  inferredConversion,
-  effectiveConversionFormat,
-});
-
 
   if (help || args.length === 0) {
     printHelp();
@@ -2118,26 +2294,64 @@ async function main() {
 
   if (verbose) console.log('[usig] reading input:', inputFile);
   const raw = await fs.readFile(inputFile);
-  const inputFileName = path.basename(inputFile);
-  const file = new File([raw], inputFileName, { type: 'application/octet-stream' });
 
-  // ── Ingest file once through IR (using hints from the first plugin) ──────────
-  // All plugin runs below consume this shared frame. This mirrors the web pipeline's
-  // "ingest once, analyze many" behavior and avoids repeated file parsing.
-  const firstPluginPath = path.join(scriptDir, `app/components/plugins/${resolvedPluginIds[0]}Plugin.tsx`);
-  const firstMod = await loadPluginModule(firstPluginPath);
-  const firstPlugin = firstMod[`${resolvedPluginIds[0]}Plugin`];
-  let sharedHints = firstPlugin && typeof firstPlugin.getIngestHints === 'function'
-    ? firstPlugin.getIngestHints({ ...firstPlugin.defaultParams, ...params })
-    : undefined;
+  const inputFileName =
+    path.basename(inputFile);
+
+  const file = new File(
+    [raw],
+    inputFileName,
+    {
+      type: 'application/octet-stream'
+    }
+  );
+
+  const firstPluginPath = path.join(
+    scriptDir,
+    `app/components/plugins/${resolvedPluginIds[0]}Plugin.tsx`
+  );
+
+  const firstMod =
+    await loadPluginModule(firstPluginPath);
+
+  const firstPlugin =
+    firstMod[`${resolvedPluginIds[0]}Plugin`];
+
+  const filenameParamHints =
+    buildFilenameParamHints(
+      firstPlugin,
+      inputFileName
+    );
+
+  const ingestionParams = {
+    ...(firstPlugin?.defaultParams ?? {}),
+    ...filenameParamHints,
+    ...(params ?? {}),
+  };
+
+  let sharedHints =
+    firstPlugin &&
+    typeof firstPlugin.getIngestHints === 'function'
+      ? firstPlugin.getIngestHints(ingestionParams)
+      : undefined;
+
   if (Number.isInteger(startSample) || Number.isInteger(endSample)) {
     sharedHints = {
       ...sharedHints,
-      ...(Number.isInteger(startSample) ? { startSample } : {}),
-      ...(Number.isInteger(endSample) ? { endSample } : {}),
+      ...(Number.isInteger(startSample)
+        ? { startSample }
+        : {}),
+      ...(Number.isInteger(endSample)
+        ? { endSample }
+        : {}),
     };
   }
-  const frame = await irEngine.getOrIngest(file, sharedHints);
+
+  const frame =
+    await irEngine.getOrIngest(
+      file,
+      sharedHints
+    );
 
   if (verbose) {
     const ns = frame?.packet?.metadata?.numSamples;
@@ -2162,18 +2376,29 @@ async function main() {
 
     let finalParams = { ...plugin.defaultParams, ...params };
     const derivedHints = buildDerivedParamHints(frame, params);
-    // If fs is unset by hooks/overrides, fall back to IR metadata.
-    if ((finalParams.fsGhz === undefined || finalParams.fsGhz === '') && derivedHints.fsGhz) {
-      finalParams.fsGhz = derivedHints.fsGhz.value;
-    }
-    if ((finalParams.adcNumBits === undefined || finalParams.adcNumBits === '') && derivedHints.adcNumBits) {
-      finalParams.adcNumBits = derivedHints.adcNumBits.value;
-    }
-    if ((finalParams.vfsPeakToPeak === undefined || finalParams.vfsPeakToPeak === '') && derivedHints.vfsPeakToPeak) {
-      finalParams.vfsPeakToPeak = derivedHints.vfsPeakToPeak.value;
-    }
+    const strictFilenameInference =
+      inferStrictMetadataFromFilename(inputFileName);
 
-    const inputSummary = buildInputSummary(plugin, finalParams, params, inputFileName, frame.headers ?? [], derivedHints);
+
+    if (verbose) console.error('[DEBUG filename inference]', {
+      inputFileName,
+      plugin: resolvedPluginId,
+      strictFilenameInference,
+      pluginDefaultParams: plugin.defaultParams,
+      explicitParams: params,
+    });
+
+    const inputSummary = buildInputSummary(
+      plugin,
+      finalParams,
+      params,
+      inputFileName,
+      frame.headers ?? [],
+      derivedHints,
+      strictFilenameInference,
+      verbose
+    );
+
     finalParams = { ...finalParams };
     for (const row of inputSummary) finalParams[row.key] = row.value;
 
@@ -2183,6 +2408,12 @@ async function main() {
     const originalConsoleLog = console.log;
     try {
       console.log = (...parts) => console.error(...parts);
+      if (verbose) console.error('[DEBUG FINAL SMEAS PARAMS]', {
+        plugin: resolvedPluginId,
+        inputFileName,
+        finalParams,
+      });
+
       if (typeof plugin.runFromWaveform === 'function') {
         scalarResult = await plugin.runFromWaveform(frame.packet, finalParams);
       } else {
