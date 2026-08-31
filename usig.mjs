@@ -437,74 +437,160 @@ function parseArgs(args) {
 
 function printHelp() {
   process.stdout.write(`\
-usig -- Unified Signal Instrument CLI  (ffprobe-style reporting)
+USIG — waveform analysis CLI
 
 USAGE
-  node usig.mjs -i <input> -plugin <id[,id2]> [flags] [output]
-  node usig.mjs -i <input> --mux bin  [conversion-flags] [output]
-  node usig.mjs -i <input> --demux csv [conversion-flags] [output]
-  node usig.mjs -h | --help
 
-INPUT
-  -i <file|glob>          Input file or glob pattern (repeatable)
+  usig -i <input-file> -plugin <id> [options]
+  usig -i <input-file> -plugin <id[,id2]> [options]
+  usig -i <input-file> <output-file> [options]
 
-PLUGIN SELECTION
-  -plugin <id[,id2]>      Plugin id(s): smeas, sinl, hsioalpha
-                          Repeatable, comma-separated, or space-separated.
+ANALYSIS
 
-PARAMETERS
-  -p <key=value>          Override plugin parameter (repeatable)
-                          Values auto-coerced to number / boolean / string.
+  -i <file>                 Input waveform file
+  -plugin <id[,id2]>        Plugin(s) to run
+  -p <key=value>            Override an input parameter
+  -of <format>              Output format: text | json | csv | yaml
 
-OUTPUT
-  [output_path]           Positional output path (ffmpeg style). Default: stdout
-  -of <fmt>               Output format: text (default), json, csv, yaml
-  --format <fmt>          Alias for -of
-  -print_format <fmt>     Alias for -of
+  Multiple plugins may be specified as a comma-separated list.
+  All requested plugins run against the same ingested waveform.
 
-VERBOSITY
-  -v / --verbose          Enable verbose logging (or bare 'verbose' token)
+INPUTS
 
-CONVERSION  (mux / demux)
-  --mux bin               Convert input (CSV/TXT/BIN) -> usig IR binary container
-  --demux csv             Convert usig IR binary container -> CSV
-  --infer-meta-from-filename
-                          Infer metadata from filename tokens; embed in output BIN
-  --embed key=value       Inject metadata field into BIN payload (repeatable)
-  --meta-to-filename      Generate output .csv basename from embedded metadata tokens
-  --channel-index <n>     For multi-waveform BIN files, select 0-based channel
-  --channel <n>           Alias for --channel-index
-  --start-sample <n>      0-based first sample index to ingest (inclusive)
-  --end-sample <n>        0-based last sample index to ingest (inclusive)
+  Plugin inputs are resolved automatically.
 
-HELP
-  -h, --help              Print this help and exit
+  Resolution order:
 
-PARAM PRECEDENCE  (lowest -> highest)
-  1. plugin defaultParams
-  2. IR / embedded BIN metadata / capturedVars
-  3. Filename token inference  (strict token form only)
-  4. Plugin-specific regex inference
-  5. Explicit -p overrides
+    1. Explicit -p key=value
+    2. Filename inference
+    3. Input-column inference
+    4. Plugin defaults
 
-  FILENAME TOKEN INFERENCE (strict)
-  Allowed token: {param}{number_with_optional_p_decimal}{optional_units}
-  Allowed separators: underscore between tokens (e.g. tokenA_tokenB)
-  Param/number/unit must not contain underscores (dashes are allowed)
-  fs2p25ghz / fs100p00ghz     fsGhz = 2.25 / 100
-  fin100mhz / finused599p93mhz  inferred from matching plugin hooks
-  adc12                       adcNumBits = 12
-  vfs2p0v / vpp1p8v           vfsPeakToPeak = 2.0 / 1.8
-  4core                       numberOfCores = 4
-  m30c / p85c                 temp = -30 / +85
+  Explicit -p values have highest priority.
+
+  For CSV/XLSX input, USIG can infer a sample column from the
+  available input columns when the plugin requires one.
+
+  Resolved inputs are always shown in the analysis output,
+  including where each value came from.
+
+  Example:
+
+    Inputs:
+      sampleColumn = "data" << inferred from source column
+      inputMode = "codes" << default applied
+      maxCode = 2047 << default applied
+
+  The source annotation is part of the normal analysis output.
+  -v does not control whether Inputs are displayed.
+
+  Use -v to additionally show ingestion, inference, parameter,
+  frame, and other diagnostic/debug information.
+
+CONVERSION
+
+  Conversion mode is selected from the output filename extension.
+
+  Supported output formats:
+
+    .bin
+    .csv
+    .xlsx
+
+  Examples:
+
+    usig -i input.csv output.bin
+    usig -i input.bin output.csv
+    usig -i input.bin output.xlsx
+
+  Conversion uses the same canonical IR representation as analysis.
+
+OPTIONS
+
+  -v                        Show additional diagnostic/debug output
+  -y                        Overwrite an existing output file
+  -h                        Show this help
+  -start-sample <n>         Start at sample index <n>
+  -end-sample <n>           End at sample index <n>
+  -probe-metadata           Inspect input metadata
+
+METADATA
+
+  Filename metadata can be inferred when enabled.
+
+  -infer-meta-from-filename
+                            Infer metadata from the input filename
+
+  -meta-to-filename         Include metadata in the output filename
+
+  Metadata and analysis inputs are separate concepts.
+
+  Inputs control plugin execution.
+  Metadata describes the measurement or source file.
 
 EXAMPLES
-  node usig.mjs -i data.csv -plugin smeas -of json
-  node usig.mjs -i cap.csv -plugin sinl,smeas -v results.csv
-  node usig.mjs -i prbs2_fs100p00ghz_finused600p00mhz.csv -plugin hsioalpha -v
-  node usig.mjs -i data.csv -plugin smeas -p fsGhz=2.25 -p fftLength=8192 -of json
-  node usig.mjs -i data.csv --mux bin --infer-meta-from-filename out.bin
-  node usig.mjs -i data.bin --demux csv --meta-to-filename out.csv
+
+  Analyze a waveform using a plugin:
+
+    usig -i waveform.csv -plugin sinl
+
+  Show additional diagnostic/debug information:
+
+    usig -i waveform.csv -plugin sinl -v
+
+  Override a plugin input:
+
+    usig -i waveform.csv -plugin sinl -p maxCode=4095
+
+  Override multiple inputs:
+
+    usig -i waveform.csv -plugin sinl \\
+      -p sampleColumn=data \\
+      -p maxCode=4095
+
+  Run multiple plugins:
+
+    usig -i waveform.csv -plugin sinl,otherplugin
+
+  Analyze a selected sample range:
+
+    usig -i waveform.csv -plugin sinl \\
+      -start-sample 1000 \\
+      -end-sample 9000
+
+  Convert CSV to USIG binary:
+
+    usig -i waveform.csv output.bin
+
+  Convert USIG binary to CSV:
+
+    usig -i waveform.bin output.csv
+
+  Convert USIG binary to Excel:
+
+    usig -i waveform.bin output.xlsx
+
+  Inspect metadata:
+
+    usig -i waveform.csv -probe-metadata
+
+PLUGIN HELP
+
+  Show the available plugins:
+
+    usig -h
+
+  Show help for a specific plugin:
+
+    usig -h -plugin sinl
+
+  Plugin-specific help includes the plugin's configurable inputs,
+  their types, descriptions, required/optional status, possible
+  values, aliases, and defaults where available.
+
+  Example:
+
+    usig -h -plugin sinl
 
 See CLI.md for full documentation.
 `);
@@ -959,13 +1045,46 @@ function buildProposedFileName(inputSummary) {
   return parts.filter(Boolean).join('_');
 }
 
+function formatInputValue(value) {
+  if (typeof value === 'string') {
+    return JSON.stringify(value);
+  }
+
+  if (value === undefined) {
+    return 'undefined';
+  }
+
+  if (value === null) {
+    return 'null';
+  }
+
+  return String(value);
+}
+
 function describeSource(key, detail) {
-  if (detail.source === 'override') return `${key}: ${detail.value} << overridden from user input`;
-  if (detail.source === 'filename') return `${key}: ${detail.value} << inferred from file name`;
-  if (detail.source === 'column') return `${key}: ${detail.value} << inferred from source column`;
-  if (detail.source === 'metadata') return `${key}: ${detail.value} << inferred from file metadata / IR`;
-  if (detail.source === 'default') return `${key}: ${detail.value} << default applied`;
-  return `${key}: ${detail.value}`;
+  const value = formatInputValue(detail.value);
+
+  if (detail.source === 'override') {
+    return `${key} = ${value} << overridden from user input`;
+  }
+
+  if (detail.source === 'filename') {
+    return `${key} = ${value} << inferred from file name`;
+  }
+
+  if (detail.source === 'column') {
+    return `${key} = ${value} << inferred from source column`;
+  }
+
+  if (detail.source === 'metadata') {
+    return `${key} = ${value} << inferred from file metadata / IR`;
+  }
+
+  if (detail.source === 'default') {
+    return `${key} = ${value} << default applied`;
+  }
+
+  return `${key} = ${value}`;
 }
 
 
@@ -1014,7 +1133,11 @@ function inferStrictMetadataFromFilename(filename) {
 }
 
 function collectDisplayFields(plugin) {
-  const all = [...(plugin.paramFields ?? []), ...(plugin.inferredParamFields ?? [])];
+  const all = [
+    ...(plugin.paramFields ?? []),
+    ...(plugin.inferredParamFields ?? []),
+    ...(plugin.manifest?.paramSchema ?? []),
+  ];
   const seen = new Set();
   const deduped = [];
   for (const field of all) {
@@ -1277,40 +1400,53 @@ function buildInputSummary(
 
   const summary = [];
 
-  for (const field of fields) {
-    const resolved =
-      resolveFieldValue(
-        field,
-        explicitParams,
-        inputFileName,
-        headers,
-        derivedHints,
-        plugin?.defaultParams ?? {}
-      );
+    for (const field of fields) {
+  const resolved =
+    resolveFieldValue(
+      field,
+      explicitParams,
+      inputFileName,
+      headers,
+      derivedHints,
+      plugin?.defaultParams ?? {}
+    );
 
-    const value =
-      resolved.value === ''
-        ? finalParams[field.key] ?? ''
-        : resolved.value;
+  let value = resolved.value;
+  let source = resolved.source;
 
+  if (
+    value === '' ||
+    value === undefined
+  ) {
     if (
-      value === '' ||
-      value === undefined
+      Object.prototype.hasOwnProperty.call(
+        finalParams ?? {},
+        field.key
+      )
     ) {
-      continue;
+      value = finalParams[field.key];
+      source = 'default';
     }
+  }
 
-    summary.push({
-      key: field.key,
-      value,
-      source: resolved.source,
-      ...(resolved.token
-        ? { token: resolved.token }
-        : {}),
-      ...(resolved.unit
-        ? { unit: resolved.unit }
-        : {}),
-    });
+  if (
+    value === '' ||
+    value === undefined
+  ) {
+    continue;
+  }
+
+  summary.push({
+    key: field.key,
+    value,
+    source,
+    ...(resolved.token
+      ? { token: resolved.token }
+      : {}),
+    ...(resolved.unit
+      ? { unit: resolved.unit }
+      : {}),
+  });
   }
 
   // Preserve explicit parameters which aren't
@@ -1353,7 +1489,8 @@ function buildInputSummary(
 
 
 
-function formatReport(payload, format) {
+function formatReport(payload, format, verbose) {
+  if (verbose) console.log('[DEBUG formatReport payload]', JSON.stringify(payload, null, 2));
   if (format === 'json') {
     return JSON.stringify(payload, null, 2) + '\n';
   }
@@ -1401,11 +1538,16 @@ function formatReport(payload, format) {
     }
   } else {
     lines.push('Inputs:');
-    for (const row of payload.input.summary || []) {
-      lines.push(`  ${describeSource(row.key, row)}`);
+    if (!payload.input.summary || payload.input.summary.length === 0) {
+      lines.push('  (no inputs)');
+    } else {
+      for (const row of payload.input.summary) {
+        lines.push(`  ${describeSource(row.key, row)}`);
+      }
     }
     lines.push('');
   }
+
 
   lines.push('Outputs:');
   if (!payload.results || payload.results.length === 0) {
@@ -2259,6 +2401,82 @@ function buildConversionMetadata({
   };
 }
 
+function printPluginHelp(pluginId, plugin) {
+  console.log(`USIG — ${pluginId} plugin`);
+  console.log('');
+
+  const schema =
+    plugin?.manifest?.paramSchema ?? [];
+
+  console.log('INPUTS');
+
+  if (schema.length === 0) {
+    console.log('  (no configurable inputs)');
+  } else {
+    for (const field of schema) {
+      console.log('');
+      console.log(`  ${field.key}`);
+
+      if (field.label) {
+        console.log(`    Label: ${field.label}`);
+      }
+
+      if (field.description) {
+        console.log(`    ${field.description}`);
+      }
+
+      if (field.type) {
+        console.log(`    Type: ${field.type}`);
+      }
+
+      console.log(
+        `    Required: ${field.required ? 'yes' : 'no'}`
+      );
+
+      if (
+        Array.isArray(field.possibleValues) &&
+        field.possibleValues.length > 0
+      ) {
+        console.log(
+          `    Values: ${field.possibleValues.join(' | ')}`
+        );
+      }
+
+      if (
+        plugin?.defaultParams &&
+        Object.prototype.hasOwnProperty.call(
+          plugin.defaultParams,
+          field.key
+        )
+      ) {
+        console.log(
+          `    Default: ${plugin.defaultParams[field.key]}`
+        );
+      }
+
+      if (
+        Array.isArray(field.aliases) &&
+        field.aliases.length > 0
+      ) {
+        console.log(
+          `    Aliases: ${field.aliases.join(', ')}`
+        );
+      }
+    }
+  }
+
+  console.log('');
+  console.log('INPUT RESOLUTION');
+  console.log('');
+  console.log('  Explicit -p values override inferred values.');
+  console.log('  Otherwise USIG may use filename inference,');
+  console.log('  column inference, and plugin defaults.');
+  console.log('');
+  console.log('EXAMPLE');
+  console.log('');
+  console.log(`  usig -i waveform.csv -plugin ${pluginId}`);
+}
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Main
@@ -2292,10 +2510,51 @@ async function main() {
 
   const effectiveConversionFormat = inferredConversion.format;
 
-  if (help || args.length === 0) {
+  if (help) {
+  if (pluginIds.length > 0) {
+    const resolvedPluginId =
+      resolvePluginId(pluginIds[0], false);
+
+    if (!(await pluginExists(resolvedPluginId))) {
+      console.error(
+        `[usig] plugin not found: ${resolvedPluginId}`
+      );
+      process.exit(1);
+    }
+
+    const pluginPath = path.join(
+      scriptDir,
+      `app/components/plugins/${resolvedPluginId}Plugin.tsx`
+    );
+
+    const pluginMod =
+      await loadPluginModule(pluginPath);
+
+    const plugin =
+      pluginMod[`${resolvedPluginId}Plugin`];
+
+    if (!plugin) {
+      throw new Error(
+        `${resolvedPluginId}Plugin export not found in ${pluginPath}`
+      );
+    }
+
+    printPluginHelp(
+      resolvedPluginId,
+      plugin
+    );
+  } else {
     printHelp();
-    process.exit(0);
   }
+
+  process.exit(0);
+}
+
+if (args.length === 0) {
+  printHelp();
+  process.exit(0);
+}
+
 
   if (probeMetadata) {
     await runProbeMetadataMode({
@@ -2509,6 +2768,8 @@ async function main() {
   // ── Run each plugin on the shared frame ─────────────────────────────────────
   const allResults = [];
   const allInputSummaries = {};  // keyed by plugin id
+  const allParamSchemas = {};  // keyed by plugin id
+
 
   for (const resolvedPluginId of resolvedPluginIds) {
     const pluginPath = path.join(scriptDir, `app/components/plugins/${resolvedPluginId}Plugin.tsx`);
@@ -2517,10 +2778,11 @@ async function main() {
       ? firstMod
       : await loadPluginModule(pluginPath);
     const pluginExport = mod[`${resolvedPluginId}Plugin`];
-    if (!pluginExport || (typeof pluginExport.run !== 'function' && typeof pluginExport.runFromWaveform !== 'function')) {
+    if (!pluginExport || typeof pluginExport.run !== 'function') {
       throw new Error(`${resolvedPluginId}Plugin export not found or invalid in ${pluginPath}`);
     }
     const plugin = pluginExport;
+    allParamSchemas[resolvedPluginId] = plugin.manifest?.paramSchema ?? [];
 
     let finalParams = {
       ...plugin.defaultParams,
@@ -2587,6 +2849,9 @@ async function main() {
     input: {
       file: inputFile,
       plugin: resolvedPluginIds.length === 1 ? resolvedPluginId : resolvedPluginIds.join('+'),
+      paramSchema: resolvedPluginIds.length === 1
+        ? allParamSchemas[resolvedPluginId] ?? []
+        : [],
       format,
       params,
       summary: allInputSummaries[resolvedPluginId] ?? [],
@@ -2594,8 +2859,13 @@ async function main() {
     },
     results: allResults,
   };
-
-  const report = formatReport(payload, format);
+  if (verbose) {
+    console.log('[DEBUG before formatReport] payload =', JSON.stringify(payload, null, 2));
+    console.log('[DEBUG before formatReport] payload keys =', Object.keys(payload || {}));
+    console.log('[DEBUG before formatReport] payload.input =', JSON.stringify(payload?.input, null, 2));
+    console.log('[DEBUG before formatReport] payload.results =', JSON.stringify(payload?.results, null, 2));
+  }
+  const report = formatReport(payload, format, verbose);
 
   // ffprobe-style default: stdout. Keep deprecated positional output for compatibility.
   if (outputFile) {
