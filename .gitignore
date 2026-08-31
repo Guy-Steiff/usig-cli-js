@@ -63,8 +63,10 @@ pnpm-debug.log*
 # ------------------------------------------------------------
 
 .DS_Store
+.fuse_hidden*
 .idea/
 .vscode/
+
 
 *.swp
 *.swo
