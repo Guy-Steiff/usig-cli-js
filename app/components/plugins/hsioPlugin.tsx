@@ -1,3 +1,732 @@
+// app/components/plugins/hsioPlugin.tsx
+
+/*
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * MIGRATION NOTE: OLD FILE-BASED PLUGIN ARCHITECTURE → IR/WAVEFORM ARCHITECTURE
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
+ * PURPOSE
+ * -------
+ * This plugin must operate on the canonical IR WaveformPacket. The old plugin
+ * architecture passed a File into run(), and the plugin itself performed file
+ * ingestion, format detection, column selection, etc. That is no longer the
+ * architecture.
+ *
+ * OLD ARCHITECTURE
+ * ----------------
+ *
+ *     CLI / UI
+ *        |
+ *        v
+ *     plugin.run(file, params)
+ *        |
+ *        +--> plugin reads File
+ *        +--> plugin calls ingestFile()
+ *        +--> plugin selects a column
+ *        +--> plugin performs format-specific handling
+ *        +--> plugin analyzes samples
+ *
+ * NEW ARCHITECTURE
+ * ----------------
+ *
+ *     CLI / UI
+ *        |
+ *        v
+ *     IREngine.getOrIngest(file, hints)
+ *        |
+ *        +--> ingestAllColumns()        [metadata / headers / captured vars]
+ *        |
+ *        +--> ingestFile(file, hints)   [canonical waveform]
+ *        |
+ *        v
+ *     SignalFrame
+ *        |
+ *        +--> frame.packet
+ *        |       |
+ *        |       +--> waveform: Float32Array
+ *        |       +--> metadata: WaveformMetadata
+ *        |
+ *        +--> frame.headers
+ *        +--> frame.singleValueColumns
+ *        +--> frame.capturedVars
+ *        |
+ *        v
+ *     plugin.run(frame.packet, params)
+ *
+ *
+ * IMPORTANT: THE CANONICAL API IS run(packet, params)
+ * --------------------------------------------------
+ *
+ * pluginTypes.ts now defines:
+ *
+ *     run: (
+ *       packet: WaveformPacket,
+ *       params: P,
+ *     ) => Promise<Record<string, string | number>>;
+ *
+ * Therefore the plugin's run() must NOT expect a File.
+ *
+ * Correct:
+ *
+ *     run: async (packet, params) => {
+ *       const samples = packet.waveform;
+ *       ...
+ *     }
+ *
+ * Incorrect:
+ *
+ *     run: async (file, params) => {
+ *       const packet = await ingestFile(file);
+ *       ...
+ *     }
+ *
+ * Also incorrect:
+ *
+ *     run: async (packet, params) => {
+ *       const packet = await ingestFile(packet);
+ *       ...
+ *     }
+ *
+ * The packet has ALREADY been ingested by the pipeline.
+ *
+ *
+ * DO NOT REINTRODUCE runFromWaveform()
+ * ------------------------------------
+ *
+ * During migration it is tempting to preserve both:
+ *
+ *     run(file, params)
+ *
+ * and:
+ *
+ *     runFromWaveform(packet, params)
+ *
+ * That creates two competing plugin APIs and is unnecessary.
+ *
+ * The final architecture should use:
+ *
+ *     run(packet, params)
+ *
+ * The CLI/pipeline should call:
+ *
+ *     plugin.run(frame.packet, finalParams)
+ *
+ * not:
+ *
+ *     plugin.runFromWaveform(...)
+ *
+ * and not:
+ *
+ *     plugin.run(file, ...)
+ *
+ * The temporary compatibility check in the CLI may accept an old
+ * runFromWaveform export while migrating plugins, but new/migrated plugins
+ * should expose the standard run(packet, params) API.
+ *
+ *
+ * THE MOST IMPORTANT MIGRATION PITFALL
+ * ------------------------------------
+ *
+ * DO NOT ASSUME THAT packet IS THE SAME OBJECT AS THE OLD INGESTION RESULT.
+ *
+ * The canonical packet has this shape conceptually:
+ *
+ *     {
+ *       waveform: Float32Array,
+ *       metadata: {
+ *         ...
+ *       }
+ *     }
+ *
+ * Therefore:
+ *
+ *     packet.waveform
+ *
+ * is the sample array.
+ *
+ * Metadata is accessed through:
+ *
+ *     packet.metadata
+ *
+ * For example:
+ *
+ *     packet.metadata.units
+ *
+ *     packet.metadata.sourceFile
+ *
+ *     packet.metadata.numSamples
+ *
+ * NEVER write code that assumes:
+ *
+ *     packet.units
+ *
+ *     packet.sourceFile
+ *
+ *     packet.numSamples
+ *
+ * when those values are actually inside packet.metadata.
+ *
+ *
+ * A PARTICULAR MIGRATION PITFALL: undefined metadata
+ * --------------------------------------------------
+ *
+ * If code is executed with the wrong object, this:
+ *
+ *     packet.metadata.units
+ *
+ * can fail with:
+ *
+ *     TypeError: Cannot read properties of undefined (reading 'units')
+ *
+ * This happened during migration when inferSinlParamsFromPacket() was called
+ * with something that was not the canonical WaveformPacket.
+ *
+ * The correct call is:
+ *
+ *     params = inferSinlParamsFromPacket(params, packet);
+ *
+ * where packet is the actual:
+ *
+ *     frame.packet
+ *
+ * returned by:
+ *
+ *     irEngine.getOrIngest(...)
+ *
+ * Do not "fix" this by randomly adding optional chaining everywhere. First
+ * verify that the object being passed is actually the canonical packet.
+ *
+ * Optional chaining can hide an architectural error if the wrong object is
+ * being passed.
+ *
+ *
+ * WHERE INGESTION NOW BELONGS
+ * ---------------------------
+ *
+ * File ingestion belongs upstream in IREngine:
+ *
+ *     const frame = await irEngine.getOrIngest(file, hints);
+ *
+ * The engine does:
+ *
+ *     ingestAllColumns(file)
+ *
+ * when necessary for column/header/captured-variable information, and then:
+ *
+ *     ingestFile(file, hints)
+ *
+ * to construct the canonical WaveformPacket.
+ *
+ * The plugin receives the result:
+ *
+ *     frame.packet
+ *
+ * The plugin must not call ingestFile().
+ *
+ *
+ * COLUMN SELECTION PITFALL
+ * ------------------------
+ *
+ * Old plugins often had logic resembling:
+ *
+ *     ingestFile(file, ...)
+ *
+ * followed by:
+ *
+ *     selectColumn(...)
+ *
+ * or direct parsing of a particular CSV column.
+ *
+ * That logic must NOT simply be copied into the new run().
+ *
+ * Column selection is now part of ingestion / parameter resolution.
+ *
+ * If a plugin needs a column selection parameter, declare it through the
+ * declarative plugin parameter system, normally using:
+ *
+ *     paramFields
+ *
+ * and/or:
+ *
+ *     manifest.paramSchema
+ *
+ * The ingestion layer / pipeline resolves the selected signal into the
+ * canonical packet.
+ *
+ * The plugin then analyzes:
+ *
+ *     packet.waveform
+ *
+ * not the original CSV.
+ *
+ *
+ * DO NOT USE File APIs INSIDE THE ANALYSIS PATH
+ * ---------------------------------------------
+ *
+ * A migrated plugin should not contain analysis-time code such as:
+ *
+ *     file.text()
+ *     file.arrayBuffer()
+ *     FileReader
+ *     Papa.parse(...)
+ *     ingestFile(...)
+ *     ingestAllColumns(...)
+ *     format detection
+ *     CSV parsing
+ *     XLSX parsing
+ *
+ * Those responsibilities belong upstream.
+ *
+ * The plugin should be format-independent.
+ *
+ * A CSV file, TXT file, XLSX-derived signal, binary-derived signal, etc. should
+ * all arrive at the plugin as the same canonical WaveformPacket abstraction.
+ *
+ *
+ * PRESERVE THE ALGORITHM; CHANGE THE INPUT BOUNDARY
+ * -------------------------------------------------
+ *
+ * The safest migration strategy is:
+ *
+ *     1. Leave the core algorithm alone.
+ *     2. Remove file ingestion from the plugin.
+ *     3. Change the algorithm's input from the old parsed representation to
+ *        packet.waveform.
+ *     4. Move any required file/format knowledge into the ingestion layer.
+ *     5. Move column-selection UI/parameter declarations into paramFields and
+ *        manifest.paramSchema.
+ *     6. Use packet.metadata for signal metadata.
+ *
+ * In other words, do NOT rewrite the mathematical algorithm merely because
+ * the architecture changed.
+ *
+ *
+ * EXAMPLE OF THE DESIRED PATTERN
+ * ------------------------------
+ *
+ *     run: async (packet, params) => {
+ *       const samples = packet.waveform;
+ *
+ *       // Analysis only.
+ *       const result = runSomeAlgorithm(samples, params);
+ *
+ *       const fileName = packet.metadata.sourceFile ?? 'waveform';
+ *
+ *       return {
+ *         filename: fileName,
+ *         ...
+ *       };
+ *     },
+ *
+ *
+ * PREPAREDATA MUST FOLLOW THE SAME RULE
+ * -------------------------------------
+ *
+ * If the plugin has prepareData(), it receives the same canonical packet:
+ *
+ *     prepareData: async (packet, params) => {
+ *       const samples = packet.waveform;
+ *       ...
+ *     }
+ *
+ * It must NOT ingest the File again.
+ *
+ * Correct:
+ *
+ *     prepareData(packet, params)
+ *
+ * Incorrect:
+ *
+ *     prepareData(file, params)
+ *
+ * Incorrect:
+ *
+ *     prepareData(packet, params) {
+ *       return ingestFile(packet);
+ *     }
+ *
+ *
+ * METADATA PITFALL
+ * ----------------
+ *
+ * Old code may have obtained metadata from the file parser, for example:
+ *
+ *     parsed.units
+ *     parsed.filename
+ *     parsed.sampleRate
+ *
+ * After migration, check the WaveformMetadata definition and use the canonical
+ * location.
+ *
+ * Typical access is:
+ *
+ *     packet.metadata.units
+ *     packet.metadata.sourceFile
+ *
+ * Do not invent new top-level packet properties just to make old code work.
+ *
+ *
+ * PARAMETER INFERENCE PITFALL
+ * ---------------------------
+ *
+ * Filename-derived and captured-variable parameters are resolved by the
+ * pipeline before plugin.run().
+ *
+ * The CLI currently constructs:
+ *
+ *     let finalParams = { ...plugin.defaultParams, ...params };
+ *
+ * then builds the input summary and finally applies the resolved input-summary
+ * values:
+ *
+ *     for (const row of inputSummary) {
+ *       finalParams[row.key] = row.value;
+ *     }
+ *
+ * Therefore plugin.run() should consume the resolved params.
+ *
+ * Do not duplicate the entire filename-inference / captured-variable pipeline
+ * inside the plugin.
+ *
+ * Plugin-specific parameter declarations belong in:
+ *
+ *     paramFields
+ *
+ * and/or:
+ *
+ *     manifest.paramSchema
+ *
+ *
+ * PARAMETER TYPES AND VALUES
+ * --------------------------
+ *
+ * Be careful during migration because CLI-derived parameters can arrive as
+ * strings even when the logical parameter is numeric.
+ *
+ * Existing plugins commonly normalize explicitly:
+ *
+ *     Number(params.someValue)
+ *
+ *     Math.round(Number(params.someValue))
+ *
+ *     Math.max(...)
+ *
+ * Preserve the existing normalization semantics when migrating.
+ *
+ * Do not assume that TypeScript's declared type guarantees the runtime value's
+ * representation at the CLI boundary.
+ *
+ *
+ * DEFAULTS MUST REMAIN CONSISTENT
+ * -------------------------------
+ *
+ * Keep:
+ *
+ *     defaultParams
+ *
+ * consistent with:
+ *
+ *     manifest.paramSchema
+ *
+ * and:
+ *
+ *     paramFields
+ *
+ * In particular, do not accidentally remove a parameter from defaultParams
+ * because it is now declared in paramFields.
+ *
+ * The declarative parameter system describes the UI/inference behavior;
+ * defaultParams still provides the plugin's baseline parameter object.
+ *
+ *
+ * MULTI-PLUGIN / CLI PITFALL
+ * -------------------------
+ *
+ * The CLI now obtains one shared IR frame and runs multiple plugins against
+ * that frame.
+ *
+ * Conceptually:
+ *
+ *     const frame = await irEngine.getOrIngest(file, sharedHints);
+ *
+ *     for (const plugin of plugins) {
+ *       const result = await plugin.run(frame.packet, finalParams);
+ *     }
+ *
+ * Therefore a plugin MUST NOT mutate packet.waveform or packet.metadata in a
+ * way that changes the input for another plugin.
+ *
+ * Treat the packet as read-only.
+ *
+ * If the algorithm needs a mutable working array, make a copy:
+ *
+ *     const samples = new Float32Array(packet.waveform);
+ *
+ * or otherwise use a non-mutating algorithm.
+ *
+ *
+ * HINTS PITFALL
+ * -------------
+ *
+ * Ingestion hints are an upstream concern.
+ *
+ * If the plugin requires a particular column, the plugin should DECLARE the
+ * requirement so the pipeline can construct the correct packet.
+ *
+ * Do not solve a missing-column problem by reopening and reparsing the File
+ * inside run().
+ *
+ * The intended flow is:
+ *
+ *     plugin declaration
+ *          |
+ *          v
+ *     pipeline determines hints
+ *          |
+ *          v
+ *     IREngine.getOrIngest(file, hints)
+ *          |
+ *          v
+ *     canonical packet
+ *          |
+ *          v
+ *     plugin.run(packet, params)
+ *
+ *
+ * CACHE PITFALL
+ * -------------
+ *
+ * IREngine caches frames by file + ingestion hints.
+ *
+ * This means:
+ *
+ *     getOrIngest(file)
+ *
+ * and:
+ *
+ *     getOrIngest(file, hints)
+ *
+ * can represent different cached frames.
+ *
+ * Do not bypass the engine and perform ad-hoc ingestion in the plugin. Doing
+ * so defeats the IR cache and can cause repeated file reads.
+ *
+ *
+ * DO NOT CONFUSE COLUMNAR DATA WITH THE WAVEFORM PACKET
+ * -----------------------------------------------------
+ *
+ * The engine exposes both:
+ *
+ *     frame.headers
+ *     frame.singleValueColumns
+ *     frame.capturedVars
+ *
+ * and:
+ *
+ *     frame.packet
+ *
+ * These have different purposes.
+ *
+ * frame.packet is the canonical signal consumed by the analysis algorithm.
+ *
+ * frame.headers / singleValueColumns / capturedVars are pipeline metadata used
+ * for parameter resolution, UI, inference, etc.
+ *
+ * Do not reconstruct the signal from frame.headers or capturedVars inside the
+ * plugin.
+ *
+ *
+ * CLI COMPATIBILITY CHECK PITFALL
+ * -------------------------------
+ *
+ * During migration the CLI may contain a compatibility check such as:
+ *
+ *     if (
+ *       !pluginExport ||
+ *       (
+ *         typeof pluginExport.run !== 'function' &&
+ *         typeof pluginExport.runFromWaveform !== 'function'
+ *       )
+ *     ) {
+ *       throw new Error(...);
+ *     }
+ *
+ * This DOES NOT mean a migrated plugin should implement both APIs.
+ *
+ * It merely allows the CLI to recognize plugins during the transition.
+ *
+ * The desired migrated plugin API is:
+ *
+ *     run(packet, params)
+ *
+ * The actual execution path for the migrated architecture should be:
+ *
+ *     scalarResult = await plugin.run(frame.packet, finalParams);
+ *
+ * If compatibility code still references runFromWaveform, do not use that as
+ * a reason to reintroduce runFromWaveform into the plugin. Remove the
+ * compatibility branch once all plugins have migrated.
+ *
+ *
+ * SEARCH/VERIFY CHECKLIST AFTER MIGRATION
+ * ---------------------------------------
+ *
+ * After converting a plugin, search for old file-based execution and ingestion.
+ *
+ * Useful checks:
+ *
+ *     grep -RIn --exclude-dir=node_modules --exclude-dir=.git \
+ *       "ingestFile" app/components/plugins/<plugin>Plugin.tsx
+ *
+ *     grep -RIn --exclude-dir=node_modules --exclude-dir=.git \
+ *       "ingestAllColumns" app/components/plugins/<plugin>Plugin.tsx
+ *
+ *     grep -RIn --exclude-dir=node_modules --exclude-dir=.git \
+ *       "\.run(file" app usig.mjs
+ *
+ *     grep -RIn --exclude-dir=node_modules --exclude-dir=.git \
+ *       "runFromWaveform" app usig.mjs
+ *
+ * For a fully migrated plugin, ingestion should not appear in the plugin's
+ * implementation, and the plugin should expose:
+ *
+ *     run: async (packet, params) => ...
+ *
+ *
+ * VERIFY THE CLI EXECUTION SITE
+ * -----------------------------
+ *
+ * The critical CLI line should be equivalent to:
+ *
+ *     scalarResult = await plugin.run(frame.packet, finalParams);
+ *
+ * NOT:
+ *
+ *     scalarResult = await plugin.run(file, finalParams);
+ *
+ * The distinction is crucial. If the CLI passes File while the plugin expects
+ * WaveformPacket, the plugin may fail later with misleading errors such as:
+ *
+ *     Cannot read properties of undefined (reading 'units')
+ *
+ * because File does not have the canonical packet structure.
+ *
+ *
+ * VERIFY THE FRAME CONSTRUCTION
+ * -----------------------------
+ *
+ * The CLI should obtain the frame through:
+ *
+ *     const frame = await irEngine.getOrIngest(
+ *       file,
+ *       Object.keys(hints).length ? hints : undefined
+ *     );
+ *
+ * Then:
+ *
+ *     frame.packet
+ *
+ * is what gets passed to the plugin.
+ *
+ * A useful debug check during migration is:
+ *
+ *     console.error({
+ *       hasFrame: !!frame,
+ *       hasPacket: !!frame?.packet,
+ *       hasWaveform: !!frame?.packet?.waveform,
+ *       hasMetadata: !!frame?.packet?.metadata,
+ *       units: frame?.packet?.metadata?.units,
+ *       numSamples: frame?.packet?.metadata?.numSamples,
+ *     });
+ *
+ * Remove temporary debugging once migration is verified.
+ *
+ *
+ * SINL MIGRATION LESSON
+ * ---------------------
+ *
+ * SINL demonstrated the intended final pattern:
+ *
+ *     run: async (packet, params) => {
+ *       params = inferSinlParamsFromPacket(params, packet);
+ *
+ *       ...
+ *
+ *       const samples = samplesToCodes(
+ *         packet.waveform,
+ *         params.inputMode,
+ *         minCode,
+ *         maxCode,
+ *         10,
+ *       );
+ *
+ *       ...
+ *
+ *       const fileName =
+ *         packet.metadata.sourceFile ?? 'waveform';
+ *
+ *       return singularsToOutput(singulars, fileName);
+ *     }
+ *
+ * The important part is not the SINL-specific algorithm. The important part is
+ * the boundary:
+ *
+ *     packet.waveform
+ *     packet.metadata
+ *
+ * The algorithm is now completely independent of the original file format.
+ *
+ *
+ * FINAL MIGRATION RULE
+ * --------------------
+ *
+ * When converting an old plugin, think:
+ *
+ *     "Move ingestion OUT of the plugin, not INTO a differently named function."
+ *
+ * Old:
+ *
+ *     File
+ *       -> plugin
+ *       -> ingest
+ *       -> parse
+ *       -> select column
+ *       -> analyze
+ *
+ * New:
+ *
+ *     File
+ *       -> IREngine
+ *       -> ingest
+ *       -> select/resolve signal
+ *       -> WaveformPacket
+ *       -> plugin
+ *       -> analyze
+ *
+ * The plugin begins at the final arrow.
+ *
+ * The plugin receives:
+ *
+ *     packet: WaveformPacket
+ *
+ * and should principally operate on:
+ *
+ *     packet.waveform
+ *
+ * with signal metadata from:
+ *
+ *     packet.metadata
+ *
+ * and resolved algorithm parameters from:
+ *
+ *     params
+ *
+ * If code inside the plugin needs to reopen the File, parse CSV/XLSX/TXT,
+ * detect the format, or call ingestFile(), the migration is incomplete.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════════
+ */
+
 import {
   type Plugin,
   type PluginManifest,

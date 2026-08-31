@@ -35,7 +35,10 @@
  *  They describe the same params from different angles — do NOT collapse them.
  */
 
-import { ReactNode, ComponentType } from 'react';
+import { ComponentType } from 'react';
+import type { WaveformPacket } from './ingest';
+export type { WaveformPacket } from './ingest';
+
 
 /** A JSON-serialisable description of a single plugin parameter. */
 export interface ParamSchema {
@@ -44,6 +47,13 @@ export interface ParamSchema {
   type: 'column-select' | 'text' | 'number' | 'boolean';
   required: boolean;
   description?: string;
+
+  aliases?: string[];
+  possibleValues?: string[];
+  min?: number;
+  max?: number;
+  unit?: string;
+  unitOptions?: string[];
 }
 
 /** Self-describing metadata about a plugin — safe to serialise & transmit. */
@@ -321,18 +331,17 @@ export interface InferredParamField {
 }
 
 /**
- * Generic plugin definition.
+ * Standard output:
+ *   run() → receives a canonical WaveformPacket and returns one scalar row.
  *
- * P  — the shape of the plugin's configuration parameters.
+ * Optional rich output:
+ *   prepareData() → receives the same canonical WaveformPacket and returns
+ *   figure data and/or debug tables.
  *
- * Standard output (required):
- *   `run` → one scalar row per input file → written to the main results CSV.
- *
- * Optional debug outputs:
- *   `prepareData` → returns { figureData, debugTables } per file.
- *   `figures`     → canvas plots drawn from figureData.
- *   `debugTables` declared on the plugin → downloaded as CSV/JSON on demand.
+ * Plugins operate exclusively on IR frames / WaveformPackets.
+ * File ingestion and format detection happen upstream in the pipeline.
  */
+
 export interface Plugin<P = Record<string, string>> {
   id: string;
   name: string;
@@ -354,8 +363,16 @@ export interface Plugin<P = Record<string, string>> {
    * The declarative approach is simpler, more consistent, and more maintainable.
    */
 
-  /** Standard output: one scalar row per file — written to the main results CSV. */
-  run: (file: File, params: P) => Promise<Record<string, string | number>>;
+  /**
+   * Standard plugin execution.
+   * Receives the canonical IR WaveformPacket — never a File or raw file format.
+   * Returns one scalar result row for the input packet.
+   */
+
+  run: (
+      packet: WaveformPacket,
+      params: P,
+    ) => Promise<Record<string, string | number>>;
 
   /**
    * Optional: called whenever any param changes (changedKey = the key that changed).
@@ -366,35 +383,17 @@ export interface Plugin<P = Record<string, string>> {
   onParamChange?: (changedKey: string, params: P) => Partial<P> | null;
 
   /**
-   * Translate resolved params into IngestHints for the ingestion layer.
-   *
-   * The pipeline calls this BEFORE ingesting each file so that `ingestFile()`
-   * uses the correct signal column, fs-column regex, etc. chosen by the user.
-   *
-   * If omitted, the pipeline falls back to the most-unique-values heuristic
-   * which will pick the wrong column in multi-column files.
-   *
-   * Every plugin that has a column-select parameter MUST implement this.
-   */
-  getIngestHints?: (params: P) => import('./ingest').IngestHints;
-
-  /**
-   * Optional canonical-data-model entry point.
-   * When implemented, the pipeline calls this INSTEAD of run() when a WaveformPacket
-   * is available (i.e. the file was ingested via the ingestion layer).
-   * Plugins that implement this receive Float32Array + metadata and never touch
-   * raw file bytes, CSV strings, or binary formats.
-   * This is the preferred API for new plugins and the migration target for existing ones.
-   */
-  runFromWaveform?: (packet: import('./ingest').WaveformPacket, params: P) => Promise<Record<string, string | number>>;
-  /**
    * Optional canonical prepareData counterpart.
    * Same as prepareData() but receives a WaveformPacket instead of a File.
    */
-  prepareDataFromWaveform?: (packet: import('./ingest').WaveformPacket, params: P) => Promise<{
-    figureData?: unknown;
-    debugTables?: import('./pluginTypes').PluginDebugTable[];
-  }>;
+  prepareData?: (
+      packet: WaveformPacket,
+      params: P,
+    ) => Promise<{
+      figureData?: unknown;
+      debugTables?: PluginDebugTable[];
+    }>;
+
   /**
    * Declared output column names — keys that run() will produce.
    * Shown in the plugin card's Output Columns panel immediately, without needing a run.
@@ -402,18 +401,10 @@ export interface Plugin<P = Record<string, string>> {
    * Falls back to post-run actuals if omitted.
    */
   outputColumns?: string[];
-  /**
-   * Optional: produce rich per-file data alongside the scalar result.
-   * Return value shape: { figureData?: unknown; debugTables?: PluginDebugTable[] }
-   * figureData is passed to each figure's draw().
-   * debugTables are exposed as downloadable CSV/JSON per file.
-   */
-  prepareData?: (file: File, params: P) => Promise<{
-    figureData?: unknown;
-    debugTables?: PluginDebugTable[];
-  }>;
+
   /** Figures this plugin can draw — shown as plot buttons after a successful run. */
   figures?: PluginFigure[];
+
   /**
    * Optional markdown documentation string. When provided, a collapsed "📖 plugin docs"
    * section is shown in the plugin card beneath the standard info block.

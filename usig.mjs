@@ -1933,6 +1933,7 @@ const mergedMetadata = buildConversionMetadata({
   inputFileName,
 });
 
+
 const frameForExport = {
   ...frame,
   packet: {
@@ -1989,44 +1990,46 @@ function inferConversionModeFromOutput(outputFile) {
   };
 }
 
-async function ingestInputToIR({ irMod,
-                                 inputFile,
-                                 startSample,
-                                 endSample,
-                                 params,
-                               }) {
+async function ingestInputToIR({
+  irMod,
+  inputFile,
+  startSample,
+  endSample,
+  params,
+}) {
   const hints = {
     ...(params ?? {}),
   };
-  console.log('[debug ingestInputToIR params]', params);
+
   const IREngine = irMod?.IREngine;
   if (!IREngine) {
     throw new Error(
-        'IREngine export missing in app/lib/ir/index.ts bundle.'
+      'IREngine export missing in app/lib/ir/index.ts bundle.'
     );
   }
 
   const raw = await fs.readFile(inputFile);
   const inputFileName = path.basename(inputFile);
 
-  if (Number.isInteger(startSample))
+  if (Number.isInteger(startSample)) {
     hints.startSample = startSample;
+  }
 
-  if (Number.isInteger(endSample))
+  if (Number.isInteger(endSample)) {
     hints.endSample = endSample;
+  }
 
   const ext = path.extname(inputFile).toLowerCase();
 
   if (ext === '.bin') {
     const mapperMod = await loadBinMapperModule();
-    console.log('[debug] bin mapper exports:', Object.keys(mapperMod));
-    console.log('[debug] bin mapper module:', mapperMod);
+
     const packet = await mapperMod.mapBinaryToIRCandidate({
       inputPath: inputFile,
       filename: inputFileName,
-      hints
+      hints,
     });
-    console.log('[debug] mapped packet keys:', Object.keys(packet));
+
     return {
       frame: {
         ...packet,
@@ -2044,33 +2047,82 @@ async function ingestInputToIR({ irMod,
   if (ext === '.csv' || ext === '.xlsx') {
     const mapperMod = await loadCsvXlsxMapperModule();
 
-    const packet = await mapperMod.mapCsvXlsxToIRCandidate({
-        inputPath: inputFile,
-        filename: inputFileName,
-        hints,
+    const mapped = await mapperMod.mapCsvXlsxToIRCandidate({
+      inputPath: inputFile,
+      filename: inputFileName,
+      hints,
     });
 
-    console.log(packet.packet.channels);
-    console.log(packet.packet.metadata);
+    if (!mapped?.packet) {
+      throw new Error(
+        'CSV/XLSX mapper returned an invalid IR candidate: missing packet.'
+      );
+    }
 
-    console.log(
-        '[debug] mapped table packet keys:',
-        Object.keys(packet)
-    );
+    const packet = mapped.packet;
+
+    const waveform =
+      packet.waveform ??
+      packet.arrays?.[0]?.waveform ??
+      packet.channels?.[0]?.waveform;
+
+    if (!waveform) {
+      throw new Error(
+        'CSV/XLSX mapper returned an IR packet without waveform or channels.'
+      );
+    }
+
+    const channels =
+      packet.channels ??
+      packet.arrays ??
+      [{
+        label:
+          packet.metadata?.signalColumn ??
+          packet.metadata?.channelLabels?.[0] ??
+          'data',
+        units: packet.metadata?.units,
+        waveform,
+      }];
+
+    const normalizedPacket = {
+      ...packet,
+      waveform,
+      arrays: channels,
+      channels,
+      metadata: {
+        ...(packet.metadata ?? {}),
+        channelLabels:
+          packet.metadata?.channelLabels ??
+          channels.map(ch => ch.label),
+      },
+    };
+
+    console.log('[DEBUG CSV PACKET NORMALIZATION]', {
+      packetKeys: Object.keys(normalizedPacket),
+      waveformLength: normalizedPacket.waveform?.length,
+      channels: normalizedPacket.channels?.map(ch => ({
+        label: ch.label,
+        units: ch.units,
+        waveformLength: ch.waveform?.length,
+      })),
+    });
 
     return {
-        frame: {
-            ...packet,
-            headers: [],
-            singleValueColumns: {},
-            cacheKey: null,
-            hintsKey: null,
-            ingestedAt: Date.now(),
-            schemaVersion: 1,
-        },
-        inputFileName,
+      frame: {
+        packet: normalizedPacket,
+        headers:
+          packet.metadata?.columnLabels ??
+          normalizedPacket.channels.map(ch => ch.label),
+        singleValueColumns: {},
+        cacheKey: null,
+        hintsKey: null,
+        ingestedAt: Date.now(),
+        schemaVersion: 1,
+        capturedVars: mapped.capturedVars ?? {},
+      },
+      inputFileName,
     };
-}
+  }
 
   // TXT and other legacy formats
   const file = new File(
@@ -2093,6 +2145,61 @@ async function ingestInputToIR({ irMod,
     inputFileName,
   };
 }
+
+
+function buildFilenameParamHints(
+  plugin,
+  inputFileName
+) {
+  const hints = {};
+
+  const fields =
+    collectDisplayFields(plugin);
+
+  for (const field of fields) {
+    const inferred =
+      resolveFilenameTokenForField(
+        field,
+        inputFileName
+      );
+
+    if (!inferred) continue;
+
+    hints[field.key] =
+      inferred.value;
+  }
+
+  return hints;
+}
+
+function normalizeMetadataKey(value) {
+  return String(value ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '');
+}
+
+function buildFilenameTokenCandidates(token) {
+  const key =
+    normalizeMetadataKey(token.key);
+
+  const unit =
+    normalizeMetadataKey(token.unit);
+
+  const candidates =
+    new Set();
+
+  if (key) {
+    candidates.add(key);
+  }
+
+  if (key && unit) {
+    candidates.add(`${key}${unit}`);
+  }
+
+  return candidates;
+}
+
 
 function buildConversionMetadata({
   frame,
@@ -2152,58 +2259,6 @@ function buildConversionMetadata({
   };
 }
 
-function buildFilenameParamHints(
-  plugin,
-  inputFileName
-) {
-  const hints = {};
-
-  const fields =
-    collectDisplayFields(plugin);
-
-  for (const field of fields) {
-    const inferred =
-      resolveFilenameTokenForField(
-        field,
-        inputFileName
-      );
-
-    if (!inferred) continue;
-
-    hints[field.key] =
-      inferred.value;
-  }
-
-  return hints;
-}
-
-function normalizeMetadataKey(value) {
-  return String(value ?? '')
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]/g, '');
-}
-
-function buildFilenameTokenCandidates(token) {
-  const key =
-    normalizeMetadataKey(token.key);
-
-  const unit =
-    normalizeMetadataKey(token.unit);
-
-  const candidates =
-    new Set();
-
-  if (key) {
-    candidates.add(key);
-  }
-
-  if (key && unit) {
-    candidates.add(`${key}${unit}`);
-  }
-
-  return candidates;
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Main
@@ -2293,10 +2348,10 @@ async function main() {
   const irEngine = new IREngine();
 
   if (verbose) console.log('[usig] reading input:', inputFile);
-  const raw = await fs.readFile(inputFile);
 
-  const inputFileName =
-    path.basename(inputFile);
+  const inputFileName = path.basename(inputFile);
+
+  const raw = await fs.readFile(inputFile);
 
   const file = new File(
     [raw],
@@ -2305,6 +2360,7 @@ async function main() {
       type: 'application/octet-stream'
     }
   );
+
 
   const firstPluginPath = path.join(
     scriptDir,
@@ -2347,16 +2403,108 @@ async function main() {
     };
   }
 
-  const frame =
-    await irEngine.getOrIngest(
+   // ── Canonical input ingestion ───────────────────────────────────────────────
+  // CSV/XLSX must use the same mapper as conversion mode. This guarantees that
+  // plugin execution and conversion receive the same canonical IR packet shape.
+  const ext = path.extname(inputFile).toLowerCase();
+
+  let frame;
+
+  if (ext === '.csv' || ext === '.xlsx') {
+    const ingested = await irEngine.getOrIngest(
       file,
       sharedHints
     );
 
+    const canonicalFrame = ingested.frame ?? ingested;
+    const packet = canonicalFrame?.packet ?? {};
+
+    const waveform =
+      packet.waveform ??
+      packet.arrays?.[0]?.waveform ??
+      packet.channels?.[0]?.waveform;
+
+    if (!waveform) {
+      throw new Error(
+        'CSV/XLSX ingestion returned an IR packet without waveform.'
+      );
+    }
+
+    const existingChannels =
+      packet.channels ??
+      packet.arrays ??
+      [];
+
+    const channels =
+      existingChannels.length > 0
+        ? existingChannels
+        : [{
+            label:
+              packet.metadata?.signalColumn ??
+              packet.metadata?.channelLabels?.[0] ??
+              canonicalFrame?.headers?.[0] ??
+              'data',
+            units: packet.metadata?.units,
+            waveform,
+          }];
+
+    frame = {
+      ...canonicalFrame,
+      packet: {
+        ...packet,
+        waveform,
+        channels,
+        arrays: channels,
+        metadata: {
+          ...(packet.metadata ?? {}),
+          channelLabels:
+            packet.metadata?.channelLabels ??
+            channels.map(ch => ch.label),
+        },
+      },
+    };
+
+  } else {
+
+    const ingested = await irEngine.getOrIngest(
+      file,
+      sharedHints
+    );
+
+    frame = ingested.frame ?? ingested;
+
+    console.log('[DEBUG getOrIngest RETURN]', {
+      type: typeof ingested,
+      keys: Object.keys(ingested ?? {}),
+      hasFrame: !!ingested?.frame,
+      frameKeys: Object.keys(ingested?.frame ?? {}),
+    });
+
+  }
+
   if (verbose) {
-    const ns = frame?.packet?.metadata?.numSamples;
+    console.error('[DEBUG CANONICAL FRAME]', {
+      packetKeys: Object.keys(frame?.packet ?? {}),
+      metadata: frame?.packet?.metadata,
+      waveformType: frame?.packet?.waveform?.constructor?.name,
+      waveformLength: frame?.packet?.waveform?.length,
+      channels: frame?.packet?.channels?.map(ch => ({
+        label: ch?.label,
+        units: ch?.units,
+        waveformLength: ch?.waveform?.length,
+      })),
+      headers: frame?.headers,
+      capturedVars: frame?.capturedVars,
+    });
+
+    const ns =
+      frame?.packet?.metadata?.numSamples ??
+      frame?.packet?.waveform?.length ??
+      frame?.packet?.channels?.[0]?.waveform?.length;
+
     console.log(`[usig] ingested through IR (${ns ?? 'unknown'} samples)`);
   }
+
 
   // ── Run each plugin on the shared frame ─────────────────────────────────────
   const allResults = [];
@@ -2374,7 +2522,12 @@ async function main() {
     }
     const plugin = pluginExport;
 
-    let finalParams = { ...plugin.defaultParams, ...params };
+    let finalParams = {
+      ...plugin.defaultParams,
+      ...filenameParamHints,
+      ...params,
+    };
+
     const derivedHints = buildDerivedParamHints(frame, params);
     const strictFilenameInference =
       inferStrictMetadataFromFilename(inputFileName);
@@ -2408,17 +2561,14 @@ async function main() {
     const originalConsoleLog = console.log;
     try {
       console.log = (...parts) => console.error(...parts);
-      if (verbose) console.error('[DEBUG FINAL SMEAS PARAMS]', {
+      if (verbose) console.error('[DEBUG FINAL PLUGIN PARAMS]', {
         plugin: resolvedPluginId,
         inputFileName,
         finalParams,
       });
 
-      if (typeof plugin.runFromWaveform === 'function') {
-        scalarResult = await plugin.runFromWaveform(frame.packet, finalParams);
-      } else {
-        scalarResult = await plugin.run(file, finalParams);
-      }
+      scalarResult = await plugin.run(frame.packet, finalParams);
+
     } catch (err) {
       console.error(`[usig] ${resolvedPluginId}.run() failed:`, err);
       process.exit(1);
