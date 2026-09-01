@@ -635,7 +635,7 @@ async function loadIrEngineModule() {
       platform: 'node',
       loader: { '.tsx': 'tsx', '.ts': 'ts' },
       outfile: tmpPath,
-      external: ['react', 'react-dom', 'fft.js', 'recharts', 'fs', 'path'],
+      external: ['react', 'react-dom', 'fft.js', 'recharts', 'fs', 'path', 'exceljs'],
       sourcemap: false,
       absWorkingDir: scriptDir,
       nodePaths: [nodeModulesDir],

@@ -189,7 +189,8 @@ function xlsxCellToString(value: unknown): string {
 
 async function parseXlsxTable(file: File): Promise<{ headers: string[]; dataRows: string[][] }> {
   const excelJsMod = await import('exceljs');
-  const workbook = new excelJsMod.Workbook();
+  const ExcelJS = (excelJsMod as any).default ?? excelJsMod;
+  const workbook = new ExcelJS.Workbook();
   const buffer = await file.arrayBuffer();
   await workbook.xlsx.load(buffer);
 
