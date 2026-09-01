@@ -5,7 +5,7 @@
  * Returns standardized data format for use across components.
  */
 
-import ExcelJS from 'exceljs';
+import * as ExcelJS from 'exceljs';
 
 export interface ParsedData {
   headers: string[];
@@ -237,7 +237,7 @@ export const parseXLSX = async (file: File): Promise<ParsedData> => {
   if (!worksheet) throw new Error('Excel file has no sheets.');
 
   const jsonData: any[][] = [];
-  worksheet.eachRow({ includeEmpty: false }, row => {
+  worksheet.eachRow({ includeEmpty: false }, (row: ExcelJS.Row) => {
     jsonData.push((row.values as any[]).slice(1)); // ExcelJS row.values is 1-indexed
   });
 
@@ -288,19 +288,4 @@ export const parseXLSX = async (file: File): Promise<ParsedData> => {
     firstNumericVariable: firstNumericVar,
     fileNameColumns,
   };
-};
-
-/**
- * Parse any supported file type (CSV or XLSX)
- */
-export const parseFile = async (file: File): Promise<ParsedData> => {
-  const fileName = file.name.toLowerCase();
-
-  if (fileName.endsWith('.csv')) {
-    return parseCSV(file);
-  } else if (fileName.endsWith('.xlsx') || fileName.endsWith('.xls')) {
-    return parseXLSX(file);
-  } else {
-    throw new Error('Unsupported file type. Please upload CSV or XLSX file.');
-  }
 };

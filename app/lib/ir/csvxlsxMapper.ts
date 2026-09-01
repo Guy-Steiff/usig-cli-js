@@ -177,8 +177,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as ExcelJSImport from "exceljs";
 import type { Row } from "exceljs";
-import type { WaveformArray } from '../ingest/types';
-
+import type { WaveformArray } from "../ingest/types";
 
 const ExcelJS = (ExcelJSImport as any).default ?? ExcelJSImport;
 
@@ -195,12 +194,25 @@ interface TableData {
 
 const stripCell = (s: string) =>
     String(s).trim().replace(/^"|"$/g, "");
+
 function parseNumeric(cell: string): number {
     const lc = cell.toLowerCase();
-    if (lc === "inf" || lc === "+inf" || lc === "infinity")
+
+    if (
+        lc === "inf" ||
+        lc === "+inf" ||
+        lc === "infinity"
+    ) {
         return Infinity;
-    if (lc === "-inf" || lc === "-infinity")
+    }
+
+    if (
+        lc === "-inf" ||
+        lc === "-infinity"
+    ) {
         return -Infinity;
+    }
+
     return Number(cell);
 }
 
@@ -210,10 +222,15 @@ function parseNumeric(cell: string): number {
 
 async function loadCsv(file: string): Promise<TableData> {
     const text = await fs.readFile(file, "utf8");
+
     const lines = text
         .split(/\r?\n/)
         .filter(l => l.trim().length);
-    const delimiter = lines[0].includes("\t") ? "\t" : ",";
+
+    const delimiter = lines[0].includes("\t")
+        ? "\t"
+        : ",";
+
     return {
         headers: lines[0]
             .split(delimiter)
@@ -221,46 +238,69 @@ async function loadCsv(file: string): Promise<TableData> {
                 const name = stripCell(h);
                 return name || `data${i + 1}`;
             }),
-        rows: lines.slice(1).map(l => l.split(delimiter))
+
+        rows: lines
+            .slice(1)
+            .map(l => l.split(delimiter))
     };
 }
 
 async function loadXlsx(file: string): Promise<TableData> {
-    // console.log('[exceljs debug]', ExcelJS);
-    // console.log('[exceljs keys]', Object.keys(ExcelJS));
-    // console.log('[exceljs Workbook]', ExcelJS.Workbook);
     const workbook = new ExcelJS.Workbook();
-    await workbook.xlsx.readFile(file);
-    const sheet = workbook.worksheets[0];
-    if (!sheet)
-        throw new Error("Workbook contains no worksheets.");
-    const rows: string[][] = [];
-    sheet.eachRow({ includeEmpty: false }, (row: Row) => {
 
-        rows.push(
-            (row.values as unknown[])
-                .slice(1)
-                .map(v => String(v ?? "").trim())
+    await workbook.xlsx.readFile(file);
+
+    const sheet = workbook.worksheets[0];
+
+    if (!sheet) {
+        throw new Error(
+            "Workbook contains no worksheets."
         );
-    });
-    if (!rows.length)
-        throw new Error("Worksheet is empty.");
+    }
+
+    const rows: string[][] = [];
+
+    sheet.eachRow(
+        { includeEmpty: false },
+        (row: Row) => {
+            rows.push(
+                (row.values as unknown[])
+                    .slice(1)
+                    .map(v => String(v ?? "").trim())
+            );
+        }
+    );
+
+    if (!rows.length) {
+        throw new Error(
+            "Worksheet is empty."
+        );
+    }
+
     return {
-        headers: rows[0].map((h, i) => h || `col_${i}`),
+        headers: rows[0].map(
+            (h, i) => h || `col_${i}`
+        ),
         rows: rows.slice(1)
     };
 }
 
-async function loadTable(file: string): Promise<TableData> {
+async function loadTable(
+    file: string
+): Promise<TableData> {
 
     switch (path.extname(file).toLowerCase()) {
 
         case ".csv":
             return loadCsv(file);
+
         case ".xlsx":
             return loadXlsx(file);
+
         default:
-            throw new Error("Unsupported table format.");
+            throw new Error(
+                "Unsupported table format."
+            );
     }
 }
 
@@ -272,39 +312,64 @@ function classifyColumns(
     headers: string[],
     rows: string[][]
 ) {
-
     const arrays: WaveformArray[] = [];
+
     const metadata: Record<string, unknown> = {
         metadataSources: {}
     };
-    for (let c = 0; c < headers.length; c++) {
 
+    for (
+        let c = 0;
+        c < headers.length;
+        c++
+    ) {
         const name = headers[c];
+
         const rawValues = rows.map(r =>
             stripCell(r[c] ?? "")
         );
-        const nonEmpty = rawValues.filter(Boolean);
-        if (!nonEmpty.length)
-            continue;
-        const unique = new Set(nonEmpty);
-        if (unique.size === 1) {
 
-            const metadataName =
-                name && name.trim() !== ''
-                    ? name
-                    : `meta${Object.keys(metadata).filter(k => k.startsWith('meta')).length}`;
-            metadata[metadataName] = nonEmpty[0];
+        const nonEmpty =
+            rawValues.filter(Boolean);
+
+        if (!nonEmpty.length) {
             continue;
         }
 
-        const numeric = rawValues.map(parseNumeric);
-        if (numeric.every(Number.isFinite)) {
+        const unique = new Set(nonEmpty);
+
+        if (unique.size === 1) {
+
+            const metadataName =
+                name && name.trim() !== ""
+                    ? name
+                    : `meta${
+                        Object.keys(metadata)
+                            .filter(k =>
+                                k.startsWith("meta")
+                            ).length
+                    }`;
+
+            metadata[metadataName] =
+                nonEmpty[0];
+
+            continue;
+        }
+
+        const numeric =
+            rawValues.map(parseNumeric);
+
+        if (
+            numeric.every(Number.isFinite)
+        ) {
             arrays.push({
                 label:
-                    name && name.trim() !== ''
+                    name && name.trim() !== ""
                         ? name
                         : `data${arrays.length}`,
-                waveform: new Float32Array(numeric)
+
+                waveform:
+                    new Float32Array(numeric)
             });
         }
 
@@ -316,12 +381,7 @@ function classifyColumns(
          * enum arrays
          */
     }
-    // console.log(
-    // arrays.map(a => ({
-    //     label: a.label,
-    //     length: a.waveform.length,
-    //     first: Array.from(a.waveform.slice(0,4))    }))
-    // );
+
     return {
         arrays,
         metadata
@@ -331,14 +391,21 @@ function classifyColumns(
 /* -------------------------------------------------------------------------- */
 /*                               Public mapper                                */
 /* -------------------------------------------------------------------------- */
+
 // Used dynamically by usig.mjs conversion pipeline.
 export async function mapCsvXlsxToIRCandidate({
     inputPath,
     filename
 }: MapperArgs) {
 
-    console.log("[csvxlsxMapper] mapping:", filename);
-    const table = await loadTable(inputPath);
+    console.log(
+        "[csvxlsxMapper] mapping:",
+        filename
+    );
+
+    const table =
+        await loadTable(inputPath);
+
     const {
         arrays,
         metadata
@@ -346,56 +413,71 @@ export async function mapCsvXlsxToIRCandidate({
         table.headers,
         table.rows
     );
-    if (!arrays.length)
+
+    if (!arrays.length) {
         throw new Error(
             "No varying numeric columns found."
         );
+    }
+
     console.log(
-        '[csvxlsxMapper final metadata]',
-        JSON.stringify(metadata, null, 2)
+        "[csvxlsxMapper final metadata]",
+        JSON.stringify(
+            metadata,
+            null,
+            2
+        )
     );
+
     return {
         packet: {
-            waveform: arrays[0].waveform,
+            waveform:
+                arrays[0].waveform,
+
             arrays,
-            channels: arrays,
+
+            channels:
+                arrays,
+
             metadata: {
-                columnLabels: arrays.map(a => a.label),
+                columnLabels:
+                    arrays.map(a => a.label),
+
                 ...metadata,
+
                 metadataSources: {
                     ...(metadata.metadataSources as object),
+
                     csvxlsxMapper: true
                 }
             }
         },
+
         capturedVars: {}
     };
 }
 
 export interface WaveformMetadata {
-  // ── Provenance ────────────────────────────────────────────────────────────
-  sourceFile?: string;
-  captureTimestamp?: string;
-  instrument?: string;
-  processingHistory?: string[];
+    // ── Provenance ────────────────────────────────────────────────────────────
+    sourceFile?: string;
+    captureTimestamp?: string;
+    instrument?: string;
+    processingHistory?: string[];
 
-  // ── Scaling & units ───────────────────────────────────────────────────────
-  units?: SignalUnits;
+    // ── Binary format specifics ───────────────────────────────────────────────
+    endianness?: "little" | "big";
+    signed?: boolean;
+    bitDepth?: number;
+    storageBitDepth?: number;
+    headerBytes?: number;
 
-  // ── Binary format specifics ───────────────────────────────────────────────
-  endianness?: 'little' | 'big';
-  signed?: boolean;
-  bitDepth?: number;
-  storageBitDepth?: number;
-  headerBytes?: number;
+    // ── Multi-channel ─────────────────────────────────────────────────────────
+    channels?: number;
+    channelLabels?: string[];
+    channelIndex?: number;
 
-  // ── Multi-channel ─────────────────────────────────────────────────────────
-  channels?: number;
-  channelLabels?: string[];
-  channelIndex?: number;
-
-  // ── Provenance tracking ───────────────────────────────────────────────────
-  metadataSources?: Record<string, unknown>;
-  userOverrides?: Record<string, unknown>;
-  inferredFields?: string[];
+    // ── Provenance tracking ───────────────────────────────────────────────────
+    metadataSources?: Record<string, unknown>;
+    userOverrides?: Record<string, unknown>;
+    inferredFields?: string[];
 }

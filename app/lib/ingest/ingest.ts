@@ -32,7 +32,6 @@
  *   3. Inferred                          ← marked in inferredFields[]
  */
 
-import { mapBinaryToIRCandidate } from '../ir/binMapper';
 import type { WaveformPacket, WaveformMetadata } from './types';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -87,17 +86,6 @@ export interface IngestColumnsResult {
 // Broad, domain-agnostic patterns — no plugin-specific knowledge here.
 // Returns SI base-unit values (Hz, bits, volts).
 // ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Parse a numeric string that may include:
- *   - decimal point:        "2.25"
- *   - p-decimal encoding:   "2p25" → 2.25
- *   - scientific notation:  "2.25e9", "2e9"
- *   - unit suffix handled externally
- */
-function parseEncodedNumber(s: string): number {
-  return parseFloat(s.replace(/p(?=\d)/gi, '.'));
-}
 
 /**
  * Normalise a frequency value + unit string → Hz.
@@ -201,8 +189,7 @@ function xlsxCellToString(value: unknown): string {
 
 async function parseXlsxTable(file: File): Promise<{ headers: string[]; dataRows: string[][] }> {
   const excelJsMod = await import('exceljs');
-  const ExcelJS = excelJsMod.default ?? excelJsMod;
-  const workbook = new ExcelJS.Workbook();
+  const workbook = new excelJsMod.Workbook();
   const buffer = await file.arrayBuffer();
   await workbook.xlsx.load(buffer);
 
@@ -210,8 +197,10 @@ async function parseXlsxTable(file: File): Promise<{ headers: string[]; dataRows
   if (!worksheet) return { headers: [], dataRows: [] };
 
   const rows: string[][] = [];
-  worksheet.eachRow({ includeEmpty: false }, (row) => {
-    const values = (Array.isArray(row.values) ? row.values.slice(1) : []).map(xlsxCellToString);
+  worksheet.eachRow({ includeEmpty: false }, (row: import('exceljs').Row) => {
+    const values = (Array.isArray(row.values) ? row.values.slice(1) : []).map(
+        (v: unknown) => xlsxCellToString(v)
+    );
     const hasAnyValue = values.some(v => v !== '');
     if (hasAnyValue) rows.push(values);
   });
