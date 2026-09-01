@@ -2,6 +2,7 @@ import os
 import time
 import subprocess
 import pandas as pd
+import shutil
 from pathlib import Path
 
 
@@ -57,22 +58,74 @@ def run_usig(command, b_verbose=False):
         text=True
     )
 
+    command_text = " ".join(str(item) for item in command)
+
     if b_verbose:
         print("\nCOMMAND:")
-        print(" ".join(command))
+        print(command_text)
         print("\nSTDOUT:")
         print(result.stdout)
         print("\nSTDERR:")
         print(result.stderr)
 
     if result.returncode != 0:
-        raise RuntimeError(
-            f"USIG command failed:\n"
-            f"{' '.join(command)}\n\n"
+        print(
+            f"\nUSIG command failed:\n"
+            f"{command_text}\n\n"
             f"{result.stderr}"
         )
+        return None
 
     return result
+
+def find_node():
+
+    # Normal case:
+    # node is already available in PATH
+    node = shutil.which("node")
+
+    if node:
+        return node
+
+    # Common Windows locations
+    windows_candidates = [
+        Path(os.environ.get("ProgramFiles", "")) / "nodejs" / "node.exe",
+        Path(os.environ.get("ProgramFiles(x86)", "")) / "nodejs" / "node.exe",
+    ]
+
+    # Common Unix locations
+    unix_candidates = [
+        Path("/usr/bin/node"),
+        Path("/usr/local/bin/node"),
+    ]
+
+    candidates = (
+        windows_candidates +
+        unix_candidates
+    )
+
+    for candidate in candidates:
+
+        if candidate.exists():
+            return str(candidate)
+
+    # nvm fallback (Linux/macOS)
+    nvm_root = Path.home() / ".nvm" / "versions" / "node"
+
+    if nvm_root.exists():
+
+        versions = sorted(
+            nvm_root.glob("*/bin/node"),
+            reverse=True
+        )
+
+        if versions:
+            return str(versions[0])
+
+    raise RuntimeError(
+        "Node.js was not found. "
+        "Please install Node.js before running USIG."
+    )
 
 
 def add_check(report, name, condition):
@@ -142,15 +195,20 @@ def main():
     # -------------------------------------------------------------------------
     # Environment setup
     # -------------------------------------------------------------------------
-
-    os.environ["PATH"] += ':/home/gnew/.nvm/versions/node/v24.11.1/bin'
-
     PROJECT_ROOT = Path(__file__).resolve().parents[2]
+    node_executable = find_node()
+    USIG_CLI = PROJECT_ROOT / "usig.mjs"
+
+    if not USIG_CLI.exists():
+        raise FileNotFoundError(
+            f"Missing USIG CLI entry point: {USIG_CLI}"
+        )
 
     # Verify Node runtime is available because USIG CLI is Node-based.
     subprocess.run(
-        ["node", "--version"],
-        check=True
+        [node_executable, "--version"],
+        check=True,
+        capture_output=True
     )
 
     # -------------------------------------------------------------------------
@@ -242,7 +300,8 @@ def main():
 
     run_usig(
         [
-            "usig",
+            node_executable,
+            str(USIG_CLI),
             "-i",
             str(golden_csv),
             str(csv_to_bin)
@@ -272,9 +331,10 @@ def main():
     #   - exported dataframe structure is preserved
     # =========================================================================
 
-    run_usig(
+    result = run_usig(
         [
-            "usig",
+            node_executable,
+            str(USIG_CLI),
             "-i",
             str(csv_to_bin),
             str(bin_to_csv)
@@ -284,40 +344,62 @@ def main():
 
     add_check(
         report,
+        "Step 1: BIN -> CSV command succeeded",
+        result is not None
+    )
+
+    add_check(
+        report,
         "Step 1: BIN -> CSV file created",
         bin_to_csv.exists()
     )
 
-    pd_roundtrip = pd.read_csv(bin_to_csv)
+    pd_roundtrip = None
+
+    if bin_to_csv.exists():
+        try:
+            pd_roundtrip = pd.read_csv(bin_to_csv)
+        except Exception as e:
+            print(f"Step 1: failed to read CSV: {e}")
 
     add_check(
         report,
-        "Step 1: CSV column count preserved",
-        len(pd_orig.columns) == len(pd_roundtrip.columns)
+        "Step 1: CSV readable",
+        pd_roundtrip is not None
     )
 
-    add_check(
-        report,
-        "Step 1: CSV column names preserved",
-        list(pd_orig.columns) == list(pd_roundtrip.columns)
-    )
+    if pd_roundtrip is not None:
+        add_check(
+            report,
+            "Step 1: CSV column count preserved",
+            len(pd_orig.columns) == len(pd_roundtrip.columns)
+        )
 
-    add_check(
-        report,
-        "Step 1: waveform data preserved",
-        (pd_roundtrip["data"] == pd_orig["data"]).all()
-    )
+        add_check(
+            report,
+            "Step 1: CSV column names preserved",
+            list(pd_orig.columns) == list(pd_roundtrip.columns)
+        )
 
-    add_check(
-        report,
-        "Step 1: row count preserved",
-        len(pd_orig) == len(pd_roundtrip)
-    )
+        add_check(
+            report,
+            "Step 1: waveform data preserved",
+            "data" in pd_roundtrip.columns
+            and "data" in pd_orig.columns
+            and (pd_roundtrip["data"] == pd_orig["data"]).all()
+        )
+
+        add_check(
+            report,
+            "Step 1: row count preserved",
+            len(pd_orig) == len(pd_roundtrip)
+        )
 
     # =========================================================================
     # STEP 2
     #
     # CSV -> BIN using metadata inferred from filename
+    # (CSV -> BIN with --infer-meta-from-filename)
     #
     # Metadata is not validated here because it is stored inside the BIN.
     # Validation happens after STEP 3 when the BIN is exported again.
@@ -325,7 +407,8 @@ def main():
 
     run_usig(
         [
-            "usig",
+            node_executable,
+            str(USIG_CLI),
             "-i",
             str(golden_csv),
             "--infer-meta-from-filename",
@@ -361,7 +444,8 @@ def main():
 
     run_usig(
         [
-            "usig",
+            node_executable,
+            str(USIG_CLI),
             "-i",
             str(metadata_bin),
             str(metadata_bin_to_csv)
@@ -375,7 +459,19 @@ def main():
         metadata_bin_to_csv.exists()
     )
 
-    pd_metadata_roundtrip = pd.read_csv(metadata_bin_to_csv)
+    pd_metadata_roundtrip = None
+
+    if metadata_bin_to_csv.exists():
+        try:
+            pd_metadata_roundtrip = pd.read_csv(metadata_bin_to_csv)
+        except Exception as e:
+            print(f"Step 3: failed to read CSV: {e}")
+
+    add_check(
+        report,
+        "Step 3: CSV readable",
+        pd_metadata_roundtrip is not None
+    )
 
     # -------------------------------------------------------------------------
     # Waveform validation
@@ -384,7 +480,9 @@ def main():
     add_check(
         report,
         "Step 3: waveform preserved after metadata BIN roundtrip",
-        (pd_metadata_roundtrip["data"] == pd_orig["data"]).all()
+        pd_metadata_roundtrip is not None
+        and "data" in pd_metadata_roundtrip.columns
+        and (pd_metadata_roundtrip["data"] == pd_orig["data"]).all()
     )
 
     # -------------------------------------------------------------------------
@@ -411,19 +509,21 @@ def main():
     # proves the metadata pipeline.
     # -------------------------------------------------------------------------
 
-    validate_metadata(
-        report,
-        pd_metadata_roundtrip,
-        {
-            "fs": 2.25,
-            "tonemode": "single",
-            "fftlength": 8192,
-            "numaveraging": 4,
-            "numberofcores": 8,
-            "ticorrections": "ogp"
-        },
-        "Step 3"
-    )
+    if pd_metadata_roundtrip is not None:
+        validate_metadata(
+            report,
+            pd_metadata_roundtrip,
+            {
+                "fs": 2.25,
+                "tonemode": "single",
+                "fftlength": 8192,
+                "numaveraging": 4,
+                "numberofcores": 8,
+                "ticorrections": "ogp"
+            },
+            "Step 3"
+        )
+
 
     # =========================================================================
     # STEP 4
@@ -440,7 +540,8 @@ def main():
 
     run_usig(
         [
-            "usig",
+            node_executable,
+            str(USIG_CLI),
             "-i",
             metadata_bin_to_csv,
             "-p",
@@ -482,7 +583,8 @@ def main():
 
     run_usig(
         [
-            "usig",
+            node_executable,
+            str(USIG_CLI),
             "-i",
             str(override_bin),
             str(override_csv)
@@ -496,33 +598,50 @@ def main():
         override_csv.exists()
     )
 
-    pd_override = pd.read_csv(override_csv)
+    pd_override = None
+
+    if override_csv.exists():
+        try:
+            pd_override = pd.read_csv(override_csv)
+        except Exception as e:
+            print(f"Step 5: failed to read CSV: {e}")
+
+    add_check(
+        report,
+        "Step 5: CSV readable",
+        pd_override is not None
+    )
 
     add_check(
         report,
         "Step 5: waveform preserved after override",
-        (pd_override["data"] == pd_orig["data"]).all()
+        pd_override is not None
+        and "data" in pd_override.columns
+        and (pd_override["data"] == pd_orig["data"]).all()
+
     )
 
     add_check(
         report,
         "Step 5: row count preserved after override",
-        len(pd_override) == len(pd_orig)
-    )
+        pd_override is not None
+        and len(pd_override) == len(pd_orig)
 
-    validate_metadata(
-        report,
-        pd_override,
-        {
-            "fs": 2.25,
-            "tonemode": "single",
-            "fftlength": 8192,
-            "numaveraging": 5,
-            "numberofcores": 8,
-            "ticorrections": "ogp"
-        },
-        "Step 5"
     )
+    if pd_override is not None:
+        validate_metadata(
+            report,
+            pd_override,
+            {
+                "fs": 2.25,
+                "tonemode": "single",
+                "fftlength": 8192,
+                "numaveraging": 5,
+                "numberofcores": 8,
+                "ticorrections": "ogp"
+            },
+            "Step 5"
+        )
 
     # =========================================================================
     # STEP 6
@@ -544,7 +663,8 @@ def main():
 
     run_usig(
         [
-            "usig",
+            node_executable,
+            str(USIG_CLI),
             "-i",
             str(override_csv),
             "-p",
@@ -586,7 +706,8 @@ def main():
 
     run_usig(
         [
-            "usig",
+            node_executable,
+            str(USIG_CLI),
             "-i",
             str(xlsx_output),
             str(xlsx_roundtrip_csv)
@@ -600,34 +721,53 @@ def main():
         xlsx_roundtrip_csv.exists()
     )
 
-    pd_xlsx = pd.read_csv(xlsx_roundtrip_csv)
+    pd_xlsx = None
+
+    if xlsx_roundtrip_csv.exists():
+        try:
+            pd_xlsx = pd.read_csv(xlsx_roundtrip_csv)
+        except Exception as e:
+            print(f"Step 7: failed to read CSV: {e}")
+
+    add_check(
+        report,
+        "Step 7: CSV readable",
+        pd_xlsx is not None
+    )
 
     add_check(
         report,
         "Step 7: waveform preserved after XLSX roundtrip",
-        (pd_xlsx["data"] == pd_override["data"]).all()
+        pd_xlsx is not None
+        and pd_override is not None
+        and "data" in pd_xlsx.columns
+        and "data" in pd_override.columns
+        and (pd_xlsx["data"] == pd_override["data"]).all()
+
     )
 
     add_check(
         report,
         "Step 7: row count preserved after XLSX roundtrip",
-        len(pd_xlsx) == len(pd_override)
+        pd_xlsx is not None
+        and pd_override is not None
+        and len(pd_xlsx) == len(pd_override)
     )
-
-    validate_metadata(
-        report,
-        pd_xlsx,
-        {
-            "fs": 2.25,
-            "tonemode": "single",
-            "fftlength": 8192,
-            "numaveraging": 5,
-            "numberofcores": 8,
-            "ticorrections": "ogp",
-            "gg": 1
-        },
-        "Step 7"
-    )
+    if pd_xlsx is not None:
+        validate_metadata(
+            report,
+            pd_xlsx,
+            {
+                "fs": 2.25,
+                "tonemode": "single",
+                "fftlength": 8192,
+                "numaveraging": 5,
+                "numberofcores": 8,
+                "ticorrections": "ogp",
+                "gg": 1
+            },
+            "Step 7"
+        )
 
     # -------------------------------------------------------------------------
     # Final report

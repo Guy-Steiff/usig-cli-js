@@ -52,9 +52,10 @@
 
 import { ingestFile, ingestAllColumns } from '../ingest';
 import type { IngestHints, IngestColumnsResult } from '../ingest/ingest';
+import { mapBinaryToIRCandidate } from './binMapper';
 import type { SignalFrame, IRManifestEntry } from './types';
 import { IRCache, fileFingerprint, hintsKey as makeHintsKey } from './cache';
-import { ingestMappedBinary } from './binMapper';
+import type { WaveformPacket } from '../ingest/types';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Stats
@@ -127,12 +128,29 @@ export class IREngine {
       columnarMeta = {
         headers:            colsResult.headers,
         singleValueColumns: colsResult.singleValueColumns,
-        capturedVars:       colsResult.capturedVars,
+        capturedVars:       {},
       };
+
     }
 
     // ── Ingest the single-signal waveform packet ───────────────────────────
-    const packet = await ingestFile(file, hints);
+    const fileName = file.name.toLowerCase();
+
+    let packet: WaveformPacket;
+
+    if (fileName.endsWith('.bin') || fileName.endsWith('.raw')) {
+      const mapped = await mapBinaryToIRCandidate({
+        filename: file.name,
+        data: Buffer.from(await file.arrayBuffer()),
+        hints: hints as Record<string, unknown>,
+      });
+
+      packet = mapped.packet;
+    } else {
+      packet = await ingestFile(file, hints);
+    }
+
+
 
     // ── Build and cache the frame ──────────────────────────────────────────
     const frame: SignalFrame = {
@@ -197,7 +215,7 @@ export class IREngine {
         packet,
         headers:            colsResult.headers,
         singleValueColumns: colsResult.singleValueColumns,
-        capturedVars:       colsResult.capturedVars,
+        capturedVars:       {},
         cacheKey:     fileFingerprint(file),
         hintsKey:     makeHintsKey(undefined),
         ingestedAt:   Date.now(),

@@ -177,13 +177,10 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as ExcelJSImport from "exceljs";
 import type { Row } from "exceljs";
+import type { WaveformArray } from '../ingest/types';
+
 
 const ExcelJS = (ExcelJSImport as any).default ?? ExcelJSImport;
-
-interface IRArray {
-    label: string;
-    waveform: Float32Array;
-}
 
 interface MapperArgs {
     inputPath: string;
@@ -276,7 +273,7 @@ function classifyColumns(
     rows: string[][]
 ) {
 
-    const arrays: IRArray[] = [];
+    const arrays: WaveformArray[] = [];
     const metadata: Record<string, unknown> = {
         metadataSources: {}
     };
@@ -373,4 +370,32 @@ export async function mapCsvXlsxToIRCandidate({
         },
         capturedVars: {}
     };
+}
+
+export interface WaveformMetadata {
+  // ── Provenance ────────────────────────────────────────────────────────────
+  sourceFile?: string;
+  captureTimestamp?: string;
+  instrument?: string;
+  processingHistory?: string[];
+
+  // ── Scaling & units ───────────────────────────────────────────────────────
+  units?: SignalUnits;
+
+  // ── Binary format specifics ───────────────────────────────────────────────
+  endianness?: 'little' | 'big';
+  signed?: boolean;
+  bitDepth?: number;
+  storageBitDepth?: number;
+  headerBytes?: number;
+
+  // ── Multi-channel ─────────────────────────────────────────────────────────
+  channels?: number;
+  channelLabels?: string[];
+  channelIndex?: number;
+
+  // ── Provenance tracking ───────────────────────────────────────────────────
+  metadataSources?: Record<string, unknown>;
+  userOverrides?: Record<string, unknown>;
+  inferredFields?: string[];
 }

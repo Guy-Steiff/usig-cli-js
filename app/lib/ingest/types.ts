@@ -18,8 +18,74 @@
 // Canonical metadata — mirrors unified_signal Section 2
 // ─────────────────────────────────────────────────────────────────────────────
 
-export type SourceFormat = 'csv' | 'txt' | 'xlsx' | 'bin' | 'json' | 'hdf5' | 'unknown';
-export type SignalUnits  = 'volts' | 'amps' | 'adc_codes' | 'dbm' | 'normalized' | string;
+export type SourceFormat =
+  | 'csv'
+  | 'txt'
+  | 'xlsx'
+  | 'bin'
+  | 'json'
+  | 'hdf5'
+  | 'unknown';
+
+// export type SignalUnits =
+//   | 'volts'
+//   | 'amps'
+//   | 'adc_codes'
+//   | 'dbm'
+//   | 'normalized'
+//   | string;
+
+export interface WaveformArray {
+  label: string;
+  waveform: Float32Array;
+}
+
+export interface WaveformMetadata {
+  // Provenance
+  sourceFile?: string;
+  captureTimestamp?: string;
+  instrument?: string;
+  processingHistory?: string[];
+
+  // Scaling / units
+  units?: SignalUnits;
+
+  // Binary format
+  endianness?: 'little' | 'big';
+  signed?: boolean;
+  bitDepth?: number;
+  storageBitDepth?: number;
+  headerBytes?: number;
+
+  // Multi-channel
+  channels?: number;
+  channelLabels?: string[];
+  channelIndex?: number;
+
+  // General metadata / provenance
+  metadataSources?: Record<string, unknown>;
+  userOverrides?: Record<string, unknown>;
+  inferredFields?: string[];
+
+  // Allow ingestion-specific metadata such as fs,
+  // fftLength, toneMode, etc.
+  [key: string]: unknown;
+}
+
+export interface WaveformPacket {
+  waveform: Float32Array;
+  metadata: WaveformMetadata;
+
+  /**
+   * All varying numeric columns preserved by table ingestion.
+   */
+  arrays?: WaveformArray[];
+
+  /**
+   * Compatibility alias for arrays.
+   */
+  channels?: WaveformArray[];
+}
 
 /**
  * Optional metadata fields — may be present depending on source and analysis.
@@ -50,6 +116,36 @@ export interface WaveformMetadata {
   // ── Provenance tracking (mirrors unified_signal) ──────────────────────────
   userOverrides?: Record<string, unknown>;
   inferredFields?: string[];      // fields that were inferred, not declared
+}
+
+/**
+ * One independently preserved varying column from a tabular source.
+ *
+ * A table may contain multiple waveform-like arrays:
+ *   time, voltage, frequency, I, Q, etc.
+ *
+ * The mapper deliberately does not decide which one is "the signal".
+ */
+export interface WaveformArray {
+  label: string;
+  waveform: Float32Array;
+}
+
+export interface WaveformPacket {
+  /** Primary/compatibility waveform — normally the first array. */
+  waveform: Float32Array;
+
+  /** All preserved varying arrays from tabular ingestion. */
+  arrays?: WaveformArray[];
+
+  /**
+   * Compatibility alias for older consumers.
+   * Normally references the same array objects as `arrays`.
+   */
+  channels?: WaveformArray[];
+
+  /** All metadata for this packet. */
+  metadata: WaveformMetadata;
 }
 
 export interface WaveformPacket {

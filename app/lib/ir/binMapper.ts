@@ -161,6 +161,7 @@
  */
 
 import * as fs from 'node:fs/promises';
+import type { WaveformPacket } from '../ingest/types';
 import {
   deserializeFrame,
   unpackSerializedIR,
@@ -169,8 +170,13 @@ import {
 import { generateHypothesis } from './hypothesis_gen_for_ir_from_bin.js';
 
 
-function materializeMetadataFields(fields = []) {
-  const metadata = {
+function materializeMetadataFields(
+  fields: Array<{
+    path: string;
+    value: unknown;
+  }> = []
+): Record<string, any> {
+  const metadata: Record<string, any> = {
     metadataSources: {},
   };
 
@@ -183,13 +189,16 @@ function materializeMetadataFields(fields = []) {
       .replace(/^metadata\./, '')
       .split('.');
 
-    let target = metadata;
+    let target: any = metadata;
 
     while (path.length > 1) {
-      const key = path.shift();
+      const key = path.shift()!;
 
       if (!target[key]) {
-        target[key] = /^\d+$/.test(path[0]) ? [] : {};
+        target[key] =
+          /^\d+$/.test(path[0])
+            ? []
+            : {};
       }
 
       target = target[key];
@@ -207,39 +216,101 @@ function materializeMetadataFields(fields = []) {
   return metadata;
 }
 
+
 function normalizeChannels(mapped: any, raw: Buffer) {
   const channelDefinitions = mapped.channels;
 
-  if (!Array.isArray(channelDefinitions) || channelDefinitions.length === 0) {
+  if (
+    !Array.isArray(channelDefinitions) ||
+    channelDefinitions.length === 0
+  ) {
     const instructions = mapped.reconstruction_instructions;
 
-    const waveformOffset =
-      raw.length -
-      (instructions.samples * instructions.bytes_per_sample);
+    if (
+      !instructions ||
+      !Number.isInteger(instructions.samples) ||
+      !Number.isInteger(instructions.bytes_per_sample)
+    ) {
+      throw new Error(
+        'Binary mapper produced no channel definitions and incomplete waveform reconstruction instructions.'
+      );
+    }
+
+    // Determine offset to use. If an explicit offset was provided in the
+    // reconstruction instructions (e.g. embedded metadata), honor it exactly.
+    // Only fall back to end-of-file placement when no explicit offset exists.
+    let waveformOffset: number;
+    if (Object.prototype.hasOwnProperty.call(instructions, 'offset') && Number.isInteger(instructions.offset)) {
+      waveformOffset = instructions.offset as number;
+    } else {
+      waveformOffset = raw.length - (instructions.samples * instructions.bytes_per_sample);
+    }
+
+    const metadata =
+      materializeMetadataFields(
+        mapped.metadata_fields
+      );
+
+    const channelLabels =
+      Array.isArray(metadata.channelLabels)
+        ? metadata.channelLabels
+        : [];
+
+    const label = channelLabels[0];
+
+
+    const waveform = reconstructWaveform(raw, {
+      ...instructions,
+      offset: waveformOffset,
+    });
+
+    const reconUsed = {
+      encoding: instructions.encoding ?? 'float32',
+      endianness: instructions.endianness ?? 'little',
+      bytes_per_sample: instructions.bytes_per_sample,
+      samples: instructions.samples,
+      offset: waveformOffset,
+      scale: instructions.scale ?? 1.0,
+      offset_value: instructions.offset_value ?? 0.0,
+      channelIndex: 0,
+    };
 
     return [
       {
-        label: 'data',
-        waveform: reconstructWaveform(raw, {
-          ...instructions,
-          offset: waveformOffset,
-        }),
+        label,
+        waveform,
+        reconstructionUsed: reconUsed,
       },
     ];
-  }
 
-  return channelDefinitions.map((channel, index) => {
-    const waveform = reconstructWaveform(
-      raw,
-      channel.reconstruction
-    );
+    }
 
-    return {
-      label: channel.label ?? `channel_${index}`,
-      waveform,
-    };
-  });
+    return channelDefinitions.map((channel, index) => {
+      const waveform = reconstructWaveform(
+        raw,
+        channel.reconstruction
+      );
+
+      const reconUsed = {
+        encoding: channel.reconstruction?.encoding ?? 'float32',
+        endianness: channel.reconstruction?.endianness ?? 'little',
+        bytes_per_sample: channel.reconstruction?.bytes_per_sample,
+        samples: channel.reconstruction?.samples,
+        offset: channel.reconstruction?.offset ?? 0,
+        scale: channel.reconstruction?.scale ?? 1.0,
+        offset_value: channel.reconstruction?.offset_value ?? 0.0,
+        channelIndex: index,
+      };
+
+      return {
+        label: channel.label ?? `channel_${index}`,
+        waveform,
+        reconstructionUsed: reconUsed,
+      };
+    });
 }
+
+
 
 function reconstructWaveform(
       buffer: Buffer,
@@ -251,44 +322,45 @@ function reconstructWaveform(
     offset = 0,
     scale = 1,
     offset_value = 0,
+    endianness = 'little',
+    bytes_per_sample,
   } = instructions;
 
-  const payload = buffer.subarray(offset);
-    if (payload.byteOffset % 4 !== 0 && encoding === 'float32') {
-      const aligned = Buffer.from(payload);
-      return reconstructWaveform(aligned, {
-        ...instructions,
-        offset: 0,
-      });
-    }
+  const littleEndian = endianness === 'little';
+
+  // Validate available bytes explicitly. Choose to throw on insufficient
+  // data rather than silently truncate — makes behavior explicit and testable.
+  const needed = samples * bytes_per_sample;
+  const available = buffer.length - offset;
+  if (available < needed) {
+    throw new Error(
+      `Insufficient data for waveform reconstruction: need ${needed} bytes starting at offset ${offset}, only ${available} available.`
+    );
+  }
+
+  const view = new DataView(
+    buffer.buffer,
+    buffer.byteOffset + offset,
+    needed
+  );
 
   switch (encoding) {
     case 'float32': {
-      const raw = new Float32Array(
-          payload.buffer.slice(
-              payload.byteOffset,
-              payload.byteOffset + samples * 4
-          )
-      );
-
-      return Float32Array.from(
-        raw,
-        v => (v + offset_value) * scale
-      );
+      const out = new Float32Array(samples);
+      for (let i = 0; i < samples; i++) {
+        const v = view.getFloat32(i * 4, littleEndian);
+        out[i] = (v + offset_value) * scale;
+      }
+      return out;
     }
 
     case 'int16': {
-      const raw = new Int16Array(
-          payload.buffer.slice(
-            payload.byteOffset,
-            payload.byteOffset + samples * 2
-          )
-        );
-
-      return Float32Array.from(
-        raw,
-        v => (v + offset_value) * scale
-      );
+      const out = new Float32Array(samples);
+      for (let i = 0; i < samples; i++) {
+        const v = view.getInt16(i * 2, littleEndian);
+        out[i] = (v + offset_value) * scale;
+      }
+      return out;
     }
 
     default:
@@ -301,11 +373,33 @@ function reconstructWaveform(
 export async function mapBinaryToIRCandidate({
   inputPath,
   filename,
+  data,
   hints: _hints = {},
-}) {
+}: {
+  inputPath?: string;
+  filename: string;
+  data?: Buffer;
+  hints?: Record<string, unknown>;
+}): Promise<{
+  packet: WaveformPacket;
+  capturedVars: Record<string, unknown>;
+}> {
+
+
   console.log('[binMapper] mapping:', filename);
 
-  const raw = await fs.readFile(inputPath);
+  const raw =
+    data ??
+    (inputPath
+      ? await fs.readFile(inputPath)
+      : null);
+
+  if (!raw) {
+    throw new Error(
+      `Binary mapper requires either inputPath or data for "${filename}".`
+    );
+  }
+
 
 
   // --------------------------------------------------
@@ -324,15 +418,26 @@ export async function mapBinaryToIRCandidate({
         waveform
       );
 
+    console.error('[DEBUG binMapper native IR]', {
+      frameKeys: Object.keys(frame ?? {}),
+      packetKeys: Object.keys(frame?.packet ?? {}),
+      packetMetadata: frame?.packet?.metadata,
+      waveformLength: frame?.packet?.waveform?.length,
+    });
+
     return {
       packet: frame.packet,
       capturedVars: frame.capturedVars ?? {},
     };
 
-  } catch {
+  } catch (error) {
+    console.error('[DEBUG binMapper native IR failed]', error);
+
     // Not a USIG container.
     // Continue with generic binary hypothesis mapping.
   }
+
+
 
 
   // --------------------------------------------------
@@ -340,8 +445,7 @@ export async function mapBinaryToIRCandidate({
   // --------------------------------------------------
 
   const mapped: any =
-    generateHypothesis(inputPath);
-
+      generateHypothesis(raw);
 
   if (!mapped?.decision?.can_create_ir) {
     throw new Error(
@@ -349,16 +453,24 @@ export async function mapBinaryToIRCandidate({
     );
   }
 
-
-  const metadata =
-    materializeMetadataFields(
+  const metadata = {
+    ...materializeMetadataFields(
       mapped.metadata_fields
-    );
+    ),
+    channelLabels: Array.isArray(mapped.channel_labels)
+      ? mapped.channel_labels
+      : undefined,
+  } as WaveformPacket['metadata'];
 
+
+  const mappedWithMetadata = {
+    ...mapped,
+    metadata,
+  };
 
   const channels =
     normalizeChannels(
-      mapped,
+      mappedWithMetadata,
       raw
     );
 
@@ -366,17 +478,62 @@ export async function mapBinaryToIRCandidate({
   const waveform =
     channels[0].waveform;
 
+  // Persist effective reconstruction instructions used for the primary channel
+  // so downstream consumers can audit and reproduce the decoding.
+  const primaryRecon: any = (() => {
+    // If normalizeChannels recorded the actual reconstructionUsed for the channel, prefer it.
+    const ch = channels[0];
+    if (ch && ch.reconstructionUsed) {
+      return ch.reconstructionUsed;
+    }
+
+    // If mapped provided a top-level reconstruction_instructions, use that as base.
+    const top = mapped.reconstruction_instructions ?? {};
+    // If channels provided per-channel reconstruction, prefer that.
+    const chRecon = mapped.channels && Array.isArray(mapped.channels) && mapped.channels[0]?.reconstruction
+      ? mapped.channels[0].reconstruction
+      : undefined;
+    const used = {
+      encoding: chRecon?.encoding ?? top.encoding ?? 'float32',
+      endianness: chRecon?.endianness ?? top.endianness ?? 'little',
+      bytes_per_sample: chRecon?.bytes_per_sample ?? top.bytes_per_sample ?? (top.encoding === 'int16' ? 2 : 4),
+      samples: chRecon?.samples ?? top.samples ?? waveform.length,
+      offset: chRecon?.offset ?? top.offset ?? 0,
+      scale: chRecon?.scale ?? top.scale ?? 1.0,
+      offset_value: chRecon?.offset_value ?? top.offset_value ?? 0.0,
+      channelIndex: 0,
+    };
+    return used;
+  })();
+
+  console.error('[DEBUG binMapper canonical output]', {
+    metadata,
+    channelLabels: metadata.channelLabels,
+    signalColumn: metadata.signalColumn,
+    channels: channels.map(channel => ({
+      label: channel.label,
+      waveformLength: channel.waveform?.length,
+    })),
+    primaryReconstruction: primaryRecon,
+  });
+
 
   return {
     packet: {
       waveform,
-      channels,
+      arrays: channels.map(c => ({ label: c.label, waveform: c.waveform })),
+      channels: channels.map(c => ({ label: c.label, waveform: c.waveform })),
       metadata: {
         ...metadata,
+        reconstruction: primaryRecon,
+        channelLabels:
+          metadata.channelLabels ??
+          channels.map(channel => channel.label),
       },
     },
 
     capturedVars:
       mapped.capturedVars ?? {},
   };
+
 }

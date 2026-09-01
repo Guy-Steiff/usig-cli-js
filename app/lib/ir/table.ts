@@ -1,65 +1,55 @@
 /**
  * app/lib/ir/table.ts
  *
- * Converts IR into a generic table.
+ * Converts a SignalFrame into a generic table.
  *
- * Export priority:
+ * For tabular ingestion, every preserved varying waveform array becomes
+ * an output column.
  *
- * 1. sourceTable
- *    Exact original input columns.
- *
- * 2. waveform fallback
- *    Only for binary/synthetic inputs without a table.
+ * The first waveform remains the compatibility fallback for legacy packets
+ * which do not expose packet.arrays.
  */
 
 import type { SignalFrame } from './types';
-
 
 export interface IRTable {
   headers: string[];
   rows: unknown[][];
 }
 
-
 export function frameToTable(
   frame: SignalFrame
 ): IRTable {
 
-
   // ─────────────────────────────────────────────
   // Preferred path:
-  // preserve original input table
+  // preserve all independently ingested arrays
   // ─────────────────────────────────────────────
 
-  if (frame.sourceTable) {
+  const arrays = frame.packet.arrays;
 
-    const headers =
-      frame.sourceTable.headers;
+  if (arrays && arrays.length > 0) {
 
+    const headers = arrays.map(
+      array => array.label
+    );
 
-    const length =
-      Math.max(
-        ...headers.map(
-          h =>
-            frame.sourceTable!.columns[h]?.length ?? 0
-        )
-      );
-
+    const length = Math.max(
+      ...arrays.map(
+        array => array.waveform.length
+      )
+    );
 
     const rows: unknown[][] = [];
-
 
     for (let i = 0; i < length; i++) {
 
       rows.push(
-        headers.map(
-          h =>
-            frame.sourceTable!.columns[h]?.[i] ?? ''
+        arrays.map(
+          array => array.waveform[i] ?? ''
         )
       );
-
     }
-
 
     return {
       headers,
@@ -67,22 +57,23 @@ export function frameToTable(
     };
   }
 
-
-
   // ─────────────────────────────────────────────
-  // Binary fallback
+  // Legacy / binary fallback
   // ─────────────────────────────────────────────
+
+  const header =
+    frame.packet.metadata.channelLabels?.[0]
+    ?? frame.headers[0]
+    ?? 'samples';
 
   return {
-
     headers: [
-      frame.waveformColumn,
+      header,
     ],
 
-    rows:
-      Array.from(
-        frame.packet.waveform,
-        v => [v]
-      ),
+    rows: Array.from(
+      frame.packet.waveform,
+      value => [value]
+    ),
   };
 }

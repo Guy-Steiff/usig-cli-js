@@ -752,31 +752,6 @@ async function loadCsvXlsxMapperModule() {
   }
 }
 
-async function loadBinReaderModule() {
-  const tmpDir = path.join(scriptDir, `.tmp_usig_bin_${Date.now()}`);
-  const tmpPath = path.join(tmpDir, 'binreader-bundle.mjs');
-  await fs.mkdir(tmpDir, { recursive: true });
-
-  try {
-    await esbuild.build({
-      entryPoints: [path.join(scriptDir, 'app/lib/binReader.ts')],
-      bundle: true,
-      format: 'esm',
-      target: 'es2020',
-      loader: { '.tsx': 'tsx', '.ts': 'ts' },
-      outfile: tmpPath,
-      external: ['react', 'react-dom', 'fft.js', 'recharts'],
-      sourcemap: false,
-      absWorkingDir: scriptDir,
-      nodePaths: [nodeModulesDir],
-    });
-
-    return await import(pathToFileURL(tmpPath).href + `?t=${Date.now()}`);
-  } finally {
-    await fs.rm(tmpDir, { recursive: true, force: true });
-  }
-}
-
 async function pluginExists(pluginId) {
   const pluginPath = path.join(scriptDir, `app/components/plugins/${pluginId}Plugin.tsx`);
   try { await fs.access(pluginPath); return true; } catch { return false; }
@@ -1487,8 +1462,6 @@ function buildInputSummary(
   return summary;
 }
 
-
-
 function formatReport(payload, format, verbose) {
   if (verbose) console.log('[DEBUG formatReport payload]', JSON.stringify(payload, null, 2));
   if (format === 'json') {
@@ -1715,27 +1688,6 @@ function toArrayBuffer(buf, bytesRead = buf.length) {
   return buf.buffer.slice(buf.byteOffset, buf.byteOffset + bytesRead);
 }
 
-async function readExternalBinMetadata(inputFile, inputFileName) {
-  const binMod = await loadBinReaderModule();
-  const parseBinMetadata = binMod?.parseBinMetadata;
-  if (typeof parseBinMetadata !== 'function') throw new Error('parseBinMetadata export not found in app/lib/binReader.ts bundle.');
-
-  const handle = await fs.open(inputFile, 'r');
-  try {
-    const headerBuf = Buffer.alloc(4096);
-    const firstRead = await handle.read(headerBuf, 0, headerBuf.length, 0);
-    if (firstRead.bytesRead === 0) return {};
-    let meta = parseBinMetadata(toArrayBuffer(headerBuf, firstRead.bytesRead), inputFileName);
-    if (meta?.parseError) {
-      const full = await fs.readFile(inputFile);
-      meta = parseBinMetadata(toArrayBuffer(full), inputFileName);
-    }
-    return meta ?? {};
-  } finally {
-    await handle.close();
-  }
-}
-
 async function runProbeMetadataMode({
   inputFile,
   verbose,
@@ -1760,8 +1712,12 @@ async function runProbeMetadataMode({
   // Probe with minimal reads: stream tabular files, parse BIN headers first.
   if (ext === '.bin') {
     try {
-      const usigMeta = await deserializeFrame(inputFile);
-      irMetadata = usigMeta ?? await readExternalBinMetadata(inputFile, inputFileName);
+      const frame = await ingestMappedBinary({
+        inputPath: inputFile,
+        filename: inputFileName,
+      });
+
+      irMetadata = frame?.packet?.metadata ?? {};
     } catch (err) {
       ingestError = String(err?.message ?? err);
     }
@@ -1917,7 +1873,7 @@ async function exportIRFrame({
   channels: packet?.channels?.length,
   metadata: packet?.metadata,
   });
-  const channels =
+  let channels =
       packet.channels ??
       packet.arrays ??
       null;
@@ -1926,6 +1882,21 @@ async function exportIRFrame({
       channels?.[0]?.waveform;
 
   const metadata = packet.metadata ?? {};
+
+  // If channels/arrays are not present but the serialized metadata contains
+  // column/channel labels, synthesize a minimal channels array so CSV/XLSX
+  // exporters can emit a header row and at least the primary waveform.
+  if (!channels && Array.isArray(metadata.channelLabels) && metadata.channelLabels.length > 0) {
+    channels = metadata.channelLabels.map((lab, idx) => ({
+      label: lab,
+      waveform: idx === 0 ? wf : Array.from({ length: wf.length }, () => '')
+    }));
+  } else if (!channels && Array.isArray(metadata.columnLabels) && metadata.columnLabels.length > 0) {
+    channels = metadata.columnLabels.map((lab, idx) => ({
+      label: lab,
+      waveform: idx === 0 ? wf : Array.from({ length: wf.length }, () => '')
+    }));
+  }
 
   const metadataKeys = Object.keys(metadata).filter(k =>
       typeof metadata[k] !== 'object' &&
@@ -2219,9 +2190,10 @@ async function ingestInputToIR({
       packet.arrays ??
       [{
         label:
-          packet.metadata?.signalColumn ??
           packet.metadata?.channelLabels?.[0] ??
-          'data',
+          packet.metadata?.signalColumn ??
+          packet.channels?.[0]?.label ??
+          packet.arrays?.[0]?.label,
         units: packet.metadata?.units,
         waveform,
       }];
@@ -2694,34 +2666,39 @@ if (args.length === 0) {
       packet.arrays ??
       [];
 
-    const channels =
+    const channelDefinitions =
       existingChannels.length > 0
         ? existingChannels
         : [{
             label:
-              packet.metadata?.signalColumn ??
               packet.metadata?.channelLabels?.[0] ??
-              canonicalFrame?.headers?.[0] ??
-              'data',
+              packet.metadata?.signalColumn ??
+              canonicalFrame?.headers?.[0],
             units: packet.metadata?.units,
             waveform,
           }];
+
+    if (!channelDefinitions[0]?.label) {
+      throw new Error(
+        'CSV/XLSX ingestion produced a waveform without a canonical channel label.'
+      );
+    }
 
     frame = {
       ...canonicalFrame,
       packet: {
         ...packet,
         waveform,
-        channels,
-        arrays: channels,
+        arrays: channelDefinitions,
         metadata: {
           ...(packet.metadata ?? {}),
           channelLabels:
             packet.metadata?.channelLabels ??
-            channels.map(ch => ch.label),
+            channelDefinitions.map(ch => ch.label),
         },
       },
     };
+
 
   } else {
 
@@ -2730,7 +2707,7 @@ if (args.length === 0) {
       sharedHints
     );
 
-    frame = ingested.frame ?? ingested;
+    frame = ingested.frame ?? (ingested.packet ? {...ingested, packet: ingested.packet,} : ingested);
 
     console.log('[DEBUG getOrIngest RETURN]', {
       type: typeof ingested,

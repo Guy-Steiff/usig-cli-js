@@ -32,7 +32,7 @@
  *   3. Inferred                          ← marked in inferredFields[]
  */
 
-import { parseBinMetadata, readBinSamples } from '../binReader';
+import { mapBinaryToIRCandidate } from '../ir/binMapper';
 import type { WaveformPacket, WaveformMetadata } from './types';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -267,67 +267,7 @@ function parseNumericCell(cell: string): number {
 // possible future addition: --profile keysight / --profile rigol to preserve more instrument-specific metadata
 //
 // ─────────────────────────────────────────────────────────────────────────────
-function ingestBin(file: File, buffer: ArrayBuffer, hints: IngestHints): WaveformPacket {
-  const binMeta = parseBinMetadata(buffer, file.name);
-  if (binMeta.parseError) {
-    throw new Error(`Binary parse failed for "${file.name}": ${binMeta.parseError}`);
-  }
-  const requestedChannel = Number.isInteger(hints.channelIndex)
-    ? Number(hints.channelIndex)
-    : 0;
-  const maxChannel = Math.max(0, (binMeta.numWaveforms || 1) - 1);
-  const selectedChannelIndex = Math.min(
-    Math.max(requestedChannel, 0),
-    maxChannel
-  );
-  const rawFull = readBinSamples(
-    buffer,
-    binMeta,
-    selectedChannelIndex
-  );
-  const binSlice = computeSampleSlice(
-    rawFull.length,
-    hints
-  );
-  const rawSlice = rawFull.slice(
-    binSlice.start,
-    binSlice.endExclusive
-  );
-  const waveform =
-    rawSlice instanceof Float32Array
-      ? rawSlice
-      : new Float32Array(rawSlice);
-  const inferred: string[] = [];
-  const metadata: WaveformMetadata = {
-    sourceFile: file.name,
-    instrument: binMeta.deviceModel || undefined,
-    captureTimestamp: binMeta.captureDate ? `${binMeta.captureDate}T${binMeta.captureTime || '00:00:00'}` : undefined,
-    processingHistory: [`ingested from binary "${file.name}"`],
-    userOverrides:
-      hints.channelIndex !== undefined
-        ? {
-            channelIndex: selectedChannelIndex,
-          }
-        : undefined,
-    inferredFields: inferred,
 
-    // Binary encoding information
-    bitDepth: binMeta.bitsPerPoint,
-    endianness: 'little',
-
-    // Multi-channel information
-    channels: binMeta.numWaveforms || 1,
-    channelIndex: selectedChannelIndex,
-
-    // Optional: keep this if bin metadata contains it
-    units: binMeta.yUnits || undefined,
-  };
-
-  return {
-    waveform,
-    metadata,
-  };
-}
 // ─────────────────────────────────────────────────────────────────────────────
 // CSV ingestion
 // ─────────────────────────────────────────────────────────────────────────────
@@ -688,15 +628,27 @@ function ingestTxt(file: File, text: string, hints: IngestHints): WaveformPacket
 export async function ingestFile(file: File, hints: IngestHints = {}): Promise<WaveformPacket> {
   const buffer = await file.arrayBuffer();
   const format = detectFormat(file, buffer);
+
   switch (format) {
-    case 'bin': return ingestBin(file, buffer, hints);
-    case 'xlsx': return ingestXlsx(file, hints);
+    case 'bin':
+      throw new Error(
+        `Binary ingestion must use the canonical IR binary mapper; ` +
+        `ingestFile() cannot ingest "${file.name}" directly.`
+      );
+
+    case 'xlsx':
+      return ingestXlsx(file, hints);
+
     case 'csv':
     case 'txt': {
       const text = await file.text();
-      return format === 'csv' ? ingestCsv(file, text, hints) : ingestTxt(file, text, hints);
-    }  }
+      return format === 'csv'
+        ? ingestCsv(file, text, hints)
+        : ingestTxt(file, text, hints);
+    }
+  }
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public: multi-column inspection  (pipeline UI — file-add time)
@@ -717,18 +669,6 @@ export async function ingestAllColumns(file: File): Promise<IngestColumnsResult>
   try {
     const buffer = await file.arrayBuffer();
     const format = detectFormat(file, buffer);
-
-    if (format === 'bin') {
-      const binMeta = parseBinMetadata(buffer, file.name);
-      const colName = (binMeta.yUnits && binMeta.yUnits !== '') ? binMeta.yUnits : 'samples';
-      const raw     = binMeta.parseError ? new Float32Array(0) : readBinSamples(buffer, binMeta);
-      const wf      = (raw as unknown) instanceof Float32Array ? (raw as Float32Array) : new Float32Array(raw as ArrayLike<number>);
-    return {
-      headers: [colName],
-      columns: { [colName]: wf },
-      singleValueColumns: {},
-    };
-    }
 
     // For tabular formats, parse all columns using the appropriate parser.
     let headers: string[];

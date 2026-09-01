@@ -24,6 +24,7 @@ export function serializeFrame(frame: SignalFrame): SerializedIR {
     waveformEncoding: 'Float32Array',
     waveformBytesPerElement: 4,
   };
+
   const waveformCopy = normalizedWaveform.buffer.slice(
     normalizedWaveform.byteOffset,
     normalizedWaveform.byteOffset + normalizedWaveform.byteLength,
@@ -41,11 +42,19 @@ type MetaJSON = Omit<SignalFrame, 'packet'> & {
 
 export function deserializeFrame(meta: string, waveform: ArrayBuffer): SignalFrame {
   const obj = JSON.parse(meta) as MetaJSON;
-  if (obj.schemaVersion !== IR_SCHEMA_VERSION) {
+  const serializedSchemaVersion = String(obj.schemaVersion);
+  const currentSchemaVersion = String(IR_SCHEMA_VERSION);
+
+  const schemaVersionCompatible =
+    serializedSchemaVersion === currentSchemaVersion ||
+    serializedSchemaVersion === '1';
+
+  if (!schemaVersionCompatible) {
     throw new Error(
-      `IR schema version mismatch: expected ${IR_SCHEMA_VERSION}, got ${obj.schemaVersion}.`,
+      `IR schema version mismatch: expected ${currentSchemaVersion}, got ${obj.schemaVersion}.`,
     );
   }
+
   if (waveform.byteLength !== obj.waveformByteLength) {
     throw new Error(
       `IR waveform buffer mismatch: expected ${obj.waveformByteLength}, got ${waveform.byteLength}.`,
