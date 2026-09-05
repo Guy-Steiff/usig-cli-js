@@ -83,7 +83,15 @@ export interface PluginManifest {
    */
   reportTitle?: string;
   paramSchema: ParamSchema[];
+  /** Optional declarative debug table capabilities exposed by the plugin. */
+  debugTables?: Array<{
+    id: string;
+    label?: string;
+    description?: string;
+    columns?: string[];
+  }>;
 }
+
 
 /**
  * A single interactive control declared by a figure.

@@ -918,16 +918,55 @@ def main():
                 scalar_csv_output
             )
 
+            # Basic load check
+            csv_loaded = not csv_df.empty
             add_check(
                 report,
                 "1b: generated CSV can be loaded by pandas",
-                not csv_df.empty,
+                csv_loaded,
                 (
                     None
-                    if not csv_df.empty
+                    if csv_loaded
                     else "generated CSV contains no rows"
                 )
             )
+
+            if csv_loaded:
+                # Exact-row check: should contain exactly one data row for scalar KPI output
+                one_row = csv_df.shape[0] == 1
+                add_check(
+                    report,
+                    "1b: generated CSV contains exactly one data row",
+                    one_row,
+                    None if one_row else f"CSV contains {csv_df.shape[0]} rows"
+                )
+
+                # Columns presence: all expected KPI keys must be present
+                missing = [k for k in expected_kpis.keys() if k not in csv_df.columns]
+                add_check(
+                    report,
+                    "1b: generated CSV contains expected KPI columns",
+                    len(missing) == 0,
+                    None if len(missing) == 0 else f"missing columns: {missing}"
+                )
+
+                # Ensure human-readable labels are not present as columns
+                hr_present = any(c in csv_df.columns for c in ['Inputs', 'Outputs'])
+                add_check(
+                    report,
+                    "1b: CSV does not contain human-readable report sections",
+                    not hr_present,
+                    None if not hr_present else "CSV contains human-readable section headers"
+                )
+
+                # If columns are present, validate numeric KPI values against golden
+                if len(missing) == 0:
+                    validate_output_columns(
+                        report,
+                        csv_df,
+                        expected_kpis,
+                        "1b"
+                    )
 
         except Exception as exc:
             add_check(
@@ -943,6 +982,138 @@ def main():
             "1b: generated CSV can be loaded by pandas",
             "CSV output file was not created"
         )
+
+    # =========================================================================
+    # 1c) XLSX output-format smoke test
+    # =========================================================================
+    scalar_xlsx_output = (
+        output_folder
+        / "sinl_scalar_output.xlsx"
+    )
+
+    scalar_xlsx_command = run_usig(
+        [
+            node_executable,
+            str(USIG_CLI),
+            "-i",
+            str(golden_csv),
+            "-plugin",
+            "sinl",
+            str(scalar_xlsx_output),
+        ],
+        b_verbose
+    )
+
+    check_command(
+        report,
+        "1c: SINL XLSX output-format execution completed",
+        scalar_xlsx_command
+    )
+
+    assert_file_exists(
+        report,
+        "1c: SINL XLSX output file was created",
+        scalar_xlsx_output
+    )
+
+    # Quick binary check: XLSX is a ZIP archive (PK)
+    try:
+        with open(scalar_xlsx_output, 'rb') as f:
+            sig = f.read(2)
+        is_zip = sig == b'PK'
+        add_check(
+            report,
+            "1c: generated XLSX looks like a ZIP archive",
+            is_zip,
+            None if is_zip else "XLSX file missing PK signature"
+        )
+    except Exception as exc:
+        add_check(
+            report,
+            "1c: generated XLSX looks like a ZIP archive",
+            False,
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    # =========================================================================
+    # 1d) BIN output-format smoke test
+    # =========================================================================
+    scalar_bin_output = (
+        output_folder
+        / "sinl_scalar_output.bin"
+    )
+
+    scalar_bin_command = run_usig(
+        [
+            node_executable,
+            str(USIG_CLI),
+            "-i",
+            str(golden_csv),
+            "-plugin",
+            "sinl",
+            str(scalar_bin_output),
+        ],
+        b_verbose
+    )
+
+    check_command(
+        report,
+        "1d: SINL BIN output-format execution completed",
+        scalar_bin_command
+    )
+
+    assert_file_exists(
+        report,
+        "1d: SINL BIN output file was created",
+        scalar_bin_output
+    )
+
+    # Check magic bytes for USIG IR container
+    try:
+        with open(scalar_bin_output, 'rb') as f:
+            magic = f.read(8)
+        is_usigir = magic == b'USIGIR1\n'
+        add_check(
+            report,
+            "1d: generated BIN starts with USIGIR1 magic",
+            is_usigir,
+            None if is_usigir else "BIN file does not start with USIGIR1 magic"
+        )
+    except Exception as exc:
+        add_check(
+            report,
+            "1d: generated BIN starts with USIGIR1 magic",
+            False,
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    # =========================================================================
+    # 1e) Unsupported extension rejection test
+    # =========================================================================
+    scalar_unsupported_output = (
+        output_folder
+        / "sinl_scalar_output.unsup"
+    )
+
+    scalar_unsupported_command = run_usig(
+        [
+            node_executable,
+            str(USIG_CLI),
+            "-i",
+            str(golden_csv),
+            "-plugin",
+            "sinl",
+            str(scalar_unsupported_output),
+        ],
+        b_verbose
+    )
+
+    add_check(
+        report,
+        "1e: unsupported extension is rejected (non-zero exit)",
+        scalar_unsupported_command is not None and scalar_unsupported_command.returncode != 0,
+        None if (scalar_unsupported_command is not None and scalar_unsupported_command.returncode != 0) else "CLI accepted unsupported extension"
+    )
 
     # =========================================================================
     # 2) Filename inference
@@ -1354,13 +1525,203 @@ def main():
         )
 
     # =========================================================================
-    # 6) Debug vector output
+    # 6) Debug table runtime exports (CSV, XLSX, BIN)
+    # =========================================================================
+
+    debug_csv_output = (
+        output_folder
+        / "inl_dnl_series_debug.csv"
+    )
+
+    debug_csv_command = run_usig(
+        [
+            node_executable,
+            str(USIG_CLI),
+            "-i",
+            str(golden_csv),
+            "-plugin",
+            "sinl",
+            "-debug",
+            "inl_dnl_series=" + str(debug_csv_output),
+        ],
+        b_verbose
+    )
+
+    check_command(
+        report,
+        "6a: debug CSV export completed",
+        debug_csv_command
+    )
+
+    assert_file_exists(
+        report,
+        "6a: debug CSV file created",
+        debug_csv_output
+    )
+
+    if debug_csv_output.exists():
+        try:
+            import pandas as pd
+        except Exception:
+            add_check(
+                report,
+                "6a: debug CSV can be loaded by pandas",
+                False,
+                "pandas is required to run this check"
+            )
+        else:
+            try:
+                df = pd.read_csv(debug_csv_output)
+                expected_cols = ['code','pdf','cdf','cos_cdf','dnl','inl','inl_polynomial']
+                missing = [c for c in expected_cols if c not in df.columns]
+                add_check(
+                    report,
+                    "6a: debug CSV contains expected columns",
+                    len(missing) == 0,
+                    None if len(missing) == 0 else f"missing columns: {missing}"
+                )
+            except Exception as exc:
+                add_check(
+                    report,
+                    "6a: debug CSV can be loaded by pandas",
+                    False,
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+    # XLSX
+    debug_xlsx_output = (
+        output_folder
+        / "inl_dnl_series_debug.xlsx"
+    )
+
+    debug_xlsx_command = run_usig(
+        [
+            node_executable,
+            str(USIG_CLI),
+            "-i",
+            str(golden_csv),
+            "-plugin",
+            "sinl",
+            "-debug",
+            "inl_dnl_series=" + str(debug_xlsx_output),
+        ],
+        b_verbose
+    )
+
+    check_command(
+        report,
+        "6b: debug XLSX export completed",
+        debug_xlsx_command
+    )
+
+    assert_file_exists(
+        report,
+        "6b: debug XLSX file created",
+        debug_xlsx_output
+    )
+
+    # Quick check: XLSX is a ZIP
+    try:
+        with open(debug_xlsx_output, 'rb') as f:
+            sig = f.read(2)
+        add_check(
+            report,
+            "6b: debug XLSX looks like ZIP",
+            sig == b'PK',
+            None if sig == b'PK' else "missing PK signature"
+        )
+    except Exception as exc:
+        add_check(
+            report,
+            "6b: debug XLSX looks like ZIP",
+            False,
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    # BIN
+    debug_bin_output = (
+        output_folder
+        / "inl_dnl_series_debug.bin"
+    )
+
+    debug_bin_command = run_usig(
+        [
+            node_executable,
+            str(USIG_CLI),
+            "-i",
+            str(golden_csv),
+            "-plugin",
+            "sinl",
+            "-debug",
+            "inl_dnl_series=" + str(debug_bin_output),
+        ],
+        b_verbose
+    )
+
+    check_command(
+        report,
+        "6c: debug BIN export completed",
+        debug_bin_command
+    )
+
+    assert_file_exists(
+        report,
+        "6c: debug BIN file created",
+        debug_bin_output
+    )
+
+    try:
+        with open(debug_bin_output, 'rb') as f:
+            magic = f.read(8)
+        add_check(
+            report,
+            "6c: debug BIN starts with USIGIR1 magic",
+            magic == b'USIGIR1\n',
+            None if magic == b'USIGIR1\n' else "BIN does not start with USIGIR1"
+        )
+    except Exception as exc:
+        add_check(
+            report,
+            "6c: debug BIN starts with USIGIR1 magic",
+            False,
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    # Unsupported extension rejection for debug
+    debug_unsupported_output = (
+        output_folder
+        / "inl_dnl_series_debug.unsup"
+    )
+
+    debug_unsupported_command = run_usig(
+        [
+            node_executable,
+            str(USIG_CLI),
+            "-i",
+            str(golden_csv),
+            "-plugin",
+            "sinl",
+            "-debug",
+            "inl_dnl_series=" + str(debug_unsupported_output),
+        ],
+        b_verbose
+    )
+
+    add_check(
+        report,
+        "6d: debug unsupported extension is rejected (non-zero exit)",
+        debug_unsupported_command is not None and debug_unsupported_command.returncode != 0,
+        None if (debug_unsupported_command is not None and debug_unsupported_command.returncode != 0) else "CLI accepted unsupported debug extension"
+    )
+
+    # =========================================================================
+    # 7) Figure export
     # =========================================================================
 
     add_skip(
         report,
-        "6: SINL debug vector export and integrity",
-        "CLI debug-vector export not implemented yet"
+        "7: SINL PDF/DNL/INL figure export",
+        "CLI figure export not implemented yet"
     )
 
     # =========================================================================

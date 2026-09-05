@@ -1357,9 +1357,19 @@ const manifest: PluginManifest = {
   },
 ],
 
+  // Declarative debug table capabilities. These are lightweight metadata only
+  // and do not contain table data. prepareData() still generates the actual
+  // PluginDebugTable objects at runtime.
+  debugTables: [
+    {
+      id: 'inl_dnl_series',
+      label: 'INL / DNL per-code series',
+      description: 'Per-code series including PDF, CDF, DNL, INL and polynomial fit values.',
+      columns: ['code', 'pdf', 'cdf', 'cos_cdf', 'dnl', 'inl', 'inl_polynomial'],
+    }
+  ],
+
 };
-
-
 
 // ── Recharts interactive figure components ────────────────────────────────────
 
@@ -1721,7 +1731,6 @@ export const sinlPlugin: Plugin<SinlParams> = {
       params.inputMode,
     );
   },
-
 
   figures: sinlFigures,
 };

@@ -248,113 +248,20 @@ const SUPPORTED_FORMATS = new Set(['text', 'json', 'csv', 'yaml']);
 // ─────────────────────────────────────────────────────────────────────────────
 
 function parseArgs(args) {
-  // CLI parsing intentionally follows a forgiving ffmpeg-like style:
-  // - repeated flags are accepted
-  // - plugin ids can be comma-separated or space-separated after -plugin
-  // - a trailing bare token is treated as positional output path
-
-  /*
- * TODO: Extend CLI parser to support multiple input files and per-input options.
- *
- * Current model:
- *   - The parser assumes exactly one input file (`result.inputFile`).
- *   - Options such as:
- *       --channel-index
- *       --start-sample
- *       --end-sample
- *     are stored globally in `result` and therefore apply to only a single input.
- *
- * Proposed model (similar to FFmpeg):
- *
- *   Introduce:
- *
- *     result.inputs = [
- *       {
- *         file: "left.wav",
- *         channelIndex: 0,
- *         startSample: 100,
- *         endSample: 500
- *       },
- *       {
- *         file: "right.wav",
- *         channelIndex: 1,
- *         startSample: 0,
- *         endSample: null
- *       }
- *     ];
- *
- * Parsing strategy:
- *
- *   Maintain a temporary "pending input options" object while parsing.
- *
- *     let pendingInput = {
- *       channelIndex: null,
- *       startSample: null,
- *       endSample: null,
- *     };
- *
- *   As input-related switches are encountered, populate pendingInput instead
- *   of writing directly into result.
- *
- *   When "-i <file>" is encountered:
- *
- *     result.inputs.push({
- *       file: <file>,
- *       ...pendingInput
- *     });
- *
- *     pendingInput = defaultPendingInput();
- *
- *   Thus each "-i" consumes the currently pending input options, exactly as
- *   FFmpeg parses command lines.
- *
- * Example:
- *
- *     mytool \
- *         --channel 0 --start-sample 100 -i left.wav \
- *         --channel 1 --start-sample 250 -i right.wav
- *
- * becomes:
- *
- *     inputs = [
- *       {
- *         file: "left.wav",
- *         channelIndex: 0,
- *         startSample: 100,
- *         endSample: null
- *       },
- *       {
- *         file: "right.wav",
- *         channelIndex: 1,
- *         startSample: 250,
- *         endSample: null
- *       }
- *     ];
- *
- * Backwards compatibility:
- *
- *   During migration, continue exposing:
- *
- *       result.inputFile = result.inputs[0]?.file ?? null;
- *
- *   so existing single-input code continues to function while newer code
- *   iterates over result.inputs.
- *
- * NOTE:
- *   This is a parser architecture change rather than simply adding support
- *   for repeated "-i" flags, since input-related options become associated
- *   with individual inputs rather than being global.
- */
+  // Minimal parser supporting repeated -plugin instances where per-plugin -p and -debug
+  // flags attach to the most recently declared plugin. Backwards-compatible fields
+  // (pluginIds, params) are preserved for callers that expect the old shape.
   const result = {
     inputFile: null,
     outputFile: null,
-    pluginId: null,   // kept for compat; populated from pluginIds[0] after parse
-    pluginIds: [],    // all requested plugin ids (supports -plugin smeas,sinl,hsioalpha)
+    pluginId: null,
+    pluginIds: [],
+    // Backwards compat top-level global params (rare); prefer per-plugin params.
     params: {},
+    // New: array of plugin invocation objects in order of appearance.
+    pluginInvocations: [],
     verbose: false,
     format: 'text',
-    // muxFormat: null,
-    // demuxFormat: null,
     inferMetaFromFilename: false,
     metaToFilename: false,
     help: false,
@@ -365,35 +272,58 @@ function parseArgs(args) {
     overwrite: false,
   };
 
+  let currentInvocation = null;
+
+  const isPluginId = (s) => s && !s.includes('.') && !s.includes('/') && !s.includes('\\');
+
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === '-i' && i + 1 < args.length) {
       result.inputFile = args[++i];
     } else if (arg === '-plugin' && i + 1 < args.length) {
-      // Accept repeated -plugin flags, comma-separated ids, and space-separated ids.
-      // A token is treated as a plugin id if it contains no dot or path separator
-      // (which would indicate a file path / output filename).
-      const isPluginId = (s) => s && !s.includes('.') && !s.includes('/') && !s.includes('\\');
-      for (const id of args[++i].split(',')) {
+      // Start one or more plugin invocations. Support comma-separated legacy form
+      // by creating multiple invocations, but prefer the repeated -plugin model.
+      const token = args[++i];
+      for (const id of token.split(',')) {
         const trimmed = id.trim();
-        if (trimmed && !result.pluginIds.includes(trimmed)) result.pluginIds.push(trimmed);
+        if (!trimmed) continue;
+        const invocation = {
+          pluginId: trimmed,
+          params: {},
+          debugRequests: [],
+        };
+        result.pluginInvocations.push(invocation);
+        result.pluginIds.push(trimmed);
+        currentInvocation = invocation;
       }
-      // Consume additional space-separated plugin ids that follow
+      // Consume additional space-separated plugin ids that follow (legacy behavior)
       while (i + 1 < args.length && !args[i + 1].startsWith('-') && isPluginId(args[i + 1])) {
         for (const id of args[++i].split(',')) {
           const trimmed = id.trim();
-          if (trimmed && !result.pluginIds.includes(trimmed)) result.pluginIds.push(trimmed);
+          if (!trimmed) continue;
+          const invocation = {
+            pluginId: trimmed,
+            params: {},
+            debugRequests: [],
+          };
+          result.pluginInvocations.push(invocation);
+          result.pluginIds.push(trimmed);
+          currentInvocation = invocation;
         }
       }
     } else if (arg === '-p' && i + 1 < args.length) {
       const pair = args[++i];
       let [key, ...valParts] = pair.split('=');
       let val = valParts.join('=');
-      // Coerce value
       if (val === 'true') val = true;
       else if (val === 'false') val = false;
       else if (!isNaN(val) && val !== '') val = Number(val);
-      result.params[key.trim()] = val;
+      // Attach to current invocation if present, else fall back to top-level params
+      if (currentInvocation) {
+        currentInvocation.params[key.trim()] = val;
+      } else {
+        result.params[key.trim()] = val;
+      }
     } else if (arg === '--infer-meta-from-filename') {
       result.inferMetaFromFilename = true;
     } else if (arg === '--meta-to-filename') {
@@ -415,12 +345,34 @@ function parseArgs(args) {
       result.overwrite = true;
     } else if (arg === '-v' || arg === 'verbose' || arg === '--verbose') {
       result.verbose = true;
-    } else if (arg === '-h' || arg === '--help') {
+    } else if (arg === '-h' || arg === '--help' || arg === '-help') {
       result.help = true;
+    } else if (arg === '-debug' && i + 1 < args.length) {
+      const token = args[++i];
+      // split into key and optional path on first '='
+      const eqIdx = token.indexOf('=');
+      const key = eqIdx === -1 ? token : token.slice(0, eqIdx);
+      const pathStr = eqIdx === -1 ? undefined : token.slice(eqIdx + 1);
+      const req = { key, path: pathStr };
+      if (currentInvocation) {
+        currentInvocation.debugRequests.push(req);
+      } else {
+        // No active plugin — attach to a provisional first invocation container
+        if (result.pluginInvocations.length === 0) {
+          // create a placeholder invocation to be bound later when plugins are resolved
+          const placeholder = { pluginId: null, params: {}, debugRequests: [req] };
+          result.pluginInvocations.push(placeholder);
+          currentInvocation = placeholder;
+        } else {
+          // attach to last invocation
+          result.pluginInvocations[result.pluginInvocations.length - 1].debugRequests.push(req);
+        }
+      }
     } else if (!arg.startsWith('-') && result.inputFile && !result.outputFile) {
       result.outputFile = arg;
     }
   }
+
   // backward compat: single-plugin callers use result.pluginId
   result.pluginId = result.pluginIds[0] ?? null;
   return result;
@@ -509,10 +461,16 @@ OPTIONS
 
   -v                        Show additional diagnostic/debug output
   -y                        Overwrite an existing output file
-  -h                        Show this help
+-h, -help                 Show this help
   -start-sample <n>         Start at sample index <n>
   -end-sample <n>           End at sample index <n>
   -probe-metadata           Inspect input metadata
+-debug <spec>             Request plugin debug output. Spec forms:
+                          - "list" (discover plugin-declared tables without an input file)
+                          - "all" (produce all tables; requires an input and optional directory with trailing '/')
+                          - "<tableId>" (produce specific table; requires input)
+                          - "<tableId>=<file|dir>" (explicit filename or directory)
+                          Note: -debug all=<path> requires a directory path (use trailing '/').
 
 METADATA
 
@@ -595,6 +553,31 @@ PLUGIN HELP
 See CLI.md for full documentation.
 `);
 }
+
+async function askConfirmation(prompt) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(prompt, (ans) => { rl.close(); resolve(ans); });
+  });
+}
+
+async function confirmOutputOverwrite(outputFile, overwrite) {
+  if (overwrite) return true;
+
+  if (!fsRaw.existsSync(outputFile)) return true;
+
+  const answer = await askConfirmation(
+    `File "${outputFile}" already exists. Overwrite? [y/N] `
+  );
+
+  if (answer.trim().toLowerCase() === 'y' || answer.trim().toLowerCase() === 'yes') {
+    return true;
+  }
+
+  console.log('[usig] Output not overwritten.');
+  return false;
+}
+
 
 async function loadPluginModule(tsxPath) {
   const tmpDir = path.join(scriptDir, `.tmp_usig_${Date.now()}`);
@@ -790,6 +773,119 @@ function writeCsv(headers, rows) {
   }
   return lines.join('\n') + '\n';
 }
+
+// Generic structured-rows serializer. Supports csv, json, yaml, xlsx.
+async function writeStructuredRowsToFile(headers, rows, targetPath, overwrite) {
+  const ext = path.extname(targetPath).toLowerCase().replace('.', '');
+  const shouldWrite = await confirmOutputOverwrite(targetPath, overwrite);
+  if (!shouldWrite) return;
+
+
+  if (ext === 'csv') {
+    await fs.writeFile(targetPath, writeCsv(headers, rows), 'utf8');
+    return;
+  }
+
+  if (ext === 'json') {
+    await fs.writeFile(targetPath, JSON.stringify(rows.length === 1 ? rows[0] : rows, null, 2), 'utf8');
+    return;
+  }
+
+  if (ext === 'yaml' || ext === 'yml') {
+    // Simple YAML serialization: key: value lines per object, separated by '-'
+    const lines = [];
+    if (rows.length === 1) {
+      for (const [k, v] of Object.entries(rows[0])) lines.push(`${k}: ${JSON.stringify(v)}`);
+    } else {
+      for (const row of rows) {
+        lines.push('-');
+        for (const [k, v] of Object.entries(row)) lines.push(`  ${k}: ${JSON.stringify(v)}`);
+      }
+    }
+    await fs.writeFile(targetPath, lines.join('\n') + '\n', 'utf8');
+    return;
+  }
+
+  if (ext === 'xlsx') {
+    const excelJsMod = await import('exceljs');
+    const ExcelJS = excelJsMod.default ?? excelJsMod;
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet('results');
+    sheet.addRow(headers);
+    for (const row of rows) {
+      const values = headers.map(h => row[h] ?? '');
+      sheet.addRow(values);
+    }
+    await workbook.xlsx.writeFile(targetPath);
+    return;
+  }
+
+  throw new Error(`Unsupported structured output extension: ${ext}`);
+}
+
+// Write structured rows into a USIG IR binary container using irMod.serializeFrame
+async function writeStructuredRowsToBin(headers, rows, targetPath, irMod) {
+  if (!irMod || typeof irMod.serializeFrame !== 'function') {
+    throw new Error('IR module with serializeFrame is required to write .bin');
+  }
+
+  const arrays = headers.map((header) => ({
+    label: header,
+    waveform: new Float32Array(
+      rows.map((row) => {
+        const value = row[header];
+
+        if (
+          value === null ||
+          value === undefined ||
+          value === ''
+        ) {
+          return NaN;
+        }
+
+        return Number(value);
+      })
+    ),
+  }));
+
+  const frame = {
+    packet: {
+      waveform:
+        arrays[0]?.waveform ??
+        new Float32Array(0),
+
+      arrays,
+
+      channels: arrays,
+
+      metadata: {
+        channelLabels: headers,
+        usig_table: {
+          headers,
+          rows,
+        },
+      },
+    },
+
+    headers,
+    singleValueColumns: {},
+    cacheKey: null,
+    hintsKey: null,
+    ingestedAt: Date.now(),
+    schemaVersion: irMod.IR_SCHEMA_VERSION ?? '1.0.0',
+  };
+
+  const { meta, waveform } =
+    irMod.serializeFrame(frame);
+
+  const packed =
+    packSerializedIR(meta, waveform);
+
+  await fs.writeFile(targetPath, packed);
+
+  return true;
+}
+
 
 function applyRegexToString(str, pattern, replacements) {
   try {
@@ -1464,41 +1560,55 @@ function buildInputSummary(
 
 function formatReport(payload, format, verbose) {
   if (verbose) console.log('[DEBUG formatReport payload]', JSON.stringify(payload, null, 2));
+  const results = payload.results ?? [];
+
+  // Machine-readable JSON: serialize only the scalar results (single object or array)
   if (format === 'json') {
-    return JSON.stringify(payload, null, 2) + '\n';
+    const out = results.length === 1 ? results[0] : results;
+    return JSON.stringify(out, null, 2) + '\n';
   }
 
+  // Machine-readable CSV: deterministic ordering, exclude internal _plugin unless multi-plugin
   if (format === 'csv') {
-    const rows = payload.results ?? [];
-    if (rows.length === 0) return '';
-    const headers = Object.keys(rows[0]);
+    if (results.length === 0) return '';
+    if (results.length === 1) {
+      const row = results[0];
+      const headers = Object.keys(row).filter(k => k !== '_plugin');
+      const outRow = {};
+      for (const h of headers) outRow[h] = row[h];
+      return writeCsv(headers, [outRow]);
+    }
+
+    // multiple results: include a 'plugin' column first
+    const headers = ['plugin', ...Object.keys(results[0]).filter(k => k !== '_plugin')];
+    const rows = results.map(r => {
+      const obj = { plugin: r._plugin ?? '' };
+      for (const h of headers.slice(1)) obj[h] = r[h];
+      return obj;
+    });
     return writeCsv(headers, rows);
   }
 
+  // Machine-readable YAML: simple serialization of results only
   if (format === 'yaml') {
     const lines = [];
-    lines.push('input:');
-    lines.push(`  file: ${JSON.stringify(payload.input.file)}`);
-    lines.push(`  plugin: ${JSON.stringify(payload.input.plugin)}`);
-    lines.push(`  format: ${JSON.stringify(payload.input.format)}`);
-    lines.push('  params:');
-    for (const [k, v] of Object.entries(payload.input.params || {})) {
-      lines.push(`    ${k}: ${JSON.stringify(v)}`);
-    }
-    lines.push('results:');
-    for (const row of payload.results || []) {
-      lines.push('  -');
-      for (const [k, v] of Object.entries(row)) {
-        lines.push(`      ${k}: ${JSON.stringify(v)}`);
+    const out = results.length === 1 ? results[0] : results;
+    if (Array.isArray(out)) {
+      for (const item of out) {
+        lines.push('-');
+        for (const [k, v] of Object.entries(item)) lines.push(`  ${k}: ${JSON.stringify(v)}`);
       }
+    } else {
+      for (const [k, v] of Object.entries(out)) lines.push(`${k}: ${JSON.stringify(v)}`);
     }
     return lines.join('\n') + '\n';
   }
 
+  // Default: human-readable report (unchanged semantics)
   const lines = [];
   const summaries = payload.input.summaries ?? {};
   const pluginIds = Object.keys(summaries);
-  const multi = payload.results.length > 1;
+  const multi = results.length > 1;
 
   if (multi) {
     // Show each plugin's inputs labeled by plugin id
@@ -1523,10 +1633,10 @@ function formatReport(payload, format, verbose) {
 
 
   lines.push('Outputs:');
-  if (!payload.results || payload.results.length === 0) {
+  if (!results || results.length === 0) {
     lines.push('  (no results)');
   } else {
-    for (const row of payload.results) {
+    for (const row of results) {
       if (multi) lines.push(`  [${row._plugin ?? ''}]`);
       for (const [k, v] of Object.entries(row)) {
         if (k === '_plugin') continue;
@@ -1856,7 +1966,6 @@ async function runProbeMetadataMode({
   if (result.ingestError) process.stdout.write(`  ingestError: ${JSON.stringify(result.ingestError)}\n`);
 }
 
-
 async function exportIRFrame({
   irMod,
   frame,
@@ -1866,13 +1975,6 @@ async function exportIRFrame({
   verbose,
 }) {
   const packet = frame.packet;
-  console.log('[exportIRFrame debug]', {
-  hasPacket: !!packet,
-  waveformType: packet?.waveform?.constructor?.name,
-  waveformLength: packet?.waveform?.length,
-  channels: packet?.channels?.length,
-  metadata: packet?.metadata,
-  });
   let channels =
       packet.channels ??
       packet.arrays ??
@@ -2015,68 +2117,60 @@ async function runConversionMode({
   const inputExt = path.extname(inputFile).toLowerCase();
   const outputExt = path.extname(outputFile).toLowerCase();
   if (!inputFile) {
-    console.error('Usage: node usig.mjs -i <input-file> (--mux bin | --demux csv) [flags] [output_path]');
-    process.exit(1);
-  }
-  if (!outputFile) {
-    console.error('[usig] conversion requires an explicit output filename.');
-    console.error('Example: usig -i input.csv output.bin');
-    process.exit(1);
-  }
-  if (!outputFormat) {
-  throw new Error("No conversion target specified.");
-  }
+      console.error('Usage: node usig.mjs -i <input-file> (--mux bin | --demux csv) [flags] [output_path]');
+      process.exit(1);
+    }
+    if (!outputFile) {
+      console.error('[usig] conversion requires an explicit output filename.');
+      console.error('Example: usig -i input.csv output.bin');
+      process.exit(1);
+    }
+    if (!outputFormat) {
+    throw new Error("No conversion target specified.");
+    }
 
-  const irMod = await loadIrEngineModule();
-  const {
-  frame,
-  inputFileName,
-  } = await ingestInputToIR({
-    irMod,
-    inputFile,
-    startSample,
-    endSample,
+    const irMod = await loadIrEngineModule();
+    const {
+    frame,
+    inputFileName,
+    } = await ingestInputToIR({
+      irMod,
+      inputFile,
+      startSample,
+      endSample,
+      params,
+    });
+
+  const mergedMetadata = buildConversionMetadata({
+    frame,
     params,
+    inferMetaFromFilename,
+    inputFileName,
   });
 
-const mergedMetadata = buildConversionMetadata({
-  frame,
-  params,
-  inferMetaFromFilename,
-  inputFileName,
-});
 
+  const frameForExport = {
+    ...frame,
+    packet: {
+      ...frame.packet,
+      metadata: mergedMetadata,
+    },
+  };
 
-const frameForExport = {
-  ...frame,
-  packet: {
-    ...frame.packet,
-    metadata: mergedMetadata,
-  },
-};
+  const shouldWrite = await confirmOutputOverwrite(outputFile, overwrite);
+  if (!shouldWrite) return;
 
-if (!overwrite) {
-  try {
-    await fs.access(outputFile);
-    throw new Error(
-      `Output exists: ${outputFile}. Use -y to overwrite.`
-    );
-  } catch (err) {
-    if (err.code !== 'ENOENT') throw err;
-  }
-}
+  await exportIRFrame({
+    irMod,
+    frame: frameForExport,
+    outputFile,
+    outputFormat,
+    metaToFilename,
+    verbose,
+  });
 
-await exportIRFrame({
-  irMod,
-  frame: frameForExport,
-  outputFile,
-  outputFormat,
-  metaToFilename,
-  verbose,
-});
-
-console.log(`[usig] wrote result to ${outputFile}`);
-return;
+  console.log(`[usig] wrote result to ${outputFile}`);
+  return;
 }
 
 function resolvePluginId(pluginId, verbose) {
@@ -2210,16 +2304,6 @@ async function ingestInputToIR({
           channels.map(ch => ch.label),
       },
     };
-
-    console.log('[DEBUG CSV PACKET NORMALIZATION]', {
-      packetKeys: Object.keys(normalizedPacket),
-      waveformLength: normalizedPacket.waveform?.length,
-      channels: normalizedPacket.channels?.map(ch => ({
-        label: ch.label,
-        units: ch.units,
-        waveformLength: ch.waveform?.length,
-      })),
-    });
 
     return {
       frame: {
@@ -2444,6 +2528,25 @@ function printPluginHelp(pluginId, plugin) {
   console.log('  Otherwise USIG may use filename inference,');
   console.log('  column inference, and plugin defaults.');
   console.log('');
+
+  // DEBUG TABLES section. Prefer static manifest documentation if provided.
+  console.log('DEBUG TABLES');
+  console.log('');
+  const debugDocs = plugin?.manifest?.debugTables ?? null;
+  if (Array.isArray(debugDocs) && debugDocs.length > 0) {
+    for (const dt of debugDocs) {
+      console.log(`  ${dt.id}`);
+      if (dt.label) console.log(`    ${dt.label}`);
+      if (Array.isArray(dt.columns) && dt.columns.length > 0) console.log(`    Columns: ${dt.columns.join(', ')}`);
+      console.log('');
+    }
+  } else {
+    console.log('  (runtime discovery only)');
+    console.log('  Use: -debug list');
+    console.log('  Example: usig -i file -plugin', pluginId, '-debug list');
+    console.log('');
+  }
+
   console.log('EXAMPLE');
   console.log('');
   console.log(`  usig -i waveform.csv -plugin ${pluginId}`);
@@ -2463,6 +2566,7 @@ async function main() {
     inputFile,
     pluginId,
     pluginIds,
+    pluginInvocations,
     outputFile,
     params,
     inferMetaFromFilename,
@@ -2537,7 +2641,8 @@ if (args.length === 0) {
     return;
   }
 
-  if (effectiveConversionFormat) {
+  // Only treat positional output as conversion mode when no plugin is requested.
+  if (effectiveConversionFormat && (!pluginIds || pluginIds.length === 0)) {
   await runConversionMode({
     inputFile,
     outputFile,
@@ -2553,8 +2658,14 @@ if (args.length === 0) {
   return;
 }
 
-  if (!inputFile || pluginIds.length === 0) {
-    console.error('Usage: node usig.mjs -i <input-file> -plugin <id[,id2]> [-p key=value ...] [-of text|json|csv|yaml]');
+  // Allow missing inputFile when the user requested declarative '-debug list'
+  const hasOnlyDebugList = (pluginInvocations && pluginInvocations.length > 0) && pluginInvocations.every(inv => {
+    const dr = inv.debugRequests || [];
+    return dr.length > 0 && dr.every(r => r.key === 'list');
+  });
+
+  if ((!inputFile && !hasOnlyDebugList) || pluginIds.length === 0) {
+    console.error('Usage: node usig.mjs -i <input-file> -plugin <id[,id2]> [-p key=value ...] [-of text|json|yaml]');
     process.exit(1);
   }
 
@@ -2570,6 +2681,54 @@ if (args.length === 0) {
       console.error(`[usig] plugin not found: ${id}`);
       process.exit(1);
     }
+  }
+
+  // Prepare invocations array for per-invocation handling
+  const invocations = (pluginInvocations && pluginInvocations.length > 0)
+    ? pluginInvocations.map(p => ({ ...p }))
+    : pluginIds.map(id => ({ pluginId: id, params: {}, debugRequests: [] }));
+
+  // If any invocation is a placeholder (pluginId === null), bind it to the first resolved plugin id
+  if (invocations.length > 0 && (!invocations[0].pluginId || invocations[0].pluginId === null)) {
+    if (resolvedPluginIds.length > 0) {
+      invocations[0].pluginId = resolvedPluginIds[0];
+    }
+  }
+
+  // If the caller requested only '-debug list' for all invocations, perform declarative discovery
+  // regardless of whether an inputFile was supplied. Also handle the original case
+  // where there is no input file but a -debug list is requested.
+  if (hasOnlyDebugList || (!inputFile && invocations.some(inv => (inv.debugRequests || []).some(r => r.key === 'list')))) {
+    for (const invocation of invocations) {
+      if (!invocation.debugRequests || !invocation.debugRequests.some(r => r.key === 'list')) continue;
+      const requestedPluginId = invocation.pluginId ?? pluginIds[0];
+      const resolvedPluginId = resolvePluginId(requestedPluginId, verbose);
+      const pluginPath = path.join(scriptDir, `app/components/plugins/${resolvedPluginId}Plugin.tsx`);
+      if (!(await pluginExists(resolvedPluginId))) {
+        console.error(`[usig] plugin not found: ${resolvedPluginId}`);
+        process.exit(1);
+      }
+      const mod = await loadPluginModule(pluginPath);
+      const pluginExport = mod[`${resolvedPluginId}Plugin`];
+      if (!pluginExport) {
+        console.error(`[usig] plugin export not found for: ${resolvedPluginId}`);
+        process.exit(1);
+      }
+      const manifest = pluginExport.manifest ?? {};
+      console.error(`DEBUG TABLES: ${resolvedPluginId}`);
+      const declared = manifest.debugTables ?? null;
+      if (!declared || declared.length === 0) {
+        console.error('  (none declared)');
+        continue;
+      }
+      for (const dt of declared) {
+        console.error('');
+        console.error(`  ${dt.id}`);
+        if (dt.label) console.error(`    ${dt.label}`);
+        if (Array.isArray(dt.columns) && dt.columns.length > 0) console.error(`    Columns: ${dt.columns.join(', ')}`);
+      }
+    }
+    return; // done; declarative discovery does not ingest
   }
 
   // ── Load IR engine once ──────────────────────────────────────────────────────
@@ -2748,7 +2907,9 @@ if (args.length === 0) {
   const allParamSchemas = {};  // keyed by plugin id
 
 
-  for (const resolvedPluginId of resolvedPluginIds) {
+  for (const invocation of invocations) {
+    const requestedPluginId = invocation.pluginId;
+    const resolvedPluginId = resolvePluginId(requestedPluginId, verbose);
     const pluginPath = path.join(scriptDir, `app/components/plugins/${resolvedPluginId}Plugin.tsx`);
     if (verbose) console.log(`[usig] loading plugin: ${resolvedPluginId}`);
     const mod = resolvedPluginId === resolvedPluginIds[0]
@@ -2761,29 +2922,30 @@ if (args.length === 0) {
     const plugin = pluginExport;
     allParamSchemas[resolvedPluginId] = plugin.manifest?.paramSchema ?? [];
 
+    // Merge explicit params: global CLI params then per-invocation params override
+    const mergedExplicitParams = { ...(params ?? {}), ...(invocation.params ?? {}) };
+
     let finalParams = {
       ...plugin.defaultParams,
       ...filenameParamHints,
-      ...params,
+      ...mergedExplicitParams,
     };
 
-    const derivedHints = buildDerivedParamHints(frame, params);
-    const strictFilenameInference =
-      inferStrictMetadataFromFilename(inputFileName);
-
+    const derivedHints = buildDerivedParamHints(frame, mergedExplicitParams);
+    const strictFilenameInference = inferStrictMetadataFromFilename(inputFileName);
 
     if (verbose) console.error('[DEBUG filename inference]', {
       inputFileName,
       plugin: resolvedPluginId,
       strictFilenameInference,
       pluginDefaultParams: plugin.defaultParams,
-      explicitParams: params,
+      explicitParams: mergedExplicitParams,
     });
 
     const inputSummary = buildInputSummary(
       plugin,
       finalParams,
-      params,
+      mergedExplicitParams,
       inputFileName,
       frame.headers ?? [],
       derivedHints,
@@ -2818,6 +2980,207 @@ if (args.length === 0) {
     // Tag the result with plugin id so formatReport can label multi-plugin output
     allResults.push({ _plugin: resolvedPluginId, ...scalarResult });
     allInputSummaries[resolvedPluginId] = inputSummary;
+
+    // If debug was requested for this invocation, handle prepareData() and table export
+    const debugRequests = invocation.debugRequests ?? [];
+    if (debugRequests.length === 0) continue;
+
+    if (typeof plugin.prepareData !== 'function') {
+      // If the only debug request is 'list', we can still report absence without calling prepareData.
+      if (debugRequests.some(r => r.key === 'list')) {
+        console.error(`[DEBUG] plugin ${resolvedPluginId} does not implement prepareData(); no debug tables available`);
+        process.exitCode = 0;
+        continue;
+      }
+      console.error(`[DEBUG] requested debug output for plugin ${resolvedPluginId}, but plugin has no prepareData()`);
+      process.exitCode = 2;
+      continue;
+    }
+
+    let prep;
+    try {
+      console.log = (...parts) => console.error(...parts);
+      prep = await plugin.prepareData(frame.packet, finalParams);
+    } catch (err) {
+      console.error(`[DEBUG] plugin.prepareData failed for ${resolvedPluginId}:`, err?.stack ?? err);
+      process.exitCode = 2;
+      console.log = originalConsoleLog;
+      continue;
+    } finally {
+      console.log = originalConsoleLog;
+    }
+
+    const debugTables = (prep && Array.isArray(prep.debugTables)) ? prep.debugTables : [];
+
+    // Handle discovery request '-debug list'
+    if (debugRequests.some(r => r.key === 'list')) {
+      console.error(`DEBUG TABLES: ${resolvedPluginId}`);
+      if (debugTables.length === 0) {
+        console.error('(no debug tables produced)');
+      } else {
+        for (const t of debugTables) {
+          const cols = Object.keys(t.columns || {});
+          console.error('');
+          console.error(t.id);
+          if (t.label) console.error(t.label);
+          if (cols.length > 0) console.error(`columns: ${cols.join(', ')}`);
+        }
+      }
+      // continue to handle other write requests if present
+    }
+
+    if (debugTables.length === 0) {
+      // If user explicitly requested a specific table, this is an error; for 'all' we report.
+      for (const req of debugRequests) {
+        if (req.key !== 'all' && req.key !== 'list') {
+          console.error(`[DEBUG] requested table '${req.key}' not produced by plugin ${resolvedPluginId}`);
+          process.exitCode = 3;
+        }
+      }
+      if (debugRequests.some(r => r.key === 'all')) {
+        console.error(`[DEBUG] plugin ${resolvedPluginId} produced no debug tables`);
+      }
+      continue;
+    }
+
+    // Helper: find table by id
+    const tableById = new Map(debugTables.map(t => [t.id, t]));
+
+    for (const req of debugRequests) {
+      if (req.key === 'list') continue; // already handled
+
+      if (req.key === 'all') {
+        // Write all tables for this plugin
+        // Validate path semantics: if path supplied, it MUST be a directory (trailing '/' or existing dir)
+        if (req.path) {
+          const p = req.path;
+          const looksLikeDir = p.endsWith(path.sep) || p.endsWith('/');
+          let existsDir = false;
+          try {
+            existsDir = fsRaw.existsSync(p) && fsRaw.lstatSync(p).isDirectory();
+          } catch (e) { existsDir = false; }
+          if (!looksLikeDir && !existsDir) {
+            console.error(`ERROR: -debug all requires a directory path (use trailing '/'): ${p}`);
+            process.exitCode = 3;
+            continue;
+          }
+        }
+
+        // Determine target directory
+        let outDir = req.path ?? null;
+        if (!outDir) {
+          // No explicit dir provided
+          if (invocations.length > 1) {
+            outDir = path.join('.', resolvedPluginId);
+          } else {
+            outDir = '.';
+          }
+        }
+
+        await fs.mkdir(outDir, { recursive: true });
+
+        for (const table of debugTables) {
+          const filename = `${table.id}.csv`;
+          const target = path.join(outDir, filename);
+          try {
+            // Serialize table -> CSV
+            const headers = Object.keys(table.columns);
+            if (headers.length === 0) continue;
+            const len = table.columns[headers[0]].length;
+            for (const h of headers) {
+              if (table.columns[h].length !== len) throw new Error(`Column lengths differ in table ${table.id}`);
+            }
+            const rows = [];
+            for (let i = 0; i < len; i++) {
+              const row = {};
+              for (const h of headers) {
+                const v = table.columns[h][i];
+                row[h] = v === null || v === undefined ? '' : v;
+              }
+              rows.push(row);
+            }
+            try {
+              await writeStructuredRowsToFile(headers, rows, target, true);
+              console.error(`WROTE: ${target}`);
+            } catch (err) {
+              throw err;
+            }
+          } catch (err) {
+            console.error(`ERROR: writing ${target}:`, err?.stack ?? err);
+            process.exitCode = 4;
+          }
+        }
+
+      } else {
+        // Specific table requested
+        const table = tableById.get(req.key);
+        if (!table) {
+          console.error(`[DEBUG] requested table '${req.key}' not produced by plugin ${resolvedPluginId}`);
+          process.exitCode = 3;
+          continue;
+        }
+
+        let target = req.path;
+        if (!target) {
+          // No path: default filename in cwd or plugin subdir when multiple invocations
+          if (invocations.length > 1) {
+            const outDir = path.join('.', resolvedPluginId);
+            await fs.mkdir(outDir, { recursive: true });
+            target = path.join(outDir, `${table.id}.csv`);
+          } else {
+            target = `${table.id}.csv`;
+          }
+        } else {
+          // User supplied a path. If it ends with '/', treat as directory
+          if (target.endsWith(path.sep) || target.endsWith('/')) {
+            await fs.mkdir(target, { recursive: true });
+            target = path.join(target, `${table.id}.csv`);
+          } else {
+            // If target looks like an existing directory, write into it
+            try {
+              if (fsRaw.existsSync(target) && fsRaw.lstatSync(target).isDirectory()) {
+                target = path.join(target, `${table.id}.csv`);
+              }
+            } catch (e) {
+              // ignore
+            }
+          }
+        }
+
+        try {
+          const headers = Object.keys(table.columns);
+          const len = headers.length === 0 ? 0 : table.columns[headers[0]].length;
+          for (const h of headers) {
+            if (table.columns[h].length !== len) throw new Error(`Column lengths differ in table ${table.id}`);
+          }
+          const rows = [];
+          for (let i = 0; i < len; i++) {
+            const row = {};
+            for (const h of headers) {
+              const v = table.columns[h][i];
+              row[h] = v === null || v === undefined ? '' : v;
+            }
+            rows.push(row);
+          }
+          await fs.mkdir(path.dirname(target), { recursive: true });
+          try {
+            const ext = path.extname(target).toLowerCase().replace('.', '');
+            if (ext === 'bin') {
+                const written = await writeStructuredRowsToBin(headers, rows, target, irMod, overwrite);
+              if (!written) continue;
+            } else {
+              await writeStructuredRowsToFile(headers, rows, target, overwrite);
+            }
+            console.error(`WROTE: ${target}`);
+          } catch (err) {
+            throw err;
+          }
+        } catch (err) {
+          console.error(`ERROR: writing ${target}:`, err?.stack ?? err);
+          process.exitCode = 4;
+        }
+      }
+    }
   }
 
   const resolvedPluginId = resolvedPluginIds[0];
@@ -2842,25 +3205,112 @@ if (args.length === 0) {
     console.log('[DEBUG before formatReport] payload.input =', JSON.stringify(payload?.input, null, 2));
     console.log('[DEBUG before formatReport] payload.results =', JSON.stringify(payload?.results, null, 2));
   }
-  const report = formatReport(payload, format, verbose);
+  // Always emit the human-readable report to stdout
+  const humanReport = formatReport(payload, 'text', verbose);
+  process.stdout.write(humanReport);
 
-  // ffprobe-style default: stdout. Keep deprecated positional output for compatibility.
+  // If an output file was requested, write a machine-readable serialization
   if (outputFile) {
     if (verbose) console.log('[usig] writing output:', outputFile);
 
-  if (fs.existsSync(outputFile) && !args.overwrite) {
-      const answer = await askConfirmation(
-        `File exists: ${outputFile}. Overwrite? (y/N) `
-      );
+    // Determine machine format: prefer explicit -of (format), else infer from extension
+    let machineFormat = format;
+    const outExt = outputFile ? path.extname(outputFile).toLowerCase().replace('.', '') : '';
 
-      if (answer.toLowerCase() !== 'y') {
-        throw new Error('Output file exists; operation cancelled');
-      }
+    // Supported plugin output formats
+    const SUPPORTED_PLUGIN_FORMATS = new Set(['json', 'csv', 'yaml', 'yml', 'xlsx', 'bin', 'text']);
+
+    // If user specified an output extension that is not supported for plugin results, reject.
+    if (outExt && !SUPPORTED_PLUGIN_FORMATS.has(outExt)) {
+      console.error(`[usig] unsupported output extension for plugin results: .${outExt}. Supported extensions: .csv, .json, .yaml, .yml, .xlsx, .bin`);
+      process.exit(1);
     }
-    await fs.writeFile(outputFile, report, 'utf8');
-    console.log(`[usig] wrote result to ${outputFile}`);
-  } else {
-    process.stdout.write(report);
+
+    if ((!machineFormat || machineFormat === 'text') && outExt) {
+      machineFormat = outExt;
+    }
+
+    if (!SUPPORTED_PLUGIN_FORMATS.has(machineFormat)) {
+      console.error(`[usig] unsupported output format for plugin results: ${machineFormat}. Supported: text, json, csv, yaml, xlsx, bin`);
+      process.exit(1);
+    }
+
+    try {
+      const shouldWrite = await confirmOutputOverwrite(outputFile, overwrite);
+      if (!shouldWrite) return;
+
+      if (machineFormat === 'csv' || machineFormat === 'json' || machineFormat === 'yaml' || machineFormat === 'yml') {
+        const machineReport = formatReport(payload, machineFormat === 'yml' ? 'yaml' : machineFormat, verbose);
+        await fs.writeFile(outputFile, machineReport, 'utf8');
+        console.error(`[usig] wrote result to ${outputFile}`);
+      } else if (machineFormat === 'bin') {
+        // Serialize plugin results into a USIG IR binary container
+        const results = payload.results ?? [];
+        const arrays = headers.map((header) => ({
+          label: header,
+          waveform: new Float32Array(
+            rows.map((row) => {
+              const value = row[header];
+              return value === null || value === undefined || value === ''
+                ? NaN
+                : Number(value);
+            })
+          ),
+        }));
+
+        const frame = {
+          packet: {
+            waveform: arrays[0]?.waveform ?? new Float32Array(0),
+            arrays,
+            metadata: {
+              channelLabels: headers,
+            },
+          },
+          headers,
+          singleValueColumns: {},
+          cacheKey: null,
+          hintsKey: null,
+          ingestedAt: Date.now(),
+          schemaVersion: irMod.IR_SCHEMA_VERSION ?? '1.0.0',
+        };
+
+        const { meta, waveform } = irMod.serializeFrame(frame);
+        const packed = packSerializedIR(meta, waveform);
+        await fs.writeFile(outputFile, packed);
+        console.error(`[usig] wrote result to ${outputFile}`);
+      } else if (machineFormat === 'xlsx') {
+        const results = payload.results ?? [];
+        // Build headers/rows deterministically from first result (exclude _plugin)
+        if (!results || results.length === 0) {
+          const excelJsMod = await import('exceljs');
+          const ExcelJS = excelJsMod.default ?? excelJsMod;
+          const wb = new ExcelJS.Workbook();
+          wb.addWorksheet('results');
+          await wb.xlsx.writeFile(outputFile);
+          console.error(`[usig] wrote result to ${outputFile}`);
+        } else {
+          const first = results[0];
+          const headers = Object.keys(first).filter(k => k !== '_plugin');
+          const rows = results.map(r => {
+            const obj = {};
+            for (const h of headers) obj[h] = r[h] ?? '';
+            return obj;
+          });
+          await writeStructuredRowsToFile(headers, rows, outputFile, overwrite);
+          console.error(`[usig] wrote result to ${outputFile}`);
+        }
+      } else if (machineFormat === 'text') {
+        // Write the human report to file as text as well
+        await fs.writeFile(outputFile, humanReport, 'utf8');
+        console.error(`[usig] wrote result to ${outputFile}`);
+      } else {
+        console.error(`[usig] unsupported plugin result format: ${machineFormat}`);
+        process.exit(1);
+      }
+    } catch (err) {
+      console.error('[usig] failed to write output file:', err?.stack ?? err);
+      process.exitCode = 4;
+    }
   }
 
   if (verbose && Object.keys(params ?? {}).length > 0) {

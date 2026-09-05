@@ -198,6 +198,10 @@ const stripCell = (s: string) =>
 function parseNumeric(cell: string): number {
     const lc = cell.toLowerCase();
 
+    if (cell.trim() === "") {
+        return NaN;
+    }
+
     if (
         lc === "inf" ||
         lc === "+inf" ||
@@ -215,6 +219,7 @@ function parseNumeric(cell: string): number {
 
     return Number(cell);
 }
+
 
 /* -------------------------------------------------------------------------- */
 /*                              Table loading                                 */
@@ -360,7 +365,11 @@ function classifyColumns(
             rawValues.map(parseNumeric);
 
         if (
-            numeric.every(Number.isFinite)
+            numeric.every(
+                value =>
+                    Number.isFinite(value) ||
+                    Number.isNaN(value)
+            )
         ) {
             arrays.push({
                 label:
@@ -419,15 +428,6 @@ export async function mapCsvXlsxToIRCandidate({
             "No varying numeric columns found."
         );
     }
-
-    console.log(
-        "[csvxlsxMapper final metadata]",
-        JSON.stringify(
-            metadata,
-            null,
-            2
-        )
-    );
 
     return {
         packet: {

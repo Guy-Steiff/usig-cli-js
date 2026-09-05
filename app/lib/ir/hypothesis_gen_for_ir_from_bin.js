@@ -737,8 +737,7 @@ function findWaveformCandidate(data) {
 // Generate IR ingestion hypothesis
 // ------------------------------------------------------------
 
-function generateHypothesis(data, filename = "binary") {
-
+export function generateHypothesis(data, filename = "binary") {
     const result =
     {
 
@@ -869,7 +868,7 @@ result.decision =
 // ------------------------------------------------------------
 // Export
 // ------------------------------------------------------------
-
-module.exports = {
-    generateHypothesis
-};
+//
+// module.exports = {
+//     generateHypothesis
+// };

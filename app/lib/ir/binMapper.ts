@@ -405,7 +405,6 @@ export async function mapBinaryToIRCandidate({
   // --------------------------------------------------
   // First: try native USIG IR container
   // --------------------------------------------------
-
   try {
     const {
       meta,
@@ -418,19 +417,13 @@ export async function mapBinaryToIRCandidate({
         waveform
       );
 
-    console.error('[DEBUG binMapper native IR]', {
-      frameKeys: Object.keys(frame ?? {}),
-      packetKeys: Object.keys(frame?.packet ?? {}),
-      packetMetadata: frame?.packet?.metadata,
-      waveformLength: frame?.packet?.waveform?.length,
-    });
-
     return {
       packet: frame.packet,
       capturedVars: frame.capturedVars ?? {},
     };
 
   } catch (error) {
+
     console.error('[DEBUG binMapper native IR failed]', error);
 
     // Not a USIG container.
