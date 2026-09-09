@@ -615,10 +615,10 @@ def main():
     # to only the first or only the second, i.e. the classic overwrite bug)
     # =========================================================================
     #
-    # Multi-input execution is not yet implemented for plugin runs, so the
-    # command is expected to fail explicitly. Before doing so, the CLI's
-    # verbose diagnostic proves that both -i A and -i B were independently
-    # retained and ingested, in order.
+    # Multi-input job-scoped plugin execution (Option B) now runs the plugin
+    # independently against each -i, in order. Before asserting that, the
+    # CLI's verbose diagnostic proves that both -i A and -i B were
+    # independently retained and ingested, in order.
     # =========================================================================
 
     result = run_usig(
@@ -635,9 +635,10 @@ def main():
 
     add_check(
         report,
-        "9: two -i args: plugin execution fails explicitly (multi-input unsupported)",
-        result.returncode != 0
-        and "does not yet support multiple inputs" in (result.stderr or "")
+        "9: two -i args: plugin runs independently against each input",
+        result.returncode == 0
+        and result.stdout.count("filename: A.csv") == 1
+        and result.stdout.count("filename: B.csv") == 1
     )
 
     resolved_9 = parse_resolved_inputs(result.stderr)
@@ -765,11 +766,16 @@ def main():
         [e["file"] for e in resolved_13] == [str(file_a), str(file_b), str(file_c)]
     )
 
+    # Multi-input job-scoped plugin execution (Option B) now runs each
+    # concat-expanded entry independently through the same plugin, rather
+    # than rejecting outright.
     add_check(
         report,
-        "13: concat-expanded multi-input plugin execution fails explicitly",
-        result.returncode != 0
-        and "does not yet support multiple inputs" in (result.stderr or "")
+        "13: concat-expanded multi-input plugin execution succeeds per-entry",
+        result.returncode == 0
+        and result.stdout.count("filename: A.csv") == 1
+        and result.stdout.count("filename: B.csv") == 1
+        and result.stdout.count("filename: C.csv") == 1
     )
 
     # =========================================================================

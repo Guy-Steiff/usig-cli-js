@@ -90,6 +90,66 @@ export interface PluginManifest {
     description?: string;
     columns?: string[];
   }>;
+  /**
+   * Optional declarative figure capabilities exposed by the plugin.
+   * Safe to enumerate via `-figure list` WITHOUT ingesting any input or
+   * loading the (browser-only) React figure components — mirrors
+   * `debugTables` above.
+   */
+  figures?: Array<{
+    id: string;
+    label?: string;
+    description?: string;
+  }>;
+}
+
+/**
+ * Portable, renderer-agnostic description of a single figure — enough
+ * information for Python/MATLAB (or the CLI's own SVG renderer) to
+ * reconstruct the plot, without any React/Recharts/DOM internals.
+ *
+ * Deliberately excludes: fonts, CSS, component trees, renderer-specific
+ * styling. Ticks are intentionally omitted when the plugin does not define
+ * explicit ticks — the renderer is expected to derive sensible ticks itself.
+ */
+export interface PortableFigureDescription {
+  /** Figure id, e.g. "dnl" */
+  figure: string;
+  /** Plain-text title (already resolved to a string — no JSX/markup). */
+  title: string;
+  x: {
+    label: string;
+    /** Shared x-axis data — series below reuse this same array by index. */
+    data: number[];
+  };
+  series: Array<{
+    /** Series/legend name, e.g. "DNL" or "3rd-order poly". */
+    name: string;
+    /** y values; NaN/non-finite values are represented as null. */
+    y: Array<number | null>;
+    /** Visual distinction that carries semantic meaning (e.g. measured vs. fit). */
+    style?: 'solid' | 'dashed';
+  }>;
+  y: {
+    label: string;
+  };
+  legend: {
+    enabled: boolean;
+  };
+  grid: {
+    x: boolean;
+    y: boolean;
+  };
+  referenceLines?: Array<{
+    axis: 'x' | 'y';
+    value: number;
+    label?: string;
+  }>;
+  referenceAreas?: Array<{
+    x1: number;
+    x2: number;
+    label?: string;
+  }>;
 }
 
 
@@ -165,6 +225,15 @@ export interface PluginFigure {
    * Use this for interactive Recharts-based figures.
    */
   component?: ComponentType<{ data: unknown; controls: FigureControlValues }>;
+  /**
+   * Optional portable-data alternative to `component`/`draw`. Produces a
+   * renderer-agnostic PortableFigureDescription (see pluginTypes.ts) from the
+   * same `data` the component/draw would receive — used by the CLI to
+   * generate SVG/PNG/JPEG output and a sibling JSON description without any
+   * React/DOM dependency. Does not recompute analysis data; consumes the
+   * already-computed figureData produced by prepareData().
+   */
+  getData?: (data: unknown, controls: FigureControlValues) => PortableFigureDescription;
 }
 
 /**

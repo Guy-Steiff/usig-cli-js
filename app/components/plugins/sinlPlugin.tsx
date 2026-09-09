@@ -789,6 +789,7 @@ import {
   PluginManifest,
   PluginFigure,
   PluginDebugTable,
+  PortableFigureDescription,
   type WaveformPacket,
 } from '../../lib/pluginTypes';
 
@@ -1369,6 +1370,26 @@ const manifest: PluginManifest = {
     }
   ],
 
+  // Declarative figure capabilities. Safe to enumerate via `-figure list`
+  // without ingesting an input or loading the React figure components.
+  figures: [
+    {
+      id: 'pdf',
+      label: 'PDF',
+      description: 'PDF vs code/voltage, with peak-search reference zones and truncation boundaries.',
+    },
+    {
+      id: 'dnl',
+      label: 'DNL',
+      description: 'DNL per code/voltage, with zero/min/max reference lines.',
+    },
+    {
+      id: 'inl',
+      label: 'INL + polynomial',
+      description: 'INL (measured) and 3rd-order polynomial fit per code/voltage, with zero/min/max reference lines.',
+    },
+  ],
+
 };
 
 // ── Recharts interactive figure components ────────────────────────────────────
@@ -1641,10 +1662,101 @@ function _sinlPrepareCore(
   return { figureData, debugTables };
 }
 
+// ── Portable (renderer-agnostic) figure data ──────────────────────────────────
+// Consumes the same SinlFigureData produced by prepareData() — no analysis
+// recomputation. Used by the CLI to generate SVG/PNG/JPEG figures and a
+// sibling JSON description, without depending on React/Recharts/DOM.
+
+const nanToNullFigure = (v: number): number | null => (isFinite(v) ? v : null);
+
+function sinlXAxis(data: SinlFigureData): { label: string; data: number[]; c2v: (c: number) => number } {
+  const { results: r, adcRes, inputMode, minCode, maxCode } = data;
+  const numCodes = r.codes.length || adcRes;
+  const c2v = makeCodeToVolt(inputMode, minCode, maxCode, numCodes);
+  const isVolt = inputMode === 'voltage';
+  return {
+    label: isVolt ? 'voltage (V)' : 'code',
+    data: isVolt ? r.codes.map(c2v) : r.codes.slice(),
+    c2v,
+  };
+}
+
+function getSinlPdfFigureData(data: SinlFigureData): PortableFigureDescription {
+  const { results: r, singulars: s } = data;
+  const { label: xLabel, data: xData, c2v } = sinlXAxis(data);
+  const avoidR = r._binsAvoidanceRadius;
+  return {
+    figure: 'pdf',
+    title: 'PDF vs code/voltage',
+    x: { label: xLabel, data: xData },
+    series: [{ name: 'PDF', y: r.pdf.map(nanToNullFigure) }],
+    y: { label: 'PDF [probability]' },
+    legend: { enabled: false },
+    grid: { x: true, y: true },
+    referenceLines: [
+      { axis: 'x', value: c2v(s.codeMin), label: `minbin(${s.codeMin})` },
+      { axis: 'x', value: c2v(s.codeMin + avoidR), label: `+r(${avoidR})` },
+      { axis: 'x', value: c2v(s.codeMax - avoidR), label: `-r(${avoidR})` },
+      { axis: 'x', value: c2v(s.codeMax), label: `maxbin(${s.codeMax})` },
+      { axis: 'x', value: c2v(s.codeTruncLow), label: 'trunc low' },
+      { axis: 'x', value: c2v(s.codeTruncHigh), label: 'trunc high' },
+    ],
+    referenceAreas: [
+      { x1: c2v(s.codeMin), x2: c2v(s.codeMin + avoidR), label: 'peak search' },
+      { x1: c2v(s.codeMax - avoidR), x2: c2v(s.codeMax), label: 'peak search' },
+    ],
+  };
+}
+
+function getSinlDnlFigureData(data: SinlFigureData): PortableFigureDescription {
+  const { results: r, singulars: s } = data;
+  const { label: xLabel, data: xData } = sinlXAxis(data);
+  return {
+    figure: 'dnl',
+    title: `DNL +${s.dnlMax.toFixed(2)} / ${s.dnlMin.toFixed(2)} LSB (${s.missingCodesCount} missing codes)`,
+    x: { label: xLabel, data: xData },
+    series: [{ name: 'DNL', y: r.dnl.map(nanToNullFigure) }],
+    y: { label: 'DNL [LSB]' },
+    legend: { enabled: false },
+    grid: { x: true, y: true },
+    referenceLines: [
+      { axis: 'y', value: 0 },
+      { axis: 'y', value: s.dnlMin, label: `min @ ${s.codeDnlMin}: ${s.dnlMin.toFixed(2)}` },
+      { axis: 'y', value: s.dnlMax, label: `max @ ${s.codeDnlMax}: ${s.dnlMax.toFixed(2)}` },
+    ],
+  };
+}
+
+function getSinlInlFigureData(data: SinlFigureData): PortableFigureDescription {
+  const { results: r, singulars: s } = data;
+  const { label: xLabel, data: xData } = sinlXAxis(data);
+  const hasPoly = Array.isArray(r.inlPolynomial) && r.inlPolynomial.length === r.codes.length;
+  const series: PortableFigureDescription['series'] = [
+    { name: 'INL measured', y: r.inl.map(nanToNullFigure) },
+  ];
+  if (hasPoly) {
+    series.push({ name: '3rd-order poly', y: r.inlPolynomial.map(nanToNullFigure), style: 'dashed' });
+  }
+  return {
+    figure: 'inl',
+    title: `INL +${s.inlMax.toFixed(2)} / ${s.inlMin.toFixed(2)} LSB (poly p2p: ${s.inlCodesP2p.toFixed(2)})`,
+    x: { label: xLabel, data: xData },
+    series,
+    y: { label: 'INL [LSB]' },
+    legend: { enabled: true },
+    grid: { x: true, y: true },
+    referenceLines: [
+      { axis: 'y', value: 0 },
+      { axis: 'y', value: s.inlMin, label: `min @ ${s.codeInlMin}: ${s.inlMin.toFixed(2)}` },
+      { axis: 'y', value: s.inlMax, label: `max @ ${s.codeInlMax}: ${s.inlMax.toFixed(2)}` },
+    ],
+  };
+}
+
 const sinlFigures: PluginFigure[] = [
-  { id: 'pdf', label: 'PDF',            component: PdfFigure },
-  { id: 'dnl', label: 'DNL',            component: DnlFigure },
-  { id: 'inl', label: 'INL + polynomial', component: InlFigure },
+  { id: 'pdf', label: 'PDF',            component: PdfFigure, getData: (data) => getSinlPdfFigureData(data as SinlFigureData) },
+  { id: 'dnl', label: 'DNL',            component: DnlFigure, getData: (data) => getSinlDnlFigureData(data as SinlFigureData) },
+  { id: 'inl', label: 'INL + polynomial', component: InlFigure, getData: (data) => getSinlInlFigureData(data as SinlFigureData) },
 ];
 
 

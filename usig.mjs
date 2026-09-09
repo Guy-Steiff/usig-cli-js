@@ -237,6 +237,8 @@ import path from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import readline from 'node:readline';
 import * as esbuild from 'esbuild';
+import sharp from 'sharp';
+import { renderFigureToSvg } from './app/lib/figureRenderSvg.mjs';
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const nodeModulesDir = path.join(scriptDir, 'node_modules');
@@ -280,6 +282,10 @@ function parseArgs(args) {
     // shape is not a supported mass-conversion job list; execution paths
     // must reject it explicitly rather than guessing which input it means.
     multiInputSharedOutputAttempt: null,
+    // Set when a positional output arg appears with zero -i declared at all
+    // (e.g. "-plugin sinl -debug list output.csv"). An output path without
+    // any input is never valid; execution paths must reject it explicitly.
+    unattachedPositionalOutput: null,
   };
 
   let currentInvocation = null;
@@ -313,6 +319,12 @@ function parseArgs(args) {
         // output. Remains null for plugin/analyzer invocations, which don't
         // use per-input positional outputs.
         output: null,
+        // Job-scoped plugin invocations (Option B): every -plugin/-p/-debug/
+        // -figure declared while this is the current input is recorded here
+        // (in addition to the flat result.pluginInvocations, which remains
+        // for single-job backward compatibility). Enables independent jobs
+        // such as "-i A -plugin sinl ... -i B -plugin smeas ...".
+        pluginInvocations: [],
       };
       pendingFormat = null;
       result.inputFiles.push(inputSpec);
@@ -331,10 +343,16 @@ function parseArgs(args) {
           pluginId: trimmed,
           params: {},
           debugRequests: [],
+          figureRequests: [],
         };
         result.pluginInvocations.push(invocation);
         result.pluginIds.push(trimmed);
         currentInvocation = invocation;
+        // Job-scoped attachment (Option B): bind this invocation to the most
+        // recently declared -i, if any. Invocations declared before any -i
+        // (no-input discovery, e.g. "-plugin sinl -figure list") remain
+        // unbound and are only reachable via the flat result.pluginInvocations.
+        if (currentInput) currentInput.pluginInvocations.push(invocation);
       }
       // Consume additional space-separated plugin ids that follow (legacy behavior)
       while (i + 1 < args.length && !args[i + 1].startsWith('-') && isPluginId(args[i + 1])) {
@@ -345,10 +363,12 @@ function parseArgs(args) {
             pluginId: trimmed,
             params: {},
             debugRequests: [],
+            figureRequests: [],
           };
           result.pluginInvocations.push(invocation);
           result.pluginIds.push(trimmed);
           currentInvocation = invocation;
+          if (currentInput) currentInput.pluginInvocations.push(invocation);
         }
       }
     } else if (arg === '-p' && i + 1 < args.length) {
@@ -418,12 +438,33 @@ function parseArgs(args) {
         // No active plugin — attach to a provisional first invocation container
         if (result.pluginInvocations.length === 0) {
           // create a placeholder invocation to be bound later when plugins are resolved
-          const placeholder = { pluginId: null, params: {}, debugRequests: [req] };
+          const placeholder = { pluginId: null, params: {}, debugRequests: [req], figureRequests: [] };
           result.pluginInvocations.push(placeholder);
           currentInvocation = placeholder;
+          if (currentInput) currentInput.pluginInvocations.push(placeholder);
         } else {
           // attach to last invocation
           result.pluginInvocations[result.pluginInvocations.length - 1].debugRequests.push(req);
+        }
+      }
+    } else if (arg === '-figure' && i + 1 < args.length) {
+      const token = args[++i];
+      // split into key and optional path on first '='
+      const eqIdx = token.indexOf('=');
+      const key = eqIdx === -1 ? token : token.slice(0, eqIdx);
+      const pathStr = eqIdx === -1 ? undefined : token.slice(eqIdx + 1);
+      const req = { key, path: pathStr };
+      if (currentInvocation) {
+        currentInvocation.figureRequests.push(req);
+      } else {
+        // No active plugin — attach to a provisional first invocation container
+        if (result.pluginInvocations.length === 0) {
+          const placeholder = { pluginId: null, params: {}, debugRequests: [], figureRequests: [req] };
+          result.pluginInvocations.push(placeholder);
+          currentInvocation = placeholder;
+          if (currentInput) currentInput.pluginInvocations.push(placeholder);
+        } else {
+          result.pluginInvocations[result.pluginInvocations.length - 1].figureRequests.push(req);
         }
       }
     } else if (!arg.startsWith('-') && result.inputFiles.length > 0) {
@@ -451,6 +492,14 @@ function parseArgs(args) {
       // output (e.g. a stray extra positional); ignore it, matching the
       // previous behavior of ignoring extra positional args once the
       // (single, legacy) output had already been captured.
+    } else if (!arg.startsWith('-') && result.inputFiles.length === 0) {
+      // A positional argument appeared but no -i has been declared at all
+      // (e.g. "-plugin sinl -debug list output.csv"). An output path
+      // without any input is never valid — record it so callers can
+      // reject it explicitly rather than silently dropping it.
+      if (!result.unattachedPositionalOutput) {
+        result.unattachedPositionalOutput = arg;
+      }
     }
   }
 
@@ -556,7 +605,7 @@ async function resolveInputSpecs(inputSpecs) {
         // of its own — it only lets callers detect the "one trailing output
         // shared across multiple expanded entries" shape and reject it
         // explicitly, the same way repeated "-i A -i B out" is rejected.
-        resolved.push({ file, startSample: null, endSample: null, inputFormat: null, output: spec.output ?? null });
+        resolved.push({ file, startSample: null, endSample: null, inputFormat: null, output: spec.output ?? null, pluginInvocations: spec.pluginInvocations ?? [] });
       }
     } else {
       resolved.push({ ...spec });
@@ -2954,6 +3003,7 @@ async function main() {
     endSample,
     overwrite,
     multiInputSharedOutputAttempt,
+    unattachedPositionalOutput,
   } = parseArgs(args);
 
   let inputFile = parsedInputFile;
@@ -3017,6 +3067,17 @@ if (args.length === 0) {
       format,
     });
     return;
+  }
+
+  // A positional output path with zero inputs declared is never valid,
+  // regardless of conversion/plugin mode (e.g. "-plugin sinl -debug list
+  // output.csv" or "-plugin sinl -figure list output.csv"). Reject
+  // explicitly rather than silently dropping the stray positional arg.
+  if (unattachedPositionalOutput && parsedInputFiles.length === 0) {
+    console.error(
+      `[usig] output path specified but no input file was provided: ${unattachedPositionalOutput}`
+    );
+    process.exit(1);
   }
 
   // Independent conversion job(s). Only applies when no plugin/analyzer was
@@ -3133,13 +3194,18 @@ if (args.length === 0) {
     }
   }
 
-  // Allow missing inputFile when the user requested declarative '-debug list'
-  const hasOnlyDebugList = (pluginInvocations && pluginInvocations.length > 0) && pluginInvocations.every(inv => {
-    const dr = inv.debugRequests || [];
-    return dr.length > 0 && dr.every(r => r.key === 'list');
-  });
+  // No-input declarative discovery ("-debug list" / "-figure list") is valid
+  // ONLY when there is no input at all AND every requested debug/figure
+  // operation across all invocations is 'list'. If an input IS supplied,
+  // normal ingestion/analysis must still run (list does not suppress it) —
+  // list printing then happens later, from real prepareData() output.
+  const allRawListRequests = (pluginInvocations || []).flatMap(inv => [
+    ...(inv.debugRequests || []),
+    ...(inv.figureRequests || []),
+  ]);
+  const isPureListDiscovery = allRawListRequests.length > 0 && allRawListRequests.every(r => r.key === 'list');
 
-  if ((!inputFile && !hasOnlyDebugList) || pluginIds.length === 0) {
+  if ((!inputFile && !isPureListDiscovery) || pluginIds.length === 0) {
     console.error('Usage: node usig.mjs -i <input-file> -plugin <id[,id2]> [-p key=value ...] [-of text|json|yaml]');
     process.exit(1);
   }
@@ -3182,7 +3248,7 @@ if (args.length === 0) {
   // Prepare invocations array for per-invocation handling
   const invocations = (pluginInvocations && pluginInvocations.length > 0)
     ? pluginInvocations.map(p => ({ ...p }))
-    : pluginIds.map(id => ({ pluginId: id, params: {}, debugRequests: [] }));
+    : pluginIds.map(id => ({ pluginId: id, params: {}, debugRequests: [], figureRequests: [] }));
 
   // If any invocation is a placeholder (pluginId === null), bind it to the first resolved plugin id
   if (invocations.length > 0 && (!invocations[0].pluginId || invocations[0].pluginId === null)) {
@@ -3191,12 +3257,14 @@ if (args.length === 0) {
     }
   }
 
-  // If the caller requested only '-debug list' for all invocations, perform declarative discovery
-  // regardless of whether an inputFile was supplied. Also handle the original case
-  // where there is no input file but a -debug list is requested.
-  if (hasOnlyDebugList || (!inputFile && invocations.some(inv => (inv.debugRequests || []).some(r => r.key === 'list')))) {
+  // Declarative no-input discovery: only when there is no input at all.
+  // (If an input IS supplied, 'list' does not suppress normal analysis —
+  // handled later, in the per-invocation debug/figure dispatch below.)
+  if (!inputFile && isPureListDiscovery) {
     for (const invocation of invocations) {
-      if (!invocation.debugRequests || !invocation.debugRequests.some(r => r.key === 'list')) continue;
+      const wantsDebugList = (invocation.debugRequests || []).some(r => r.key === 'list');
+      const wantsFigureList = (invocation.figureRequests || []).some(r => r.key === 'list');
+      if (!wantsDebugList && !wantsFigureList) continue;
       const requestedPluginId = invocation.pluginId ?? pluginIds[0];
       const resolvedPluginId = resolvePluginId(requestedPluginId);
       const pluginPath = path.join(scriptDir, `app/components/plugins/${resolvedPluginId}Plugin.tsx`);
@@ -3211,17 +3279,35 @@ if (args.length === 0) {
         process.exit(1);
       }
       const manifest = pluginExport.manifest ?? {};
-      console.error(`DEBUG TABLES: ${resolvedPluginId}`);
-      const declared = manifest.debugTables ?? null;
-      if (!declared || declared.length === 0) {
-        console.error('  (none declared)');
-        continue;
+
+      if (wantsDebugList) {
+        console.error(`DEBUG TABLES: ${resolvedPluginId}`);
+        const declared = manifest.debugTables ?? null;
+        if (!declared || declared.length === 0) {
+          console.error('  (none declared)');
+        } else {
+          for (const dt of declared) {
+            console.error('');
+            console.error(`  ${dt.id}`);
+            if (dt.label) console.error(`    ${dt.label}`);
+            if (Array.isArray(dt.columns) && dt.columns.length > 0) console.error(`    Columns: ${dt.columns.join(', ')}`);
+          }
+        }
       }
-      for (const dt of declared) {
-        console.error('');
-        console.error(`  ${dt.id}`);
-        if (dt.label) console.error(`    ${dt.label}`);
-        if (Array.isArray(dt.columns) && dt.columns.length > 0) console.error(`    Columns: ${dt.columns.join(', ')}`);
+
+      if (wantsFigureList) {
+        console.error(`FIGURES: ${resolvedPluginId}`);
+        const declaredFigures = manifest.figures ?? null;
+        if (!declaredFigures || declaredFigures.length === 0) {
+          console.error('  (none declared)');
+        } else {
+          for (const fig of declaredFigures) {
+            console.error('');
+            console.error(`  ${fig.id}`);
+            if (fig.label) console.error(`    ${fig.label}`);
+            if (fig.description) console.error(`    ${fig.description}`);
+          }
+        }
       }
     }
     return; // done; declarative discovery does not ingest
@@ -3389,18 +3475,42 @@ if (args.length === 0) {
     });
   }
 
-  // Plugin execution below only knows how to run against a single frame.
-  // Multiple inputs are fully, independently ingested above (never silently
-  // reduced to the first one) — but running a plugin across several frames is
-  // not yet a defined operation, so fail explicitly rather than guessing.
-  if (inputFrames.length > 1) {
-    console.error(
-      '[usig] multiple inputs are ingested, but this plugin execution path does not yet support multiple inputs'
-    );
-    process.exit(1);
-  }
+  // Job-scoped plugin execution (Option B): a single input keeps the exact
+  // legacy behavior (one frame, the flat `invocations` list built above).
+  // Multiple inputs each run independently, using their own job-scoped
+  // plugin invocations (captured per `-i` during parsing) when present, so
+  // running several jobs never silently collapses onto the first input.
+  const jobs = inputFrames.map((inputFrame, jobIndex) => {
+    const jobSpec = resolvedInputs[jobIndex];
+    const jobInvocations =
+      inputFrames.length > 1 &&
+      jobSpec &&
+      Array.isArray(jobSpec.pluginInvocations) &&
+      jobSpec.pluginInvocations.length > 0
+        ? jobSpec.pluginInvocations.map(p => ({ ...p }))
+        : invocations;
 
-  const { frame, inputFileName, filenameParamHints } = inputFrames[0];
+    // Bind an unbound placeholder invocation (pluginId === null) to this
+    // job's own first plugin id, mirroring the flat-invocations binding
+    // above, so per-job -debug/-figure requests issued before any -plugin
+    // still resolve sensibly.
+    if (jobInvocations.length > 0 && !jobInvocations[0].pluginId) {
+      const fallbackPluginId =
+        jobInvocations.find(inv => inv.pluginId)?.pluginId ?? resolvedPluginIds[0];
+      jobInvocations[0].pluginId = fallbackPluginId;
+    }
+
+    return { inputFrame, jobInvocations };
+  });
+
+  // ── Run each plugin on each job's frame ─────────────────────────────────────
+  const allResults = [];
+  const allInputSummaries = {};  // keyed by plugin id
+  const allParamSchemas = {};  // keyed by plugin id
+  const debugTablesToPrint = [];
+
+  for (const job of jobs) {
+  const { frame, inputFileName, filenameParamHints } = job.inputFrame;
 
   if (verbose) {
     console.error('[DEBUG CANONICAL FRAME]', {
@@ -3425,14 +3535,7 @@ if (args.length === 0) {
     console.log(`[usig] ingested through IR (${ns ?? 'unknown'} samples)`);
   }
 
-
-  // ── Run each plugin on the shared frame ─────────────────────────────────────
-  const allResults = [];
-  const allInputSummaries = {};  // keyed by plugin id
-  const allParamSchemas = {};  // keyed by plugin id
-  const debugTablesToPrint = [];
-
-  for (const invocation of invocations) {
+  for (const invocation of job.jobInvocations) {
     const requestedPluginId = invocation.pluginId;
     const resolvedPluginId = resolvePluginId(requestedPluginId);
     const pluginPath = path.join(scriptDir, `app/components/plugins/${resolvedPluginId}Plugin.tsx`);
@@ -3506,13 +3609,19 @@ if (args.length === 0) {
     allResults.push({ _plugin: resolvedPluginId, ...scalarResult });
     allInputSummaries[resolvedPluginId] = inputSummary;
 
-    // If debug was requested for this invocation, handle prepareData() and table export
+    // If debug or figure output was requested for this invocation, handle
+    // prepareData() once and dispatch each independently from the result.
     const debugRequests = invocation.debugRequests ?? [];
-    if (debugRequests.length === 0) continue;
+    const figureRequests = invocation.figureRequests ?? [];
+    if (debugRequests.length === 0 && figureRequests.length === 0) continue;
 
     if (typeof plugin.prepareData !== 'function') {
-      // If the only debug request is 'list', we can still report absence without calling prepareData.
-      console.error(`[DEBUG] requested debug output for plugin ${resolvedPluginId}, but plugin has no prepareData()`);
+      if (debugRequests.length > 0) {
+        console.error(`[DEBUG] requested debug output for plugin ${resolvedPluginId}, but plugin has no prepareData()`);
+      }
+      if (figureRequests.length > 0) {
+        console.error(`[FIGURE] requested figure output for plugin ${resolvedPluginId}, but plugin has no prepareData()`);
+      }
       process.exitCode = 2;
       continue;
     }
@@ -3533,7 +3642,12 @@ if (args.length === 0) {
     const debugTables = (prep && Array.isArray(prep.debugTables))
       ? prep.debugTables
       : [];
+    const figureData = (prep && Object.prototype.hasOwnProperty.call(prep, 'figureData'))
+      ? prep.figureData
+      : undefined;
 
+    // ── Debug table dispatch (unchanged behavior) ─────────────────────────
+    if (debugRequests.length > 0) {
     // Handle discovery request '-debug list'
     if (debugRequests.some(r => r.key === 'list')) {
 
@@ -3563,8 +3677,7 @@ if (args.length === 0) {
       if (debugRequests.some(r => r.key === 'all')) {
         console.error(`[DEBUG] plugin ${resolvedPluginId} produced no debug tables`);
       }
-      continue;
-    }
+    } else {
 
     // Helper: find table by id
     const tableById = new Map(debugTables.map(t => [t.id, t]));
@@ -3755,7 +3868,153 @@ if (args.length === 0) {
         }
       }
     }
+    } // end else (debugTables.length > 0)
+    } // end if (debugRequests.length > 0)
+
+    // ── Figure dispatch ────────────────────────────────────────────────────
+    // Reuses the same `prep`/figureData computed above — prepareData() is
+    // never called twice, regardless of whether debug was also requested.
+    if (figureRequests.length > 0) {
+      const runtimeFigures = Array.isArray(plugin.figures) ? plugin.figures : [];
+      const manifestFigures = plugin.manifest?.figures ?? [];
+      const figureById = new Map(runtimeFigures.map((f) => [f.id, f]));
+      const SUPPORTED_FIGURE_EXTS = new Set(['svg', 'png', 'jpg', 'jpeg']);
+
+      if (figureRequests.some((r) => r.key === 'list')) {
+        console.error(`FIGURES: ${resolvedPluginId}`);
+        if (manifestFigures.length === 0) {
+          console.error('  (none declared)');
+        } else {
+          for (const fig of manifestFigures) {
+            console.error('');
+            console.error(`  ${fig.id}`);
+            if (fig.label) console.error(`    ${fig.label}`);
+            if (fig.description) console.error(`    ${fig.description}`);
+          }
+        }
+      }
+
+      if (manifestFigures.length === 0 && figureRequests.some((r) => r.key !== 'list')) {
+        console.error(`[FIGURE] plugin ${resolvedPluginId} declares no figures`);
+        process.exitCode = 3;
+      }
+
+      // Renders + rasterizes (if needed) + writes one figure and its sibling
+      // portable-JSON description. `targetPath`'s extension determines the
+      // artifact format; defaults to .svg when no extension is present.
+      const writeFigureArtifact = async (fig, targetPath) => {
+        const desc = fig.getData(figureData, {});
+        const svg = renderFigureToSvg(desc);
+        const ext = (path.extname(targetPath).toLowerCase().replace('.', '')) || 'svg';
+
+        const shouldWrite = await confirmOutputOverwrite(targetPath, overwrite);
+        if (!shouldWrite) return;
+
+        await fs.mkdir(path.dirname(targetPath) || '.', { recursive: true });
+
+        if (ext === 'svg') {
+          await fs.writeFile(targetPath, svg, 'utf8');
+        } else if (ext === 'png') {
+          await fs.writeFile(targetPath, await sharp(Buffer.from(svg)).png().toBuffer());
+        } else if (ext === 'jpg' || ext === 'jpeg') {
+          await fs.writeFile(targetPath, await sharp(Buffer.from(svg)).jpeg().toBuffer());
+        } else {
+          throw new Error(`unsupported figure output extension: .${ext}`);
+        }
+        console.error(`WROTE: ${targetPath}`);
+
+        const jsonPath = targetPath.slice(0, targetPath.length - (ext.length + 1)) + '.json';
+        const jsonShouldWrite = await confirmOutputOverwrite(jsonPath, overwrite);
+        if (jsonShouldWrite) {
+          await fs.writeFile(jsonPath, JSON.stringify(desc, null, 2), 'utf8');
+          console.error(`WROTE: ${jsonPath}`);
+        }
+      };
+
+      for (const req of figureRequests) {
+        if (req.key === 'list') continue; // already handled
+
+        if (figureData === undefined) {
+          console.error(`[FIGURE] requested figure output for plugin ${resolvedPluginId}, but prepareData() produced no figureData`);
+          process.exitCode = 3;
+          continue;
+        }
+
+        if (req.key === 'all') {
+          const outDir = req.path ?? '.';
+          let existsAsFile = false;
+          try {
+            existsAsFile = fsRaw.existsSync(outDir) && fsRaw.lstatSync(outDir).isFile();
+          } catch (e) { existsAsFile = false; }
+          if (existsAsFile) {
+            console.error(`ERROR: -figure all requires a directory path, but a file exists at: ${outDir}`);
+            process.exitCode = 3;
+            continue;
+          }
+          if (manifestFigures.length === 0) continue; // already reported above
+
+          try {
+            await fs.mkdir(outDir, { recursive: true });
+          } catch (err) {
+            console.error(`ERROR: creating directory ${outDir}:`, err?.stack ?? err);
+            process.exitCode = 4;
+            continue;
+          }
+
+          for (const figDecl of manifestFigures) {
+            const fig = figureById.get(figDecl.id);
+            if (!fig || typeof fig.getData !== 'function') {
+              console.error(`[FIGURE] figure '${figDecl.id}' has no getData() implementation`);
+              process.exitCode = 3;
+              continue;
+            }
+            const target = path.join(outDir, `${figDecl.id}.svg`);
+            try {
+              await writeFigureArtifact(fig, target);
+            } catch (err) {
+              console.error(`ERROR: writing figure ${figDecl.id}:`, err?.stack ?? err);
+              process.exitCode = 4;
+            }
+          }
+          continue;
+        }
+
+        // Specific figure requested
+        const figDecl = manifestFigures.find((f) => f.id === req.key);
+        const fig = figureById.get(req.key);
+        if (!figDecl || !fig || typeof fig.getData !== 'function') {
+          console.error(
+            `[FIGURE] requested figure '${req.key}' not produced by plugin ${resolvedPluginId}` +
+            (manifestFigures.length > 0 ? ` (available: ${manifestFigures.map((f) => f.id).join(', ')})` : '')
+          );
+          process.exitCode = 3;
+          continue;
+        }
+
+        let targetPath = req.path;
+        if (!targetPath) {
+          targetPath = `${req.key}.svg`;
+        } else {
+          const ext = path.extname(targetPath).toLowerCase().replace('.', '');
+          if (!ext) {
+            targetPath = `${targetPath}.svg`;
+          } else if (!SUPPORTED_FIGURE_EXTS.has(ext)) {
+            console.error(`ERROR: unsupported figure output extension: .${ext}. Supported: .svg, .png, .jpg, .jpeg`);
+            process.exitCode = 3;
+            continue;
+          }
+        }
+
+        try {
+          await writeFigureArtifact(fig, targetPath);
+        } catch (err) {
+          console.error(`ERROR: writing figure ${req.key}:`, err?.stack ?? err);
+          process.exitCode = 4;
+        }
+      }
+    }
   }
+  } // end of per-job invocation loop (jobs loop)
 
   const resolvedPluginId = resolvedPluginIds[0];
 
