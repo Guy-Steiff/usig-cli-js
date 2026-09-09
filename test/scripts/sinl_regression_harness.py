@@ -656,6 +656,45 @@ def validate_output_columns(
             expected,
             KPI_TOLERANCE_PERCENT
         )
+
+def pd2table(document, pd_data, f_font_size=9.5): #, str_units = 'volts'):
+    table1 = document.add_table(rows=pd_data.shape[0] + 1, cols=pd_data.shape[1])
+
+    # add the header rows.
+    for jj in range(pd_data.shape[-1]):
+        table1.cell(0, jj).text = pd_data.columns[jj]
+
+    # add the rest of the data frame
+    for ii in range(pd_data.shape[0]):
+        for jj in range(pd_data.shape[-1]):
+            item = pd_data.values[ii, jj]
+            if item == float('inf'):
+                item_to_write = 'inf'
+            elif item == float('-inf'):
+                item_to_write = '-inf'
+            else:
+                if isinstance(item, float) and not (np.isnan(item)):
+                    if int(item) == float(item):
+                        item_to_write = f'{int(item):>,}'
+                    elif int(item) != float(item):
+                        item_to_write = f'{item:>,.2f}'
+                    else:
+                        item_to_write = item
+                else:
+                    item_to_write = item
+            # item_to_write = item
+            table1.cell(ii + 1, jj).text = str(item_to_write)
+    for row in table1.rows:
+        for cell in row.cells:
+            paragraphs = cell.paragraphs
+            paragraph = paragraphs[0]
+            run_obj = paragraph.runs
+            run = run_obj[0]
+            font = run.font
+            font.size = Pt(f_font_size)
+    table1.style = 'Table Grid'
+    # document.add_paragraph(f'(units are {str_units})', style='Normal')
+
 def main():
     # =========================================================================
     # Environment setup

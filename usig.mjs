@@ -2552,6 +2552,219 @@ function printPluginHelp(pluginId, plugin) {
   console.log(`  usig -i waveform.csv -plugin ${pluginId}`);
 }
 
+function printDebugTableHead(table) {
+  const columns = table.columns ?? {};
+  const headers = Object.keys(columns);
+
+  if (headers.length === 0) {
+    console.error(`DEBUG TABLE HEAD: ${table.id}`);
+    if (table.label) console.error(table.label);
+    console.error('(empty table)');
+    return;
+  }
+
+  const MAX_DISPLAY_COLUMNS = 6;
+
+  // Pandas-like column display:
+  // - 6 or fewer columns: show everything
+  // - more than 6 columns: first 3, ..., last 3
+  const displayHeaders =
+    headers.length <= MAX_DISPLAY_COLUMNS
+      ? headers
+      : [
+          ...headers.slice(0, 3),
+          '...',
+          ...headers.slice(-3),
+        ];
+
+  const len = columns[headers[0]]?.length ?? 0;
+
+  const HEAD_ROWS = 3;
+  const TAIL_ROWS = 3;
+
+  // Select rows in pandas-like head / tail fashion.
+  let indices;
+
+  if (len <= HEAD_ROWS + TAIL_ROWS) {
+    indices = Array.from({ length: len }, (_, i) => i);
+  } else {
+    indices = [
+      ...Array.from({ length: HEAD_ROWS }, (_, i) => i),
+      ...Array.from(
+        { length: TAIL_ROWS },
+        (_, i) => len - TAIL_ROWS + i
+      ),
+    ];
+  }
+
+  function isNumeric(value) {
+    return (
+      typeof value === 'number' &&
+      Number.isFinite(value)
+    );
+  }
+
+  // Compact numeric formatting, similar in spirit to pandas display.
+  function formatValue(value) {
+    if (value === null || value === undefined) return '';
+
+    if (typeof value === 'number') {
+      if (!Number.isFinite(value)) {
+        if (Number.isNaN(value)) return 'NaN';
+        return value > 0 ? 'Inf' : '-Inf';
+      }
+
+      if (Object.is(value, -0)) return '0';
+
+      // Avoid exposing JS's full binary floating-point representation.
+      // Use fixed precision for ordinary values, switching to scientific
+      // notation for very large/small magnitudes.
+      const abs = Math.abs(value);
+
+      if (abs !== 0 && (abs >= 1e8 || abs < 1e-6)) {
+        return value.toExponential(6).replace(/\.?0+e/, 'e');
+      }
+
+      return Number(value.toPrecision(8)).toString();
+    }
+
+    return String(value);
+  }
+
+  // Build formatted cells only for displayed columns.
+  const rows = indices.map(index => {
+    const cells = {};
+
+    for (const header of displayHeaders) {
+      if (header === '...') {
+        cells[header] = '...';
+      } else {
+        cells[header] = formatValue(
+          columns[header]?.[index]
+        );
+      }
+    }
+
+    return {
+      index: String(index),
+      cells,
+    };
+  });
+
+  // Determine alignment from the actual column data.
+  const numericColumns = {};
+
+  for (const header of displayHeaders) {
+    if (header === '...') {
+      numericColumns[header] = false;
+      continue;
+    }
+
+    numericColumns[header] = true;
+
+    for (const index of indices) {
+      const value = columns[header]?.[index];
+
+      if (
+        value !== null &&
+        value !== undefined &&
+        !isNumeric(value)
+      ) {
+        numericColumns[header] = false;
+        break;
+      }
+    }
+  }
+
+  // Calculate display widths.
+  const widths = {};
+
+  widths.index = Math.max(
+    String(len > 0 ? len - 1 : 0).length,
+    1
+  );
+
+  for (const header of displayHeaders) {
+    widths[header] = header.length;
+
+    for (const row of rows) {
+      widths[header] = Math.max(
+        widths[header],
+        row.cells[header].length
+      );
+    }
+  }
+
+  function formatRow(row) {
+    const indexText = row.index.padStart(widths.index);
+
+    const values = displayHeaders.map(header => {
+      const value = row.cells[header];
+
+      if (numericColumns[header]) {
+        return value.padStart(widths[header]);
+      }
+
+      return value.padEnd(widths[header]);
+    });
+
+    return `${indexText}  ${values.join('  ')}`;
+  }
+
+  console.error('');
+  console.error(`DEBUG TABLE HEAD: ${table.id}`);
+
+  if (table.label) {
+    console.error(table.label);
+  }
+
+  console.error(`rows: ${len}`);
+  console.error(`columns: ${headers.join(', ')}`);
+  console.error('');
+
+  // Header.
+  const headerIndex = ''.padStart(widths.index);
+
+  const headerCells = displayHeaders.map(header =>
+    numericColumns[header]
+      ? header.padStart(widths[header])
+      : header.padEnd(widths[header])
+  );
+
+  console.error(
+    `${headerIndex}  ${headerCells.join('  ')}`
+  );
+
+  // Separator.
+  console.error(
+    `${'-'.repeat(widths.index)}  ` +
+    displayHeaders
+      .map(header => '-'.repeat(widths[header]))
+      .join('  ')
+  );
+
+  // Rows.
+  for (let i = 0; i < rows.length; i++) {
+    if (
+      len > HEAD_ROWS + TAIL_ROWS &&
+      i === HEAD_ROWS
+    ) {
+      console.error(
+        `${''.padStart(widths.index)}  ` +
+        displayHeaders
+          .map(header =>
+            '...'.padStart(widths[header])
+          )
+          .join('  ')
+      );
+    }
+
+    console.error(formatRow(rows[i]));
+  }
+
+  console.error('');
+}
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Main
@@ -2905,7 +3118,7 @@ if (args.length === 0) {
   const allResults = [];
   const allInputSummaries = {};  // keyed by plugin id
   const allParamSchemas = {};  // keyed by plugin id
-
+  const debugTablesToPrint = [];
 
   for (const invocation of invocations) {
     const requestedPluginId = invocation.pluginId;
@@ -2987,11 +3200,6 @@ if (args.length === 0) {
 
     if (typeof plugin.prepareData !== 'function') {
       // If the only debug request is 'list', we can still report absence without calling prepareData.
-      if (debugRequests.some(r => r.key === 'list')) {
-        console.error(`[DEBUG] plugin ${resolvedPluginId} does not implement prepareData(); no debug tables available`);
-        process.exitCode = 0;
-        continue;
-      }
       console.error(`[DEBUG] requested debug output for plugin ${resolvedPluginId}, but plugin has no prepareData()`);
       process.exitCode = 2;
       continue;
@@ -3010,10 +3218,13 @@ if (args.length === 0) {
       console.log = originalConsoleLog;
     }
 
-    const debugTables = (prep && Array.isArray(prep.debugTables)) ? prep.debugTables : [];
+    const debugTables = (prep && Array.isArray(prep.debugTables))
+      ? prep.debugTables
+      : [];
 
     // Handle discovery request '-debug list'
     if (debugRequests.some(r => r.key === 'list')) {
+
       console.error(`DEBUG TABLES: ${resolvedPluginId}`);
       if (debugTables.length === 0) {
         console.error('(no debug tables produced)');
@@ -3068,16 +3279,18 @@ if (args.length === 0) {
 
         // Determine target directory
         let outDir = req.path ?? null;
+
+        // -debug all without a path means print all tables only.
+        // Defer printing until after the normal Inputs/Outputs report.
         if (!outDir) {
-          // No explicit dir provided
-          if (invocations.length > 1) {
-            outDir = path.join('.', resolvedPluginId);
-          } else {
-            outDir = '.';
+          for (const table of debugTables) {
+            debugTablesToPrint.push(table);
           }
+          continue;
         }
 
         await fs.mkdir(outDir, { recursive: true });
+
 
         for (const table of debugTables) {
           const filename = `${table.id}.csv`;
@@ -3114,69 +3327,122 @@ if (args.length === 0) {
       } else {
         // Specific table requested
         const table = tableById.get(req.key);
+
         if (!table) {
-          console.error(`[DEBUG] requested table '${req.key}' not produced by plugin ${resolvedPluginId}`);
+          console.error(
+            `[DEBUG] requested table '${req.key}' not produced by plugin ${resolvedPluginId}`
+          );
           process.exitCode = 3;
           continue;
         }
 
+        // Always defer printing the debug table head until after
+        // the normal Inputs/Outputs report.
+        //
+        // A path does NOT suppress printing. It only additionally
+        // requests that the table be written to a file.
+        debugTablesToPrint.push(table);
+
+        if (!req.path) {
+          continue;
+        }
+
+        // A path was explicitly supplied, so also write the table.
         let target = req.path;
-        if (!target) {
-          // No path: default filename in cwd or plugin subdir when multiple invocations
-          if (invocations.length > 1) {
-            const outDir = path.join('.', resolvedPluginId);
-            await fs.mkdir(outDir, { recursive: true });
-            target = path.join(outDir, `${table.id}.csv`);
-          } else {
-            target = `${table.id}.csv`;
-          }
+
+
+        // If target ends with '/', treat it as a directory.
+        if (target.endsWith(path.sep) || target.endsWith('/')) {
+          await fs.mkdir(target, { recursive: true });
+          target = path.join(target, `${table.id}.csv`);
         } else {
-          // User supplied a path. If it ends with '/', treat as directory
-          if (target.endsWith(path.sep) || target.endsWith('/')) {
-            await fs.mkdir(target, { recursive: true });
-            target = path.join(target, `${table.id}.csv`);
-          } else {
-            // If target looks like an existing directory, write into it
-            try {
-              if (fsRaw.existsSync(target) && fsRaw.lstatSync(target).isDirectory()) {
-                target = path.join(target, `${table.id}.csv`);
-              }
-            } catch (e) {
-              // ignore
+          // If target is an existing directory, write into it.
+          try {
+            if (
+              fsRaw.existsSync(target) &&
+              fsRaw.lstatSync(target).isDirectory()
+            ) {
+              target = path.join(target, `${table.id}.csv`);
             }
+          } catch (e) {
+            // ignore
           }
         }
 
         try {
           const headers = Object.keys(table.columns);
-          const len = headers.length === 0 ? 0 : table.columns[headers[0]].length;
+          const len =
+            headers.length === 0
+              ? 0
+              : table.columns[headers[0]].length;
+
           for (const h of headers) {
-            if (table.columns[h].length !== len) throw new Error(`Column lengths differ in table ${table.id}`);
+            if (table.columns[h].length !== len) {
+              throw new Error(
+                `Column lengths differ in table ${table.id}`
+              );
+            }
           }
+
           const rows = [];
+
           for (let i = 0; i < len; i++) {
             const row = {};
+
             for (const h of headers) {
               const v = table.columns[h][i];
-              row[h] = v === null || v === undefined ? '' : v;
+              row[h] =
+                v === null || v === undefined
+                  ? ''
+                  : v;
             }
+
             rows.push(row);
           }
+
           await fs.mkdir(path.dirname(target), { recursive: true });
-          try {
-            const ext = path.extname(target).toLowerCase().replace('.', '');
-            if (ext === 'bin') {
-                const written = await writeStructuredRowsToBin(headers, rows, target, irMod, overwrite);
-              if (!written) continue;
-            } else {
-              await writeStructuredRowsToFile(headers, rows, target, overwrite);
-            }
-            console.error(`WROTE: ${target}`);
-          } catch (err) {
-            throw err;
+
+          const ext =
+            path.extname(target)
+              .toLowerCase()
+              .replace('.', '');
+
+          // Confirm overwrite before doing any actual write.
+          const shouldWrite = await confirmOutputOverwrite(
+            target,
+            overwrite
+          );
+
+          if (!shouldWrite) {
+            continue;
           }
+
+          if (ext === 'bin') {
+            const written =
+              await writeStructuredRowsToBin(
+                headers,
+                rows,
+                target,
+                irMod,
+                true
+              );
+
+            if (!written) continue;
+          } else {
+            await writeStructuredRowsToFile(
+              headers,
+              rows,
+              target,
+              true
+            );
+          }
+          console.error(`WROTE: ${target}`);
+
         } catch (err) {
-          console.error(`ERROR: writing ${target}:`, err?.stack ?? err);
+          console.error(
+            `ERROR: writing ${target}:`,
+            err?.stack ?? err
+          );
           process.exitCode = 4;
         }
       }
@@ -3209,7 +3475,13 @@ if (args.length === 0) {
   const humanReport = formatReport(payload, 'text', verbose);
   process.stdout.write(humanReport);
 
+  // Debug tables are printed only after the normal Inputs/Outputs report.
+  for (const table of debugTablesToPrint) {
+    printDebugTableHead(table);
+  }
+
   // If an output file was requested, write a machine-readable serialization
+
   if (outputFile) {
     if (verbose) console.log('[usig] writing output:', outputFile);
 
