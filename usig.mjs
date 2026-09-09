@@ -253,6 +253,10 @@ function parseArgs(args) {
   // (pluginIds, params) are preserved for callers that expect the old shape.
   const result = {
     inputFile: null,
+    // Canonical ordered list of input specifications, one per -i occurrence
+    // (or expanded from a -f concat list later). Each entry:
+    //   { file, startSample, endSample, inputFormat }
+    inputFiles: [],
     outputFile: null,
     pluginId: null,
     pluginIds: [],
@@ -271,16 +275,51 @@ function parseArgs(args) {
     endSample: null,
     overwrite: false,
     inputFormat: null,
+    // Set when a positional output arg follows two or more inputs that have
+    // no individual output of their own (e.g. "-i A -i B out.xlsx"). This
+    // shape is not a supported mass-conversion job list; execution paths
+    // must reject it explicitly rather than guessing which input it means.
+    multiInputSharedOutputAttempt: null,
   };
 
   let currentInvocation = null;
+  // Tracks the most recently declared -i input specification, so that
+  // per-input flags (-ss, -to, -f) can attach to the correct input.
+  let currentInput = null;
+  // -f may appear *before* its corresponding -i (e.g. "-f concat -i list.txt").
+  // In that case the format is held here until the next -i creates an input.
+  let pendingFormat = null;
+  // Input specs declared since the last positional output was consumed.
+  // A trailing positional argument attaches to the sole entry here (the
+  // "-i <in> <out>" job grammar). If more than one input has accumulated
+  // without an intervening output (e.g. "-i A -i B out"), the positional
+  // is ambiguous — record it as an explicit unsupported attempt rather
+  // than guessing which input it belongs to.
+  let unassignedOutputInputs = [];
 
   const isPluginId = (s) => s && !s.includes('.') && !s.includes('/') && !s.includes('\\');
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === '-i' && i + 1 < args.length) {
-      result.inputFile = args[++i];
+      const file = args[++i];
+      const inputSpec = {
+        file,
+        startSample: null,
+        endSample: null,
+        inputFormat: pendingFormat,
+        // Per-job output (mass-conversion): the positional argument that
+        // immediately follows this input (before the next -i) becomes its
+        // output. Remains null for plugin/analyzer invocations, which don't
+        // use per-input positional outputs.
+        output: null,
+      };
+      pendingFormat = null;
+      result.inputFiles.push(inputSpec);
+      currentInput = inputSpec;
+      unassignedOutputInputs.push(inputSpec);
+      // Backwards compat: result.inputFile mirrors the first declared input.
+      if (result.inputFile === null) result.inputFile = file;
     } else if (arg === '-plugin' && i + 1 < args.length) {
       // Start one or more plugin invocations. Support comma-separated legacy form
       // by creating multiple invocations, but prefer the repeated -plugin model.
@@ -336,12 +375,28 @@ function parseArgs(args) {
       if (Number.isInteger(idx) && idx >= 0) result.channelIndex = idx;
     } else if ((arg === '-start-sample' || arg === '-ss') && i + 1 < args.length) {
       const idx = Number(args[++i]);
-      if (Number.isInteger(idx)) result.startSample = idx;
+      if (!currentInput) {
+        throw new Error(`[usig] -ss/-start-sample must follow a -i <input> (no input declared yet)`);
+      }
+      if (Number.isInteger(idx)) currentInput.startSample = idx;
     } else if ((arg === '-end-sample' || arg === '-to') && i + 1 < args.length) {
       const idx = Number(args[++i]);
-      if (Number.isInteger(idx)) result.endSample = idx;
+      if (!currentInput) {
+        throw new Error(`[usig] -to/-end-sample must follow a -i <input> (no input declared yet)`);
+      }
+      if (Number.isInteger(idx)) currentInput.endSample = idx;
     } else if (arg === '-f' && i + 1 < args.length) {
-      result.inputFormat = String(args[++i]).toLowerCase();
+      const fmt = String(args[++i]).toLowerCase();
+      if (currentInput) {
+        // -f after -i attaches to that most-recently declared input.
+        currentInput.inputFormat = fmt;
+      } else if (pendingFormat === null) {
+        // -f before any -i (e.g. "-f concat -i list.txt") applies to the
+        // next input that gets declared.
+        pendingFormat = fmt;
+      } else {
+        throw new Error(`[usig] -f specified more than once before a -i <input>`);
+      }
     } else if ((arg === '-of' || arg === '-format' || arg === '-print_format') && i + 1 < args.length) {
       result.format = String(args[++i]).toLowerCase();
     } else if (arg === '-y') {
@@ -371,20 +426,62 @@ function parseArgs(args) {
           result.pluginInvocations[result.pluginInvocations.length - 1].debugRequests.push(req);
         }
       }
-    } else if (!arg.startsWith('-') && result.inputFile && !result.outputFile) {
-      result.outputFile = arg;
+    } else if (!arg.startsWith('-') && result.inputFiles.length > 0) {
+      if (unassignedOutputInputs.length === 1) {
+        // Standard job grammar: "-i <in> <out>" — the positional attaches
+        // to the single input still waiting for its own output.
+        unassignedOutputInputs[0].output = arg;
+        unassignedOutputInputs = [];
+      } else if (unassignedOutputInputs.length > 1) {
+        // Ambiguous: multiple inputs declared back-to-back with no
+        // intervening output (e.g. "-i A -i B out"). Mass-conversion
+        // output ownership is strictly one job = one output, so this
+        // shape is unsupported. Record it so callers can reject it
+        // explicitly instead of silently guessing which input "out"
+        // belongs to.
+        if (!result.multiInputSharedOutputAttempt) {
+          result.multiInputSharedOutputAttempt = {
+            inputs: unassignedOutputInputs.map((s) => s.file),
+            output: arg,
+          };
+        }
+        unassignedOutputInputs = [];
+      }
+      // If unassignedOutputInputs.length === 0, no input is waiting for an
+      // output (e.g. a stray extra positional); ignore it, matching the
+      // previous behavior of ignoring extra positional args once the
+      // (single, legacy) output had already been captured.
     }
   }
 
   // backward compat: single-plugin callers use result.pluginId
   result.pluginId = result.pluginIds[0] ?? null;
+
+  // Backwards-compat mirrors: existing single-input call sites read
+  // result.startSample / result.endSample / result.inputFormat directly.
+  // Mirror the first declared input's values here so single -i invocations
+  // behave exactly as before. Multi-input callers should use inputFiles.
+  if (result.inputFiles.length > 0) {
+    const first = result.inputFiles[0];
+    result.inputFile = first.file;
+    result.startSample = first.startSample;
+    result.endSample = first.endSample;
+    result.inputFormat = first.inputFormat;
+    // Mirror the first job's output too, so single -i invocations (with a
+    // positional output) continue to populate result.outputFile exactly as
+    // before.
+    if (first.output !== null) result.outputFile = first.output;
+  }
+
   return result;
 }
 
-async function resolveConcatInputFile(inputFile, inputFormat) {
-  if (inputFormat !== 'concat') return inputFile;
-  if (!inputFile) throw new Error('[usig] -f concat requires -i <list.txt>');
-  const listPath = path.resolve(inputFile);
+// Strictly parse an FFmpeg-style concat list file into an ordered array of
+// resolved absolute file paths. Only the strict "file 'path'" entry form is
+// accepted; anything else (blank lines aside) is a parse error that reports
+// the list filename and 1-based line number.
+async function parseConcatList(listFile) {
+  const listPath = path.resolve(listFile);
   let content;
   try {
     content = await fs.readFile(listPath, 'utf8');
@@ -412,9 +509,62 @@ async function resolveConcatInputFile(inputFile, inputFormat) {
   if (resolved.length === 0) {
     throw new Error(`[usig] concat list parse error: ${listPath}: no input entries`);
   }
-  // Phase 1: feed existing single-input path using the first listed file.
-  return resolved[0];
+  return resolved;
 }
+
+// Expand the canonical, ordered list of parsed input specifications
+// (result.inputFiles from parseArgs) into a flat, ordered list of concrete
+// input specifications. A "-f concat" entry is replaced in-place by every
+// entry it resolves to, preserving overall order. Nested concat lists (an
+// entry that is itself a concat list) are not supported and are rejected
+// rather than silently expanded recursively.
+// Resolve the canonical input list to exactly one input specification,
+// exiting the process with a clear error if zero or more than one input
+// was ultimately declared/expanded. Used by execution paths (probe-metadata,
+// conversion mode) whose semantics have not yet been defined for multiple
+// inputs.
+async function resolveSingleInputOrExit(inputSpecs, contextLabel) {
+  let resolved;
+  try {
+    resolved = await resolveInputSpecs(inputSpecs);
+  } catch (err) {
+    console.error(err?.message ?? String(err));
+    process.exit(1);
+  }
+  if (resolved.length > 1) {
+    console.error(
+      `[usig] multiple inputs are ingested, but ${contextLabel} does not yet support multiple inputs`
+    );
+    process.exit(1);
+  }
+  return resolved[0] ?? null;
+}
+
+async function resolveInputSpecs(inputSpecs) {
+  const resolved = [];
+  for (const spec of inputSpecs ?? []) {
+    if (spec.inputFormat === 'concat') {
+      if (Number.isInteger(spec.startSample) || Number.isInteger(spec.endSample)) {
+        throw new Error(
+          `[usig] -ss/-to are not supported on -f concat inputs yet (list: ${spec.file})`
+        );
+      }
+      const entries = await parseConcatList(spec.file);
+      for (const file of entries) {
+        // Propagate the concat spec's own output (if any) to every expanded
+        // entry. This does not grant concat any combination/output semantics
+        // of its own — it only lets callers detect the "one trailing output
+        // shared across multiple expanded entries" shape and reject it
+        // explicitly, the same way repeated "-i A -i B out" is rejected.
+        resolved.push({ file, startSample: null, endSample: null, inputFormat: null, output: spec.output ?? null });
+      }
+    } else {
+      resolved.push({ ...spec });
+    }
+  }
+  return resolved;
+}
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Load plugin module (TSX → ESM via esbuild)
@@ -695,9 +845,8 @@ async function loadBinMapperModule() {
       external: ['fs', 'path'],
     });
 
-    const mod = await import(
+    return await import(
         pathToFileURL(tmpPath.replace('.mjs', '.cjs')).href +`?t=${Date.now()}`);
-    return mod;
 
   } finally {
     await fs.rm(tmpDir, {
@@ -781,22 +930,6 @@ async function pluginExists(pluginId) {
 // ─────────────────────────────────────────────────────────────────────────────
 // CSV I/O
 // ─────────────────────────────────────────────────────────────────────────────
-
-function readCsv(csvText) {
-  const lines = csvText.trim().split('\n');
-  if (lines.length === 0) return { headers: [], rows: [] };
-  const headers = lines[0].split(',').map(h => h.trim());
-  const rows = lines.slice(1).map(line => {
-    const values = line.split(',').map(v => v.trim());
-    const row = {};
-    for (let i = 0; i < headers.length; i++) {
-      const v = values[i] ?? '';
-      row[headers[i]] = isNaN(v) || v === '' ? v : Number(v);
-    }
-    return row;
-  });
-  return { headers, rows };
-}
 
 function writeCsv(headers, rows) {
   const lines = [headers.join(',')];
@@ -1832,10 +1965,6 @@ async function probeXlsxColumnsStream(inputFile) {
 }
 
 
-function toArrayBuffer(buf, bytesRead = buf.length) {
-  return buf.buffer.slice(buf.byteOffset, buf.byteOffset + bytesRead);
-}
-
 async function runProbeMetadataMode({
   inputFile,
   verbose,
@@ -2010,7 +2139,6 @@ async function exportIRFrame({
   outputFile,
   outputFormat,
   metaToFilename,
-  verbose,
 }) {
   const packet = frame.packet;
   let channels =
@@ -2152,8 +2280,6 @@ async function runConversionMode({
                                    endSample,
                                    overwrite
 }) {
-  const inputExt = path.extname(inputFile).toLowerCase();
-  const outputExt = path.extname(outputFile).toLowerCase();
   if (!inputFile) {
       console.error('Usage: node usig.mjs -i <input-file> (--mux bin | --demux csv) [flags] [output_path]');
       process.exit(1);
@@ -2204,14 +2330,12 @@ async function runConversionMode({
     outputFile,
     outputFormat,
     metaToFilename,
-    verbose,
   });
 
   console.log(`[usig] wrote result to ${outputFile}`);
-  return;
 }
 
-function resolvePluginId(pluginId, verbose) {
+function resolvePluginId(pluginId) {
   if (pluginId === 'hsio') {
     console.warn('[usig] WARNING: plugin "hsio" is deprecated; using "hsioalpha"');
     return 'hsioalpha';
@@ -2815,7 +2939,7 @@ async function main() {
   // similar to python's [2:] notion
   const {
     inputFile: parsedInputFile,
-    pluginId,
+    inputFiles: parsedInputFiles,
     pluginIds,
     pluginInvocations,
     outputFile,
@@ -2829,7 +2953,7 @@ async function main() {
     startSample,
     endSample,
     overwrite,
-    inputFormat,
+    multiInputSharedOutputAttempt,
   } = parseArgs(args);
 
   let inputFile = parsedInputFile;
@@ -2838,14 +2962,10 @@ async function main() {
     console.error(`[usig] parsed sample window: startSample=${startSample} endSample=${endSample}`);
   }
 
-  const inferredConversion = inferConversionModeFromOutput(outputFile);
-
-  const effectiveConversionFormat = inferredConversion.format;
-
   if (help) {
   if (pluginIds.length > 0) {
     const resolvedPluginId =
-      resolvePluginId(pluginIds[0], false);
+      resolvePluginId(pluginIds[0]);
 
     if (!(await pluginExists(resolvedPluginId))) {
       console.error(
@@ -2889,7 +3009,8 @@ if (args.length === 0) {
 
 
   if (probeMetadata) {
-    inputFile = await resolveConcatInputFile(inputFile, inputFormat);
+    const resolvedSpec = await resolveSingleInputOrExit(parsedInputFiles, 'probe-metadata mode');
+    if (resolvedSpec) inputFile = resolvedSpec.file;
     await runProbeMetadataMode({
       inputFile,
       verbose,
@@ -2898,23 +3019,119 @@ if (args.length === 0) {
     return;
   }
 
-  // Only treat positional output as conversion mode when no plugin is requested.
-  if (effectiveConversionFormat && (!pluginIds || pluginIds.length === 0)) {
-    inputFile = await resolveConcatInputFile(inputFile, inputFormat);
-    await runConversionMode({
-    inputFile,
-    outputFile,
-    outputFormat: effectiveConversionFormat,
-    params,
-    inferMetaFromFilename,
-    metaToFilename,
-    verbose,
-    startSample,
-    endSample,
-    overwrite
-  });
-  return;
-}
+  // Independent conversion job(s). Only applies when no plugin/analyzer was
+  // requested. Each resolved input owns exactly one output (its own
+  // positional argument); this is deliberately NOT concatenation, NOT
+  // multi-input->single-output, and NOT a combined/merged conversion — every
+  // job independently ingests, converts, and writes, in command-line order.
+  if (!pluginIds || pluginIds.length === 0) {
+    if (multiInputSharedOutputAttempt) {
+      console.error(
+        `[usig] multiple inputs (${multiInputSharedOutputAttempt.inputs.join(', ')}) cannot share a single output ` +
+        `(${multiInputSharedOutputAttempt.output}); mass conversion requires one output per input, ` +
+        `e.g. "-i A.csv A.xlsx -i B.csv B.xlsx"`
+      );
+      process.exit(1);
+    }
+
+    let resolvedForConversion;
+    try {
+      resolvedForConversion = await resolveInputSpecs(parsedInputFiles);
+    } catch (err) {
+      console.error(err?.message ?? String(err));
+      process.exit(1);
+    }
+
+    // A single "-i <concat-list> <out>" can expand into multiple entries
+    // that all inherited the same trailing output (concat has no combination
+    // semantics of its own). Detect that shape here and reject it explicitly,
+    // rather than letting several independent jobs silently overwrite one
+    // another's output.
+    const outputUseCounts = new Map();
+    for (const spec of resolvedForConversion) {
+      if (spec.output) outputUseCounts.set(spec.output, (outputUseCounts.get(spec.output) ?? 0) + 1);
+    }
+    const sharedOutputs = [...outputUseCounts.entries()].filter(([, count]) => count > 1);
+    if (resolvedForConversion.length > 1 && sharedOutputs.length > 0) {
+      console.error(
+        `[usig] conversion mode does not yet support multiple inputs mapping to a single shared output ` +
+        `(${sharedOutputs.map(([output]) => output).join(', ')})`
+      );
+      process.exit(1);
+    }
+
+    const conversionJobs = resolvedForConversion.map((spec) => ({
+      spec,
+      outputFormat: inferConversionModeFromOutput(spec.output).format,
+    }));
+    const jobsWithFormat = conversionJobs.filter((j) => j.outputFormat);
+
+    if (jobsWithFormat.length > 0) {
+      if (jobsWithFormat.length !== conversionJobs.length) {
+        const missing = conversionJobs
+          .map((j, idx) => ({ idx, spec: j.spec }))
+          .filter((j) => !inferConversionModeFromOutput(j.spec.output).format)
+          .map((j) => `job ${j.idx} (input=${j.spec.file}, output=${j.spec.output ?? '(none)'})`);
+        console.error(
+          `[usig] mass conversion requires every input to have its own recognized output (.bin/.csv/.xlsx); ` +
+          `missing/unrecognized output for: ${missing.join(', ')}`
+        );
+        process.exit(1);
+      }
+
+      if (conversionJobs.length === 1) {
+        // Single job: identical to the pre-existing single-input behavior.
+        const spec = conversionJobs[0].spec;
+        await runConversionMode({
+          inputFile: spec.file,
+          outputFile: spec.output,
+          outputFormat: conversionJobs[0].outputFormat,
+          params,
+          inferMetaFromFilename,
+          metaToFilename,
+          verbose,
+          startSample: spec.startSample,
+          endSample: spec.endSample,
+          overwrite,
+        });
+        return;
+      }
+
+      // Independent mass conversion: run each job in order. Jobs never
+      // share frames, data, or output files with one another.
+      for (let jobIndex = 0; jobIndex < conversionJobs.length; jobIndex++) {
+        const { spec, outputFormat } = conversionJobs[jobIndex];
+        if (verbose) {
+          console.error(
+            `[usig] job ${jobIndex}: input=${spec.file} output=${spec.output} ` +
+            `startSample=${spec.startSample} endSample=${spec.endSample} outputFormat=${outputFormat}`
+          );
+        }
+        try {
+          await runConversionMode({
+            inputFile: spec.file,
+            outputFile: spec.output,
+            outputFormat,
+            params,
+            inferMetaFromFilename,
+            metaToFilename,
+            verbose,
+            startSample: spec.startSample,
+            endSample: spec.endSample,
+            overwrite,
+          });
+        } catch (err) {
+          console.error(
+            `[usig] job ${jobIndex} failed: input=${spec.file} output=${spec.output ?? '(none)'}`
+          );
+          console.error(err?.message ?? String(err));
+          process.exitCode = 1;
+          return;
+        }
+      }
+      return;
+    }
+  }
 
   // Allow missing inputFile when the user requested declarative '-debug list'
   const hasOnlyDebugList = (pluginInvocations && pluginInvocations.length > 0) && pluginInvocations.every(inv => {
@@ -2926,7 +3143,27 @@ if (args.length === 0) {
     console.error('Usage: node usig.mjs -i <input-file> -plugin <id[,id2]> [-p key=value ...] [-of text|json|yaml]');
     process.exit(1);
   }
-  inputFile = await resolveConcatInputFile(inputFile, inputFormat);
+
+  // Resolve the canonical, ordered set of inputs (expanding any -f concat
+  // lists). Plugin execution below ingests every input into its own frame,
+  // but currently only supports running plugins against a single frame; see
+  // the explicit multi-input rejection later in this function.
+  let resolvedInputs;
+  try {
+    resolvedInputs = await resolveInputSpecs(parsedInputFiles);
+  } catch (err) {
+    console.error(err?.message ?? String(err));
+    process.exit(1);
+  }
+  inputFile = resolvedInputs[0]?.file ?? inputFile;
+
+  if (verbose) {
+    resolvedInputs.forEach((spec, idx) => {
+      console.error(
+        `[usig] resolved input[${idx}]: file=${spec.file} startSample=${spec.startSample} endSample=${spec.endSample} inputFormat=${spec.inputFormat}`
+      );
+    });
+  }
 
   if (!SUPPORTED_FORMATS.has(format)) {
     console.error(`[usig] unsupported format: ${format}. Supported: text, json, csv, yaml`);
@@ -2934,7 +3171,7 @@ if (args.length === 0) {
   }
 
   // ── Resolve and validate all requested plugin ids ──────────────────────────
-  const resolvedPluginIds = pluginIds.map(id => resolvePluginId(id, verbose));
+  const resolvedPluginIds = pluginIds.map(id => resolvePluginId(id));
   for (const id of resolvedPluginIds) {
     if (!(await pluginExists(id))) {
       console.error(`[usig] plugin not found: ${id}`);
@@ -2961,7 +3198,7 @@ if (args.length === 0) {
     for (const invocation of invocations) {
       if (!invocation.debugRequests || !invocation.debugRequests.some(r => r.key === 'list')) continue;
       const requestedPluginId = invocation.pluginId ?? pluginIds[0];
-      const resolvedPluginId = resolvePluginId(requestedPluginId, verbose);
+      const resolvedPluginId = resolvePluginId(requestedPluginId);
       const pluginPath = path.join(scriptDir, `app/components/plugins/${resolvedPluginId}Plugin.tsx`);
       if (!(await pluginExists(resolvedPluginId))) {
         console.error(`[usig] plugin not found: ${resolvedPluginId}`);
@@ -2996,20 +3233,14 @@ if (args.length === 0) {
   if (!IREngine) throw new Error('IREngine export not found in app/lib/ir/index.ts bundle');
   const irEngine = new IREngine();
 
-  if (verbose) console.log('[usig] reading input:', inputFile);
+  if (resolvedInputs.length === 0) {
+    console.error('[usig] no input to ingest');
+    process.exit(1);
+  }
 
-  const inputFileName = path.basename(inputFile);
-
-  const raw = await fs.readFile(inputFile);
-
-  const file = new File(
-    [raw],
-    inputFileName,
-    {
-      type: 'application/octet-stream'
-    }
-  );
-
+  if (verbose) {
+    console.log('[usig] reading input(s):', resolvedInputs.map(spec => spec.file).join(', '));
+  }
 
   const firstPluginPath = path.join(
     scriptDir,
@@ -3022,119 +3253,154 @@ if (args.length === 0) {
   const firstPlugin =
     firstMod[`${resolvedPluginIds[0]}Plugin`];
 
-  const filenameParamHints =
-    buildFilenameParamHints(
-      firstPlugin,
-      inputFileName
+  // ── Canonical multi-input ingestion ─────────────────────────────────────────
+  // Every resolved input (whether from a repeated -i or an expanded -f concat
+  // list) is independently ingested into its own IR frame, in order. CSV/XLSX
+  // must use the same mapper as conversion mode, guaranteeing that plugin
+  // execution and conversion receive the same canonical IR packet shape.
+  const inputFrames = [];
+
+  for (const spec of resolvedInputs) {
+    const inputFileNameForSpec = path.basename(spec.file);
+    const rawForSpec = await fs.readFile(spec.file);
+
+    const fileForSpec = new File(
+      [rawForSpec],
+      inputFileNameForSpec,
+      {
+        type: 'application/octet-stream'
+      }
     );
 
-  const ingestionParams = {
-    ...(firstPlugin?.defaultParams ?? {}),
-    ...filenameParamHints,
-    ...(params ?? {}),
-  };
+    const filenameParamHintsForSpec =
+      buildFilenameParamHints(
+        firstPlugin,
+        inputFileNameForSpec
+      );
 
-  let sharedHints =
-    firstPlugin &&
-    typeof firstPlugin.getIngestHints === 'function'
-      ? firstPlugin.getIngestHints(ingestionParams)
-      : undefined;
-
-  if (Number.isInteger(startSample) || Number.isInteger(endSample)) {
-    sharedHints = {
-      ...sharedHints,
-      ...(Number.isInteger(startSample)
-        ? { startSample }
-        : {}),
-      ...(Number.isInteger(endSample)
-        ? { endSample }
-        : {}),
+    const ingestionParamsForSpec = {
+      ...(firstPlugin?.defaultParams ?? {}),
+      ...filenameParamHintsForSpec,
+      ...(params ?? {}),
     };
-  }
 
-   // ── Canonical input ingestion ───────────────────────────────────────────────
-  // CSV/XLSX must use the same mapper as conversion mode. This guarantees that
-  // plugin execution and conversion receive the same canonical IR packet shape.
-  const ext = path.extname(inputFile).toLowerCase();
+    let hintsForSpec =
+      firstPlugin &&
+      typeof firstPlugin.getIngestHints === 'function'
+        ? firstPlugin.getIngestHints(ingestionParamsForSpec)
+        : undefined;
 
-  let frame;
-
-  if (ext === '.csv' || ext === '.xlsx') {
-    const ingested = await irEngine.getOrIngest(
-      file,
-      sharedHints
-    );
-
-    const canonicalFrame = ingested.frame ?? ingested;
-    const packet = canonicalFrame?.packet ?? {};
-
-    const waveform =
-      packet.waveform ??
-      packet.arrays?.[0]?.waveform ??
-      packet.channels?.[0]?.waveform;
-
-    if (!waveform) {
-      throw new Error(
-        'CSV/XLSX ingestion returned an IR packet without waveform.'
-      );
+    if (Number.isInteger(spec.startSample) || Number.isInteger(spec.endSample)) {
+      hintsForSpec = {
+        ...hintsForSpec,
+        ...(Number.isInteger(spec.startSample)
+          ? { startSample: spec.startSample }
+          : {}),
+        ...(Number.isInteger(spec.endSample)
+          ? { endSample: spec.endSample }
+          : {}),
+      };
     }
 
-    const existingChannels =
-      packet.channels ??
-      packet.arrays ??
-      [];
+    const extForSpec = path.extname(spec.file).toLowerCase();
 
-    const channelDefinitions =
-      existingChannels.length > 0
-        ? existingChannels
-        : [{
-            label:
-              packet.metadata?.channelLabels?.[0] ??
-              packet.metadata?.signalColumn ??
-              canonicalFrame?.headers?.[0],
-            units: packet.metadata?.units,
-            waveform,
-          }];
+    let frameForSpec;
 
-    if (!channelDefinitions[0]?.label) {
-      throw new Error(
-        'CSV/XLSX ingestion produced a waveform without a canonical channel label.'
+    if (extForSpec === '.csv' || extForSpec === '.xlsx') {
+      const ingested = await irEngine.getOrIngest(
+        fileForSpec,
+        hintsForSpec
       );
-    }
 
-    frame = {
-      ...canonicalFrame,
-      packet: {
-        ...packet,
-        waveform,
-        arrays: channelDefinitions,
-        metadata: {
-          ...(packet.metadata ?? {}),
-          channelLabels:
-            packet.metadata?.channelLabels ??
-            channelDefinitions.map(ch => ch.label),
+      const canonicalFrame = ingested.frame ?? ingested;
+      const packet = canonicalFrame?.packet ?? {};
+
+      const waveform =
+        packet.waveform ??
+        packet.arrays?.[0]?.waveform ??
+        packet.channels?.[0]?.waveform;
+
+      if (!waveform) {
+        throw new Error(
+          'CSV/XLSX ingestion returned an IR packet without waveform.'
+        );
+      }
+
+      const existingChannels =
+        packet.channels ??
+        packet.arrays ??
+        [];
+
+      const channelDefinitions =
+        existingChannels.length > 0
+          ? existingChannels
+          : [{
+              label:
+                packet.metadata?.channelLabels?.[0] ??
+                packet.metadata?.signalColumn ??
+                canonicalFrame?.headers?.[0],
+              units: packet.metadata?.units,
+              waveform,
+            }];
+
+      if (!channelDefinitions[0]?.label) {
+        throw new Error(
+          'CSV/XLSX ingestion produced a waveform without a canonical channel label.'
+        );
+      }
+
+      frameForSpec = {
+        ...canonicalFrame,
+        packet: {
+          ...packet,
+          waveform,
+          arrays: channelDefinitions,
+          metadata: {
+            ...(packet.metadata ?? {}),
+            channelLabels:
+              packet.metadata?.channelLabels ??
+              channelDefinitions.map(ch => ch.label),
+          },
         },
-      },
-    };
+      };
 
+    } else {
 
-  } else {
+      const ingested = await irEngine.getOrIngest(
+        fileForSpec,
+        hintsForSpec
+      );
 
-    const ingested = await irEngine.getOrIngest(
-      file,
-      sharedHints
-    );
+      frameForSpec = ingested.frame ?? (ingested.packet ? {...ingested, packet: ingested.packet,} : ingested);
 
-    frame = ingested.frame ?? (ingested.packet ? {...ingested, packet: ingested.packet,} : ingested);
+      console.log('[DEBUG getOrIngest RETURN]', {
+        type: typeof ingested,
+        keys: Object.keys(ingested ?? {}),
+        hasFrame: !!ingested?.frame,
+        frameKeys: Object.keys(ingested?.frame ?? {}),
+      });
 
-    console.log('[DEBUG getOrIngest RETURN]', {
-      type: typeof ingested,
-      keys: Object.keys(ingested ?? {}),
-      hasFrame: !!ingested?.frame,
-      frameKeys: Object.keys(ingested?.frame ?? {}),
+    }
+
+    inputFrames.push({
+      frame: frameForSpec,
+      inputFileName: inputFileNameForSpec,
+      filenameParamHints: filenameParamHintsForSpec,
     });
-
   }
+
+  // Plugin execution below only knows how to run against a single frame.
+  // Multiple inputs are fully, independently ingested above (never silently
+  // reduced to the first one) — but running a plugin across several frames is
+  // not yet a defined operation, so fail explicitly rather than guessing.
+  if (inputFrames.length > 1) {
+    console.error(
+      '[usig] multiple inputs are ingested, but this plugin execution path does not yet support multiple inputs'
+    );
+    process.exit(1);
+  }
+
+  const { frame, inputFileName, filenameParamHints } = inputFrames[0];
 
   if (verbose) {
     console.error('[DEBUG CANONICAL FRAME]', {
@@ -3168,7 +3434,7 @@ if (args.length === 0) {
 
   for (const invocation of invocations) {
     const requestedPluginId = invocation.pluginId;
-    const resolvedPluginId = resolvePluginId(requestedPluginId, verbose);
+    const resolvedPluginId = resolvePluginId(requestedPluginId);
     const pluginPath = path.join(scriptDir, `app/components/plugins/${resolvedPluginId}Plugin.tsx`);
     if (verbose) console.log(`[usig] loading plugin: ${resolvedPluginId}`);
     const mod = resolvedPluginId === resolvedPluginIds[0]
@@ -3358,12 +3624,8 @@ if (args.length === 0) {
               }
               rows.push(row);
             }
-            try {
-              await writeStructuredRowsToFile(headers, rows, target, true);
-              console.error(`WROTE: ${target}`);
-            } catch (err) {
-              throw err;
-            }
+            await writeStructuredRowsToFile(headers, rows, target, true);
+            console.error(`WROTE: ${target}`);
           } catch (err) {
             console.error(`ERROR: writing ${target}:`, err?.stack ?? err);
             process.exitCode = 4;
