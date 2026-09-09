@@ -270,6 +270,7 @@ function parseArgs(args) {
     startSample: null,
     endSample: null,
     overwrite: false,
+    inputFormat: null,
   };
 
   let currentInvocation = null;
@@ -324,28 +325,30 @@ function parseArgs(args) {
       } else {
         result.params[key.trim()] = val;
       }
-    } else if (arg === '--infer-meta-from-filename') {
+    } else if (arg === '-infer-meta-from-filename') {
       result.inferMetaFromFilename = true;
-    } else if (arg === '--meta-to-filename') {
+    } else if (arg === '-meta-to-filename') {
       result.metaToFilename = true;
-    } else if (arg === '--probe-metadata') {
+    } else if (arg === '-probe-metadata') {
       result.probeMetadata = true;
-    } else if ((arg === '--channel-index' || arg === '--channel') && i + 1 < args.length) {
+    } else if ((arg === '-channel-index' || arg === '-channel') && i + 1 < args.length) {
       const idx = Number(args[++i]);
       if (Number.isInteger(idx) && idx >= 0) result.channelIndex = idx;
-    } else if ((arg === '--start-sample' || arg === 'ss') && i + 1 < args.length) {
+    } else if ((arg === '-start-sample' || arg === '-ss') && i + 1 < args.length) {
       const idx = Number(args[++i]);
-      if (Number.isInteger(idx) && idx >= 0) result.startSample = idx;
-    } else if ((arg === '--end-sample' || arg === 'to') && i + 1 < args.length) {
+      if (Number.isInteger(idx)) result.startSample = idx;
+    } else if ((arg === '-end-sample' || arg === '-to') && i + 1 < args.length) {
       const idx = Number(args[++i]);
-      if (Number.isInteger(idx) && idx >= 0) result.endSample = idx;
-    } else if ((arg === '-of' || arg === '--format' || arg === '-print_format') && i + 1 < args.length) {
+      if (Number.isInteger(idx)) result.endSample = idx;
+    } else if (arg === '-f' && i + 1 < args.length) {
+      result.inputFormat = String(args[++i]).toLowerCase();
+    } else if ((arg === '-of' || arg === '-format' || arg === '-print_format') && i + 1 < args.length) {
       result.format = String(args[++i]).toLowerCase();
     } else if (arg === '-y') {
       result.overwrite = true;
-    } else if (arg === '-v' || arg === 'verbose' || arg === '--verbose') {
+    } else if (arg === '-v' || arg === '-verbose') {
       result.verbose = true;
-    } else if (arg === '-h' || arg === '--help' || arg === '-help') {
+    } else if (arg === '-h' || arg === '-help') {
       result.help = true;
     } else if (arg === '-debug' && i + 1 < args.length) {
       const token = args[++i];
@@ -376,6 +379,41 @@ function parseArgs(args) {
   // backward compat: single-plugin callers use result.pluginId
   result.pluginId = result.pluginIds[0] ?? null;
   return result;
+}
+
+async function resolveConcatInputFile(inputFile, inputFormat) {
+  if (inputFormat !== 'concat') return inputFile;
+  if (!inputFile) throw new Error('[usig] -f concat requires -i <list.txt>');
+  const listPath = path.resolve(inputFile);
+  let content;
+  try {
+    content = await fs.readFile(listPath, 'utf8');
+  } catch (err) {
+    throw new Error(`[usig] concat list read failed: ${listPath}: ${err?.message ?? err}`);
+  }
+  const lines = content.split(/\r?\n/);
+  const resolved = [];
+  const baseDir = path.dirname(listPath);
+  const lineRegex = /^\s*file\s+'([^']+)'\s*$/;
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i];
+    if (!raw.trim()) continue;
+    const m = raw.match(lineRegex);
+    if (!m) {
+      throw new Error(`[usig] concat list parse error: ${listPath}:${i + 1}: expected \"file 'path'\"`);
+    }
+    const entry = m[1];
+    if (!entry) {
+      throw new Error(`[usig] concat list parse error: ${listPath}:${i + 1}: empty path`);
+    }
+    const resolvedPath = path.isAbsolute(entry) ? entry : path.resolve(baseDir, entry);
+    resolved.push(resolvedPath);
+  }
+  if (resolved.length === 0) {
+    throw new Error(`[usig] concat list parse error: ${listPath}: no input entries`);
+  }
+  // Phase 1: feed existing single-input path using the first listed file.
+  return resolved[0];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1805,7 +1843,7 @@ async function runProbeMetadataMode({
   channelIndex = null,
 }) {
   if (!inputFile) {
-    console.error('Usage: node usig.mjs -i <input-file> --probe-metadata [-of json|text|csv|yaml]');
+    console.error('Usage: node usig.mjs -i <input-file> -probe-metadata [-of json|text|csv|yaml]');
     process.exit(1);
   }
 
@@ -2776,7 +2814,7 @@ async function main() {
   // process.argv[1] → the script path
   // similar to python's [2:] notion
   const {
-    inputFile,
+    inputFile: parsedInputFile,
     pluginId,
     pluginIds,
     pluginInvocations,
@@ -2791,9 +2829,14 @@ async function main() {
     startSample,
     endSample,
     overwrite,
+    inputFormat,
   } = parseArgs(args);
 
-  // console.log(inferConversionModeFromOutput.toString());
+  let inputFile = parsedInputFile;
+
+  if (verbose && (Number.isInteger(startSample) || Number.isInteger(endSample))) {
+    console.error(`[usig] parsed sample window: startSample=${startSample} endSample=${endSample}`);
+  }
 
   const inferredConversion = inferConversionModeFromOutput(outputFile);
 
@@ -2846,6 +2889,7 @@ if (args.length === 0) {
 
 
   if (probeMetadata) {
+    inputFile = await resolveConcatInputFile(inputFile, inputFormat);
     await runProbeMetadataMode({
       inputFile,
       verbose,
@@ -2856,7 +2900,8 @@ if (args.length === 0) {
 
   // Only treat positional output as conversion mode when no plugin is requested.
   if (effectiveConversionFormat && (!pluginIds || pluginIds.length === 0)) {
-  await runConversionMode({
+    inputFile = await resolveConcatInputFile(inputFile, inputFormat);
+    await runConversionMode({
     inputFile,
     outputFile,
     outputFormat: effectiveConversionFormat,
@@ -2881,6 +2926,7 @@ if (args.length === 0) {
     console.error('Usage: node usig.mjs -i <input-file> -plugin <id[,id2]> [-p key=value ...] [-of text|json|yaml]');
     process.exit(1);
   }
+  inputFile = await resolveConcatInputFile(inputFile, inputFormat);
 
   if (!SUPPORTED_FORMATS.has(format)) {
     console.error(`[usig] unsupported format: ${format}. Supported: text, json, csv, yaml`);

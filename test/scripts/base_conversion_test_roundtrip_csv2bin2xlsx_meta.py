@@ -411,7 +411,7 @@ def main():
             str(USIG_CLI),
             "-i",
             str(golden_csv),
-            "--infer-meta-from-filename",
+            "-infer-meta-from-filename",
             str(metadata_bin)
         ],
         b_verbose
