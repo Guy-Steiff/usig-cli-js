@@ -24,6 +24,10 @@ const COLORS = {
   series: ['#6366F1', '#F59E0B', '#10B981', '#EC4899', '#3B82F6'],
   referenceLine: '#EF4444',
   referenceArea: 'rgba(251,191,36,0.14)',
+  // Semantic 'warning' style — analytical warning/constraint regions
+  // (e.g. SFDR avoidance zones), rendered more prominently than the
+  // default reference area.
+  referenceAreaWarning: 'rgba(251,191,36,0.35)',
 };
 
 function escapeXml(s) {
@@ -32,6 +36,13 @@ function escapeXml(s) {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
+}
+
+/** Rough monospace text-width estimate in px for a given font size — used
+ * only for sizing the results-panel box so label/value text fits inside it.
+ * Purely typographic (no domain knowledge of what the text means). */
+function estimateTextWidth(s, fontSize) {
+  return String(s).length * fontSize * 0.62;
 }
 
 /** Simple "nice" tick generator — not exact d3-scale, but produces evenly
@@ -74,28 +85,59 @@ function finiteValues(arr) {
  * @returns {string} SVG markup
  */
 export function renderFigureToSvg(desc, opts = {}) {
-  const width = opts.width ?? DEFAULT_WIDTH;
-  const height = opts.height ?? DEFAULT_HEIGHT;
+  const baseWidth = opts.width ?? DEFAULT_WIDTH;
+  const baseHeight = opts.height ?? DEFAULT_HEIGHT;
+
+  // Additive sections — only reserved when the description actually uses
+  // these optional fields, so figures that don't set them (e.g. SINL)
+  // render at exactly baseWidth x baseHeight, unchanged from before these
+  // fields existed.
+  const legendItems = desc.legend?.items ?? [];
+  const resultsPanel = desc.resultsPanel ?? [];
+  const legendCols = 4;
+  const legendRows = legendItems.length ? Math.ceil(legendItems.length / legendCols) : 0;
+  const legendSectionH = legendRows ? legendRows * 22 + 12 : 0;
+  // Results panel: a sidebar to the right of the plot (mirrors the legacy
+  // amber ResultsPanel), not a section stacked below the graph. Width is
+  // sized from the actual label/value text so nothing overflows the box.
+  const resultsRowFontSize = 9;
+  const resultsPanelInnerW = resultsPanel.length
+    ? Math.max(
+        estimateTextWidth('CARRIER / FS', resultsRowFontSize + 1),
+        ...resultsPanel.map(
+          (row) =>
+            estimateTextWidth(row.label, resultsRowFontSize) +
+            16 +
+            estimateTextWidth(row.value, resultsRowFontSize)
+        )
+      )
+    : 0;
+  const panelWidth = resultsPanel.length ? Math.min(360, Math.max(150, resultsPanelInnerW + 34)) : 0;
+
+  const width = baseWidth + panelWidth;
+  const height = baseHeight + legendSectionH;
 
   const marginLeft = 70;
-  const marginRight = 24;
+  const marginRight = 24 + panelWidth;
   const marginTop = desc.legend?.enabled ? 56 : 40;
   const marginBottom = 56;
 
   const plotW = width - marginLeft - marginRight;
-  const plotH = height - marginTop - marginBottom;
+  const plotH = baseHeight - marginTop - marginBottom;
 
   const xData = desc.x?.data ?? [];
   const xFinite = finiteValues(xData);
   const xMin = xFinite.length ? Math.min(...xFinite) : 0;
   const xMax = xFinite.length ? Math.max(...xFinite) : 1;
-
   const allY = [];
   for (const s of desc.series ?? []) {
     for (const v of s.y) if (typeof v === 'number' && Number.isFinite(v)) allY.push(v);
   }
   for (const rl of desc.referenceLines ?? []) {
     if (rl.axis === 'y' && Number.isFinite(rl.value)) allY.push(rl.value);
+  }
+  for (const mk of desc.markers ?? []) {
+    if (Number.isFinite(mk.y)) allY.push(mk.y);
   }
   let yMin = allY.length ? Math.min(...allY) : -1;
   let yMax = allY.length ? Math.max(...allY) : 1;
@@ -106,6 +148,11 @@ export function renderFigureToSvg(desc, opts = {}) {
     const pad = (yMax - yMin) * 0.1;
     yMin -= pad;
     yMax += pad;
+  }
+  // Extra headroom above the highest marker so its label (drawn just above
+  // the point) doesn't get clipped by the plot's top edge.
+  if ((desc.markers ?? []).length) {
+    yMax += (yMax - yMin) * 0.08;
   }
 
   const xSpan = xMax - xMin || 1;
@@ -129,27 +176,25 @@ export function renderFigureToSvg(desc, opts = {}) {
     );
   }
 
-  // Reference areas (drawn before grid/series so lines remain visible on top)
+  // Reference areas (drawn before grid/series so lines remain visible on
+  // top). These are plain translucent regions; their semantic meaning (e.g.
+  // "SFDR avoidance") is conveyed only via legend.items, never painted
+  // directly on the plot.
   for (const area of desc.referenceAreas ?? []) {
     const x1 = toPx(area.x1);
     const x2 = toPx(area.x2);
     const left = Math.min(x1, x2);
     const w = Math.abs(x2 - x1);
+    const areaFill = area.style === 'warning' ? COLORS.referenceAreaWarning : COLORS.referenceArea;
     parts.push(
-      `<rect x="${left.toFixed(2)}" y="${marginTop}" width="${w.toFixed(2)}" height="${plotH}" fill="${COLORS.referenceArea}"/>`
+      `<rect x="${left.toFixed(2)}" y="${marginTop}" width="${w.toFixed(2)}" height="${plotH}" fill="${areaFill}"/>`
     );
-    if (area.label) {
-      parts.push(
-        `<text x="${(left + w / 2).toFixed(2)}" y="${marginTop + 14}" text-anchor="middle" font-size="10" font-family="sans-serif" fill="#FCD34D">${escapeXml(
-          area.label
-        )}</text>`
-      );
-    }
   }
 
-  // Grid + ticks
-  const xTicks = niceTicks(xMin, xMax, 6);
-  const yTicks = niceTicks(yMin, yMax, 6);
+  // Grid + ticks — honor explicit ticks when the plugin provides them;
+  // otherwise fall back to auto-derived "nice" ticks.
+  const xTicks = desc.x?.ticks?.length ? desc.x.ticks : niceTicks(xMin, xMax, 6);
+  const yTicks = desc.y?.ticks?.length ? desc.y.ticks : niceTicks(yMin, yMax, 6);
 
   if (desc.grid?.x) {
     for (const t of xTicks) {
@@ -187,10 +232,13 @@ export function renderFigureToSvg(desc, opts = {}) {
     );
   }
 
-  // Axis labels
+  // Axis labels. x-label is placed directly below the plot's tick text
+  // (inside the base canvas region), independent of the legend strip that
+  // follows — layout order: plot -> x-label -> legend -> (results panel
+  // as an independent right-side column).
   if (desc.x?.label) {
     parts.push(
-      `<text x="${marginLeft + plotW / 2}" y="${height - 12}" text-anchor="middle" font-size="12" font-family="sans-serif" fill="${COLORS.text}">${escapeXml(
+      `<text x="${marginLeft + plotW / 2}" y="${marginTop + plotH + 34}" text-anchor="middle" font-size="12" font-family="sans-serif" fill="${COLORS.text}">${escapeXml(
         desc.x.label
       )}</text>`
     );
@@ -203,7 +251,66 @@ export function renderFigureToSvg(desc, opts = {}) {
     );
   }
 
-  // Reference lines
+  // Data series (as polylines, breaking on null/NaN gaps)
+  desc.series?.forEach((series, idx) => {
+    const color = COLORS.series[idx % COLORS.series.length];
+    const dash = series.style === 'dashed' ? ' stroke-dasharray="6 3"' : '';
+    let segment = [];
+    const segments = [];
+    for (let i = 0; i < xData.length; i++) {
+      const yv = series.y[i];
+      if (typeof yv === 'number' && Number.isFinite(yv) && Number.isFinite(xData[i])) {
+        segment.push(`${toPx(xData[i]).toFixed(2)},${toPy(yv).toFixed(2)}`);
+      } else if (segment.length > 0) {
+        segments.push(segment);
+        segment = [];
+      }
+    }
+    if (segment.length > 0) segments.push(segment);
+    for (const seg of segments) {
+      if (seg.length < 2) continue;
+      parts.push(`<polyline points="${seg.join(' ')}" fill="none" stroke="${color}" stroke-width="1.5"${dash}/>`);
+    }
+  });
+
+  // Markers — discrete labeled points (e.g. spectral spurs). Drawn as a
+  // colored point exactly at (x, y) with its label immediately above; no
+  // connecting line to the axis (distinct from referenceLines).
+  for (const mk of desc.markers ?? []) {
+    if (!Number.isFinite(mk.x) || !Number.isFinite(mk.y)) continue;
+    const px = toPx(mk.x);
+    const py = toPy(mk.y);
+    const color = mk.color || COLORS.title;
+    if (mk.shape === 'triangle') {
+      const r = 5;
+      const p1 = `${px.toFixed(2)},${(py - r).toFixed(2)}`;
+      const p2 = `${(px - r).toFixed(2)},${(py + r).toFixed(2)}`;
+      const p3 = `${(px + r).toFixed(2)},${(py + r).toFixed(2)}`;
+      parts.push(`<polygon points="${p1} ${p2} ${p3}" fill="${color}"/>`);
+    } else {
+      parts.push(`<circle cx="${px.toFixed(2)}" cy="${py.toFixed(2)}" r="3.5" fill="${color}"/>`);
+    }
+    if (mk.label) {
+      const labelY = (py - 8).toFixed(2);
+      if (mk.textRotation) {
+        parts.push(
+          `<text x="${px.toFixed(2)}" y="${labelY}" text-anchor="start" font-size="9" font-family="monospace" fill="${color}" transform="rotate(${mk.textRotation} ${px.toFixed(2)} ${labelY})">${escapeXml(
+            mk.label
+          )}</text>`
+        );
+      } else {
+        parts.push(
+          `<text x="${px.toFixed(2)}" y="${labelY}" text-anchor="middle" font-size="10" font-family="sans-serif" fill="${color}">${escapeXml(
+            mk.label
+          )}</text>`
+        );
+      }
+    }
+  }
+
+  // Reference lines — drawn last (on top of series/markers) so a reference
+  // level (e.g. a spur minimum threshold) remains visible above the plotted
+  // trace, matching its role as a reference overlay rather than plotted data.
   for (const rl of desc.referenceLines ?? []) {
     if (rl.axis === 'y') {
       const py = toPy(rl.value);
@@ -232,28 +339,6 @@ export function renderFigureToSvg(desc, opts = {}) {
     }
   }
 
-  // Data series (as polylines, breaking on null/NaN gaps)
-  desc.series?.forEach((series, idx) => {
-    const color = COLORS.series[idx % COLORS.series.length];
-    const dash = series.style === 'dashed' ? ' stroke-dasharray="6 3"' : '';
-    let segment = [];
-    const segments = [];
-    for (let i = 0; i < xData.length; i++) {
-      const yv = series.y[i];
-      if (typeof yv === 'number' && Number.isFinite(yv) && Number.isFinite(xData[i])) {
-        segment.push(`${toPx(xData[i]).toFixed(2)},${toPy(yv).toFixed(2)}`);
-      } else if (segment.length > 0) {
-        segments.push(segment);
-        segment = [];
-      }
-    }
-    if (segment.length > 0) segments.push(segment);
-    for (const seg of segments) {
-      if (seg.length < 2) continue;
-      parts.push(`<polyline points="${seg.join(' ')}" fill="none" stroke="${color}" stroke-width="1.5"${dash}/>`);
-    }
-  });
-
   // Legend
   if (desc.legend?.enabled && desc.series?.length) {
     const legendY = marginTop - 24;
@@ -265,6 +350,64 @@ export function renderFigureToSvg(desc, opts = {}) {
         `<text x="${legendX + 20}" y="${legendY + 4}" font-size="11" font-family="sans-serif" fill="${COLORS.text}">${escapeXml(series.name)}</text>`
       );
       legendX += 22 + series.name.length * 6.5 + 16;
+    });
+  }
+
+  // Legend-items strip — explicit legend entries (e.g. marker categories),
+  // drawn below the base canvas (after the plot + x-axis label). Additive:
+  // only rendered when the description provides legend.items.
+  if (legendItems.length) {
+    const stripTop = baseHeight + 6;
+    const colW = plotW / legendCols;
+    legendItems.forEach((item, idx) => {
+      const col = idx % legendCols;
+      const row = Math.floor(idx / legendCols);
+      const ix = marginLeft + col * colW;
+      const iy = stripTop + row * 22;
+      const color = item.color || COLORS.text;
+      if (item.shape === 'area') {
+        parts.push(`<rect x="${ix}" y="${iy - 9}" width="16" height="10" fill="${color}"/>`);
+      } else if (item.shape === 'triangle') {
+        parts.push(`<polygon points="${ix + 8},${iy - 9} ${ix},${iy + 1} ${ix + 16},${iy + 1}" fill="${color}"/>`);
+      } else if (item.shape === 'circle') {
+        parts.push(`<circle cx="${ix + 8}" cy="${iy - 4}" r="4" fill="${color}"/>`);
+      } else {
+        parts.push(`<line x1="${ix}" y1="${iy - 4}" x2="${ix + 16}" y2="${iy - 4}" stroke="${color}" stroke-width="2"/>`);
+      }
+      parts.push(
+        `<text x="${ix + 20}" y="${iy}" font-size="11" font-family="sans-serif" fill="${COLORS.text}">${escapeXml(item.label)}</text>`
+      );
+    });
+  }
+
+  // Results panel — amber sidebar to the right of the plot (mirrors the
+  // legacy ResultsPanel component). Additive: only rendered when provided.
+  if (resultsPanel.length) {
+    const panelX = marginLeft + plotW + 14;
+    const panelY = marginTop;
+    const panelW = panelWidth - 24;
+    const panelH = plotH;
+    const rowH = 13;
+    const headerH = 22;
+
+    parts.push(
+      `<rect x="${panelX}" y="${panelY}" width="${panelW}" height="${panelH}" rx="6" fill="rgba(120,53,15,0.2)" stroke="rgba(180,83,9,0.4)"/>`
+    );
+    parts.push(
+      `<text x="${panelX + 10}" y="${panelY + 16}" font-size="9" font-family="sans-serif" letter-spacing="0.05em" fill="#FCD34D" font-weight="600">CARRIER / FS</text>`
+    );
+    parts.push(
+      `<line x1="${panelX + 8}" y1="${panelY + headerH}" x2="${panelX + panelW - 8}" y2="${panelY + headerH}" stroke="rgba(180,83,9,0.4)"/>`
+    );
+    const maxRows = Math.max(0, Math.floor((panelH - headerH - 6) / rowH));
+    resultsPanel.slice(0, maxRows).forEach((row, idx) => {
+      const ry = panelY + headerH + 12 + idx * rowH;
+      parts.push(
+        `<text x="${panelX + 10}" y="${ry}" font-size="9" font-family="monospace" fill="rgba(252,211,77,0.7)">${escapeXml(row.label)}</text>`
+      );
+      parts.push(
+        `<text x="${panelX + panelW - 10}" y="${ry}" text-anchor="end" font-size="9" font-family="monospace" fill="#FEF3C7">${escapeXml(row.value)}</text>`
+      );
     });
   }
 

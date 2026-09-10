@@ -37,6 +37,7 @@
 
 import { ComponentType } from 'react';
 import type { WaveformPacket } from './ingest';
+import type { IngestHints } from './ingest';
 export type { WaveformPacket } from './ingest';
 
 
@@ -121,6 +122,12 @@ export interface PortableFigureDescription {
     label: string;
     /** Shared x-axis data — series below reuse this same array by index. */
     data: number[];
+    /**
+     * Optional explicit tick positions. When provided, the renderer honors
+     * these exactly instead of auto-computing "nice" ticks. Omit to fall
+     * back to the renderer's default tick derivation.
+     */
+    ticks?: number[];
   };
   series: Array<{
     /** Series/legend name, e.g. "DNL" or "3rd-order poly". */
@@ -132,9 +139,24 @@ export interface PortableFigureDescription {
   }>;
   y: {
     label: string;
+    /** Optional explicit tick positions (see x.ticks). */
+    ticks?: number[];
   };
   legend: {
     enabled: boolean;
+    /**
+     * Optional explicit legend entries (label + swatch color/shape), used
+     * when the auto-derived series-name legend is insufficient — e.g. a
+     * legend describing marker categories (spurs, harmonics) rather than
+     * plotted series. When present, the renderer draws this as a strip
+     * below the figure instead of (or in addition to) the default
+     * series-name legend above it.
+     */
+    items?: Array<{
+      label: string;
+      color?: string;
+      shape?: 'circle' | 'triangle' | 'line' | 'area';
+    }>;
   };
   grid: {
     x: boolean;
@@ -149,6 +171,41 @@ export interface PortableFigureDescription {
     x1: number;
     x2: number;
     label?: string;
+    /**
+     * Optional semantic hint for analytical warning/constraint regions
+     * (e.g. SFDR search-avoidance zones, threshold windows) — NOT a
+     * general-purpose styling system. Renderer maps 'warning' to a
+     * translucent yellow region. Omit for the default reference-area style.
+     */
+    style?: 'warning';
+  }>;
+  /**
+   * Discrete point annotations pinned to specific (x, y) data coordinates —
+   * e.g. spectral spurs/harmonics. Distinct from referenceLines (which span
+   * the full axis): a marker is a single labeled point drawn exactly at its
+   * data coordinate, with its label placed immediately above it.
+   */
+  markers?: Array<{
+    x: number;
+    y: number;
+    label?: string;
+    color?: string;
+    shape?: 'circle' | 'triangle';
+    /**
+     * Optional label text rotation, in degrees (e.g. -90 for vertical text).
+     * Purely a rendering hint — the renderer only knows how to rotate text
+     * around the marker point; it has no idea why a plugin might request it
+     * (e.g. long combinational-product labels that would otherwise overlap).
+     */
+    textRotation?: number;
+  }>;
+  /**
+   * Optional textual results block (e.g. SFDR/SNR summary rows) rendered
+   * alongside or below the figure. Purely informational — not plotted data.
+   */
+  resultsPanel?: Array<{
+    label: string;
+    value: string;
   }>;
 }
 
@@ -232,8 +289,13 @@ export interface PluginFigure {
    * generate SVG/PNG/JPEG output and a sibling JSON description without any
    * React/DOM dependency. Does not recompute analysis data; consumes the
    * already-computed figureData produced by prepareData().
+   *
+   * May return `undefined` when the figure is not meaningful for the given
+   * data (e.g. a conditional figure that only applies for certain param
+   * combinations). The CLI treats this the same as any other figure
+   * generation failure — it reports an error for that figure and continues.
    */
-  getData?: (data: unknown, controls: FigureControlValues) => PortableFigureDescription;
+  getData?: (data: unknown, controls: FigureControlValues) => PortableFigureDescription | undefined;
 }
 
 /**
@@ -510,4 +572,13 @@ export interface Plugin<P = Record<string, string>> {
     /** Key in this plugin's params (e.g. 'fsGhz'). */
     paramKey: string;
   }>;
+
+  /**
+   * Optional: plugin-specific ingestion hints (e.g. which CSV column holds
+   * the signal, units, endianness) derived from the current params. Called
+   * by the platform/CLI before ingesting an input so format-detection can
+   * use plugin knowledge (e.g. a user-selected target column) instead of
+   * generic heuristics alone.
+   */
+  getIngestHints?: (params: P) => IngestHints;
 }

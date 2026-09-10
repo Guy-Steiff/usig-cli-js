@@ -733,9 +733,54 @@
  * ═══════════════════════════════════════════════════════════════════════════════
  */
 
-import { type Plugin, type PluginManifest, type PluginFigure, type InferredParamField } from '../../lib/pluginTypes';
+/**
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * DUAL-TONE SUPPORT STATUS — IMPLEMENTED BUT UNVALIDATED
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
+ * `toneMode: 'dual'` is a real, fully-wired code path — not a stub or
+ * placeholder. It exists through the entire pipeline:
+ *
+ *   - kernel (analyzeSpectrum): F2 peak detection, IM3 sideband calculation
+ *     (min of the 2·F2−F1 / 2·F1−F2 bins), dual-aware TI-spur exclusion,
+ *     dual-aware noise-floor subtraction (see `isDual` branches throughout
+ *     analyzeSpectrum).
+ *   - scalar output: `fund2_mhz`, `fund2_dbfs`, `im3_dbc`, `im3_mhz` are
+ *     added to the result row whenever `toneMode === 'dual'`.
+ *   - figures: F1/F2/IM3 markers, dual-tone combinational-product harmonic
+ *     markers (e.g. "3F1+2F2"), legend entries, and results-panel rows are
+ *     all generated correctly when `isDual` is true (getSmeasSpectrumFigureData
+ *     / getSmeasTiDeembeddedFigureData and their marker/legend/resultsPanel
+ *     helpers).
+ *
+ * What is MISSING:
+ *
+ *   - No genuine two-tone golden dataset exists in test/golden_raw_data/.
+ *   - No regression test currently exercises `toneMode=dual` end-to-end, so
+ *     the numerical correctness of F2 detection / IM3 calculation has never
+ *     been validated against a known-good two-tone capture.
+ *   - An exploratory test (forcing `-p toneMode=dual` on a genuinely
+ *     single-tone golden file) confirmed the plumbing runs without errors
+ *     end-to-end, but such a test cannot validate correctness — the
+ *     "second tone" it detects is actually a spur/harmonic of the single
+ *     real tone, so IM3 in that scenario is not physically meaningful (it
+ *     can even degenerate to a clamped bin index at the spectrum edge).
+ *
+ * Future work required before relying on dual-tone results in production:
+ *
+ *   1. Capture (or synthesize) a real two-tone dataset with known F1/F2/IM3
+ *      and add it to test/golden_raw_data/.
+ *   2. Add scalar-result assertions (fund2_mhz/fund2_dbfs/im3_dbc/im3_mhz)
+ *      and figure/marker assertions (F2 + IM3 markers present with correct
+ *      values) to the regression suites.
+ *
+ * Do not treat the current absence of failures as proof of correctness —
+ * it only proves the code path doesn't crash.
+ * ═══════════════════════════════════════════════════════════════════════════════
+ */
+
+import { type Plugin, type PluginManifest, type PluginFigure, type InferredParamField, type PortableFigureDescription } from '../../lib/pluginTypes';
 import smeasDoc from './smeasPlugin.doc';
-import { ingestFile } from '../../lib/ingest';
 import { useState, useMemo, useRef, useEffect } from 'react';
 import FFT from 'fft.js';
 import {
@@ -792,6 +837,10 @@ export interface SmeasFigureData {
   spursMinActive?: boolean;
   /** Set when fftLength was auto-snapped down due to insufficient samples. */
   warning?: string;
+  /** Raw user-selected window param ('auto' or an explicit window name). */
+  windowParam?: string;
+  /** Raw TI-correction sequence param (e.g. 'O,G,P' or 'none'). */
+  tiCorrections?: string;
   // ── [EXPERIMENTAL] params needed for live sfdr-radius re-analysis in figure ──
   _liveAnalysisParams?: {
     harmonicsToConsider: number;
@@ -822,6 +871,7 @@ const manifest: PluginManifest = {
        type: 'column-select',
        required: true,
        description: 'Column containing ADC codes or voltages.',
+       aliases: ['sample', 'samples', 'adcCode', 'adcCodes', 'voltage', 'data'],
      },
      {
        key: 'fsGhzColumnRegex',
@@ -829,6 +879,7 @@ const manifest: PluginManifest = {
        type: 'text',
        required: false,
        description: 'Optional regex to match sampling frequency column name (e.g., "fs.*ghz|freq.*mhz"). Pattern is applied case-insensitively to column headers.',
+       aliases: ['fsGhz', 'fs', 'sampleRate'],
      },
      {
        key: 'inputMode',
@@ -836,6 +887,8 @@ const manifest: PluginManifest = {
        type: 'text',
        required: false,
        description: '"time_domain_codes" (default) or "time_domain_volts".',
+       aliases: ['mode', 'inputType'],
+       possibleValues: ['time_domain_codes', 'time_domain_volts', 'single_sided_power_spectrum'],
      },
       {
         key: 'fftLength',
@@ -922,6 +975,69 @@ const manifest: PluginManifest = {
        description: 'Manual override for spur min. threshold; 0 = use histogram auto-calc.',
      },
    ],
+
+  // Declarative debug table capabilities. These are lightweight metadata only
+  // and do not contain table data. prepareData() still generates the actual
+  // PluginDebugTable objects at runtime.
+  debugTables: [
+    {
+      id: 'spectra',
+      label: 'spectra.csv (f_MHz, PS_dBFS, noise spectrum, wo-TI spurs)',
+      description: 'Per-bin spectrum: frequency grid, raw power spectrum, noise-only spectrum, and spectrum with TI spurs removed.',
+      columns: ['f_MHz_grid', 'f_bin_grid', 'PS_dBFS_samples', 'PS_dBFS_noise_spectrum', 'PS_dBFS_wo_tispurs'],
+    },
+    {
+      id: 'timedomain',
+      label: 'time_domain.csv (samples_volts, samples_codes)',
+      description: 'Time-domain samples used for the analysis, in both volts and codes.',
+      columns: ['samples_volts', 'samples_codes'],
+    },
+    {
+      id: 'im_components',
+      label: 'im_components.csv (harmonic / IM components)',
+      description: 'Fundamental(s) and detected harmonic/intermodulation components with frequency, level, and relative amplitude.',
+      columns: ['symbol', 'f_im_mhz', 'f_im_bin', 'f_im_dbfs', 'f_im_dbc', 'f1_mhz', 'f2_mhz'],
+    },
+    {
+      id: 'ti_spurs',
+      label: 'ti_spurs.csv (TI spur locations)',
+      description: 'Time-interleave (TI) spur locations, levels, and relative amplitudes (numberOfCores > 1 only).',
+      columns: ['TI_SPURS_label', 'TI_SPURS_MHz', 'TI_SPURS_bins', 'TI_SPURS_dBFS', 'TI_SPURS_dBc'],
+    },
+    {
+      id: 'ti_cal',
+      label: 'ti_cal.csv (per-phase offset / gain / phase-skew characterisation)',
+      description: 'Per-core TI offset/gain/phase-skew characterisation and correction (only present when TI calibration ran).',
+      columns: [
+        'nav', 'phase', 'epsilon_est', 'phase_bias_rads',
+        'offset_codes_raw', 'offset_codes_quantized',
+        'gain_rms_codes_raw', 'gain_rms_codes_normalized',
+        'raw_angle_rads', 'proper_angle_rads', 'offset_angle_rads', 'ideal_angle_rads',
+        'delta_angle_rads', 'delta_angle_degs', 'delta_angle_ps', 'rotation_applied',
+        'ref_phase', 'correction_O', 'correction_G', 'correction_P', 'correction_order',
+      ],
+    },
+  ],
+
+  // Declarative figure capabilities. Safe to enumerate via `-figure list`
+  // without ingesting an input or loading the React figure components.
+  figures: [
+    {
+      id: 'spectrum',
+      label: 'Spectrum',
+      description: 'PS_dBFS vs frequency, with fundamental/harmonic/TI-spur reference lines and SFDR/TI-avoidance reference areas.',
+    },
+    {
+      id: 'spectrum_ti_deembedded',
+      label: 'Spectrum (TI de-embedded)',
+      description: 'PS_dBFS with TI spurs removed vs frequency (only produced when numberOfCores > 1).',
+    },
+    {
+      id: 'spectrum_noise',
+      label: 'Noise Spectrum',
+      description: 'Noise-only spectrum vs frequency, with the applied minimum-threshold reference line.',
+    },
+  ],
 };
 
 // isPowerOf2 removed — FFT length now auto-snaps to nearest power of 2 in the UI
@@ -975,21 +1091,21 @@ function normaliseFsToHz(fsGhz: number | string | undefined): number {
  * Plugins never read files themselves — that's ingest's job.
  */
 function smeasIngestHints(params: SmeasParams): import('../../lib/ingest').IngestHints {
-  const fsHzOverride = normaliseFsToHz(params.fsGhz) || undefined;
-
   return {
     signalColumn:       params.targetColumn?.trim() || undefined,
-    fsGhzColumnRegex:   params.fsGhzColumnRegex?.trim() || undefined,    sampleRateHz:       fsHzOverride,
     preserveBinIndex:   params.inputMode === 'single_sided_power_spectrum',
   };
 }
 
 /**
- * Resolve sampling frequency (Hz) for a WaveformPacket, falling back to params.
+ * Resolve sampling frequency (Hz) from params.
+ * `params.fsGhz` is the single canonical frequency representation for SMEAS —
+ * already resolved via explicit -p override, filename inference, or column
+ * inference before this is called. (The ingest layer never populates a
+ * `sampleRateHz` metadata field, so no such fallback exists or is needed.)
  * Throws if no source is available.
  */
 function resolveFsHz(packet: import('../../lib/ingest').WaveformPacket, params: SmeasParams): number {
-  if (packet.metadata.sampleRateHz > 0) return packet.metadata.sampleRateHz;
   const fromParam = normaliseFsToHz(params.fsGhz);
   if (fromParam > 0) return fromParam;
   throw new Error(
@@ -999,7 +1115,8 @@ function resolveFsHz(packet: import('../../lib/ingest').WaveformPacket, params: 
 
 /**
  * Auto-seed smeas params from WaveformPacket metadata.
- * Called before _smeasRunCore when using the runFromWaveform path.
+ * Called from both run() and prepareData() before the core analysis, so
+ * both entry points see identical, already-auto-seeded params.
  *
  * Rules (user params ALWAYS win — only fill in when the user left the default):
  *  • If metadata.units === 'volts' and params.inputMode is still the default
@@ -1012,21 +1129,16 @@ function smeasAutoSeedFromPacket(
   packet: import('../../lib/ingest').WaveformPacket,
 ): SmeasParams {
   const meta = packet.metadata as import('../../lib/ingest').WaveformMetadata & { vfsPeakToPeak?: number };
-  console.log('[smeas autoSeed] units:', meta.units, 'inputMode:', params.inputMode,
-    'vfsPeakToPeak meta:', meta.vfsPeakToPeak, 'params:', params.vfsPeakToPeak,
-    'sampleRateHz:', meta.sampleRateHz, 'numSamples:', meta.numSamples);
   let updated = { ...params };
 
   // Auto-detect volt input mode from oscilloscope captures
   if (meta.units === 'volts' && params.inputMode === 'time_domain_codes') {
-    console.log('[smeas autoSeed] → switching to time_domain_volts');
     updated = { ...updated, inputMode: 'time_domain_volts' };
   }
 
   // Auto-seed vfsPeakToPeak from the ingest-computed range (only if still at default 2.0)
   if (meta.vfsPeakToPeak && meta.vfsPeakToPeak > 0 &&
       Math.abs(Number(params.vfsPeakToPeak) - 2.0) < 0.001) {
-    console.log('[smeas autoSeed] → seeding vfsPeakToPeak:', meta.vfsPeakToPeak);
     updated = { ...updated, vfsPeakToPeak: meta.vfsPeakToPeak };
   }
 
@@ -1861,10 +1973,13 @@ function analyzeFromPs(
       const bin = Math.round(aliasedBinIndex(rawBin, L));
       if (bin <= 0 || bin >= S1len) return;
       if (bin === fundBin || (isDual && bin === fund2Bin)) return;
-      // Do not re-label a bin already claimed as a harmonic/IM component.
-      // Without this guard, harmonic energy gets relabelled as TI spurs when
-      // numberOfCores > 1, making existing harmonics appear as inflated TI spurs.
-      if (seenImBins.has(bin)) return;
+      // NOTE: a bin can legitimately carry BOTH an IM/harmonic component AND
+      // a TI spur — these are independent classifications of the same energy,
+      // not mutually exclusive labels. Do not suppress a TI candidate merely
+      // because `seenImBins` already claimed that bin (see smeasSpectrumMarkers/
+      // smeasSpectrumLegendItems/smeasResultsPanelRows, which now render both).
+      // Only dedupe within the TI set itself (a bin already added as an L/C/R
+      // TI candidate in this same pass shouldn't be added twice).
       if (seenTi.has(bin)) return;
       seenTi.add(bin);
       arr.push({ bin, mhz: freqMhz[bin], dbfs: PsDbfs[bin], label });
@@ -1970,9 +2085,11 @@ function analyzeFromPs(
   // 0.3% of fs guarantees we clear the main-lobe leakage for all standard windows.
   // For fs=2250 MHz → 6.75 MHz radius.  User-set sfdrLeakageAvoidanceRadiusMhz adds
   // extra margin on top; it never reduces the minimum.
-  const minRadiusMhz = (0.003 * fsHz) / 1e6;
+  // const minRadiusMhz = (0.003 * fsHz) / 1e6;
+  // const userRadiusMhz = Number(sfdrLeakageAvoidanceRadiusMhz) || 0;
+  // const effectiveRadiusMhz = Math.max(minRadiusMhz, userRadiusMhz);
   const userRadiusMhz = Number(sfdrLeakageAvoidanceRadiusMhz) || 0;
-  const effectiveRadiusMhz = Math.max(minRadiusMhz, userRadiusMhz);
+  const effectiveRadiusMhz = userRadiusMhz;
   const avoidBins = hzPerBin > 0 ? Math.ceil((effectiveRadiusMhz * 1e6) / hzPerBin) : 1;
 
   const blankAround = (arr: number[], center: number, halfBins: number) => {
@@ -2023,6 +2140,15 @@ function analyzeFromPs(
   // ── Derived spectra ───────────────────────────────────────────────────────
   const PsDbfsWoTi = Array.from(PsDbfs) as number[];
   for (const ti of [...tiSpurEntries, ...tiSpurEntries2]) PsDbfsWoTi[ti.bin] = NaN;
+  // Explicit immunity: Fund1, Fund2 (dual-tone), and DC must never be nulled
+  // by TI-spur removal, regardless of any future change to the TI-candidate
+  // exclusion logic in addTi(). addTi() already refuses to classify the
+  // fundBin/fund2Bin as TI, so this is normally a no-op — but it is asserted
+  // here explicitly (generalizing the former Fund1-only guarantee to also
+  // cover Fund2 and DC) as defense-in-depth for the TI-de-embedded figure.
+  PsDbfsWoTi[0] = PsDbfs[0];
+  PsDbfsWoTi[fundBin] = PsDbfs[fundBin];
+  if (isDual && fund2Bin > 0) PsDbfsWoTi[fund2Bin] = PsDbfs[fund2Bin];
 
   const PsDbfsNoise = Array.from(PsDbfsWoTi) as number[];
   PsDbfsNoise[0]        = NaN;
@@ -2049,7 +2175,7 @@ function analyzeFromPs(
     tiSpurEntries2,
     numberOfCores,
     isDual,
-    effectiveRadiusMhz,                 // actual blanking radius used (max of 0.3%×fs and user value)
+    effectiveRadiusMhz,                 // actual blanking radius used (exact user-specified value; 0 disables avoidance)
     freqMhz: Array.from(freqMhz),
     freqBin,
     PsDbfs: Array.from(PsDbfs),
@@ -2836,6 +2962,433 @@ function NoiseSpectrumFigure({ data, controls }: { data: unknown; controls: Reco
   );
 }
 
+// ── Portable (renderer-agnostic) figure data ──────────────────────────────────
+// Consumes the same SmeasFigureData produced by prepareData() — no analysis
+// recomputation. Used by the CLI to generate SVG/PNG/JPEG figures and a
+// sibling JSON description, without depending on React/Recharts/canvas/DOM.
+// Recovers the legacy MainSpectrumFigure/TiDeembeddedFigure/NoiseSpectrumFigure/
+// ResultsPanel semantics (markers, legend, ticks, results panel) via the
+// PortableFigureDescription.markers/legend.items/x.ticks/y.ticks/resultsPanel
+// fields, rather than flattening everything into referenceLines. Drops only
+// genuinely canvas-only presentation details (rotate hints, zoom/pan state).
+
+const nnSmeas = (v: number): number | null => (isFinite(v) ? v : null);
+
+/** SFDR-avoidance / TI-spur-avoidance reference areas shared by spectrum + spectrum_ti_deembedded. */
+function smeasAvoidanceAreas(r: any, rmhz: number, xMax: number): PortableFigureDescription['referenceAreas'] {
+  if (!(rmhz > 0)) return [];
+  // Semantics for these regions (what they mean) live only in legend.items
+  // (marker: 'area'); the renderer draws a plain translucent region here.
+  const areas: NonNullable<PortableFigureDescription['referenceAreas']> = [
+    { x1: 0, x2: Math.min(rmhz, xMax), style: 'warning' },
+    { x1: Math.max(0, r.fundMhz - rmhz), x2: Math.min(xMax, r.fundMhz + rmhz), style: 'warning' },
+  ];
+  if (r.isDual && r.fund2Mhz > 0) {
+    areas.push({ x1: Math.max(0, r.fund2Mhz - rmhz), x2: Math.min(xMax, r.fund2Mhz + rmhz), style: 'warning' });
+  }
+  areas.push({ x1: Math.max(0, xMax - rmhz), x2: xMax, style: 'warning' });
+  // TI-spur avoidance windows — only meaningful for windowed (non-rectangular) captures.
+  if (r.windowType && r.windowType !== 'rectangular') {
+    for (const ti of [...(r.tiSpurEntries ?? []), ...(r.tiSpurEntries2 ?? [])] as any[]) {
+      const f = r.freqMhz[ti.bin] ?? 0;
+      areas.push({ x1: Math.max(0, f - rmhz), x2: Math.min(xMax, f + rmhz), style: 'warning' });
+    }
+  }
+  return areas;
+}
+
+/** Frequency-label formatter shared by the portable spectral figures (mirrors fmtFreqLabel/fmtF above). */
+function smeasFmtFreqLabel(v: number, xMaxMhz: number): string {
+  if (xMaxMhz < 0.001) return `${(v * 1e6).toFixed(1)}Hz`;
+  if (xMaxMhz < 1) return `${(v * 1e3).toFixed(3)}kHz`;
+  return `${v.toFixed(4)}MHz`;
+}
+
+/** Adaptive x-tick step — ~5-8 ticks regardless of frequency range (mirrors MainSpectrumFigure.adaptiveTickStep). */
+function smeasAdaptiveTickStep(span: number): number {
+  if (span <= 0) return 1;
+  const raw = span / 6;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const norm = raw / mag;
+  const step = norm < 1.5 ? 1 : norm < 3.5 ? 2 : norm < 7.5 ? 5 : 10;
+  return step * mag;
+}
+
+function smeasXTicks(xMin: number, xMax: number): number[] {
+  const step = smeasAdaptiveTickStep(xMax - xMin);
+  const base = Math.ceil(xMin / step) * step;
+  const ticks: number[] = [];
+  for (let v = base; v <= xMax + step * 0.01; v += step) ticks.push(+v.toPrecision(10));
+  return ticks;
+}
+
+/** Fixed 10-unit-step y-ticks (mirrors the yTicks loops in the legacy figure components). */
+function smeasYTicks(yMin: number, yMax: number): number[] {
+  const ticks: number[] = [];
+  for (let v = Math.ceil(yMin / 10) * 10; v <= yMax + 1; v += 10) ticks.push(v);
+  return ticks;
+}
+
+/** Snap a target frequency to its nearest finite-valued sample (mirrors stampMarkers' binary search). */
+function smeasNearestFiniteY(freqMhz: number[], ps: number[], targetMhz: number): number | undefined {
+  if (freqMhz.length === 0) return undefined;
+  let lo = 0, hi = freqMhz.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (freqMhz[mid] < targetMhz) lo = mid + 1; else hi = mid;
+  }
+  const candidates = [lo - 1, lo, lo + 1].filter((i) => i >= 0 && i < freqMhz.length);
+  let best = candidates[0];
+  for (const i of candidates) {
+    if (Math.abs(freqMhz[i] - targetMhz) < Math.abs(freqMhz[best] - targetMhz)) best = i;
+  }
+  const v = ps[best];
+  return isFinite(v) ? v : undefined;
+}
+
+// ── Display-only spur-threshold re-filter for portable figures ──────────────
+// The kernel's imEntriesAboveThreshold/imEntriesBelowThreshold split (see
+// analyzeSpectrum) intentionally only activates on an *explicit* non-zero
+// spursMinDbfs override (Python-parity: the auto-calculated histogram value
+// is used purely as the displayed "Spur Thr." reference, never for SNR
+// filtering). That means when the user leaves spursMinDbfs at its default
+// (0, auto-calc), every IM/harmonic component is still marked "visible" by
+// the kernel even though a threshold line/value IS shown on the figure —
+// so components that are visually below that displayed line still get
+// markers/labels/legend text. This helper re-partitions the kernel's
+// imEntriesVisible list using the *resolved* r.spursMinDbfs (override or
+// auto-calc, whichever is active) for figure display only. It never touches
+// the kernel's SNR/analysis partitioning, debug tables, or scalar outputs —
+// those keep using r.imEntriesVisible/r.imEntriesBelowThreshold unchanged.
+function smeasThresholdActive(r: any): boolean {
+  return !!(r.spursMinThresholdEn && isFinite(r.spursMinDbfs) && r.spursMinDbfs !== 0);
+}
+function smeasFigureVisibleImEntries(r: any): any[] {
+  const all = (r.imEntriesVisible ?? []) as any[];
+  if (!smeasThresholdActive(r)) return all;
+  return all.filter((e) => e.dbfs >= r.spursMinDbfs);
+}
+function smeasFigureHiddenImEntries(r: any): any[] {
+  const kernelHidden = (r.imEntriesBelowThreshold ?? []) as any[];
+  if (!smeasThresholdActive(r)) return kernelHidden;
+  const all = (r.imEntriesVisible ?? []) as any[];
+  return [...kernelHidden, ...all.filter((e) => e.dbfs < r.spursMinDbfs)];
+}
+
+/**
+ * Textual results block (mirrors ResultsPanel's row generation exactly, in
+ * the same order), reused by both spectrum and spectrum_ti_deembedded.
+ */
+function smeasResultsPanelRows(
+  r: any, fsHz: number, sfdrLeakageAvoidanceRadiusMhz: number, showWoTi: boolean,
+  windowParam?: string, tiCorrections?: string,
+): NonNullable<PortableFigureDescription['resultsPanel']> {
+  const rows: NonNullable<PortableFigureDescription['resultsPanel']> = [
+    { label: 'fs (MHz)', value: (fsHz / 1e6).toFixed(2) },
+  ];
+  // Window: explicit selection shown as-is; auto selection shows the actually
+  // chosen window plus the existing leakage/"leakage detection" decision.
+  if (windowParam === 'auto') {
+    rows.push({ label: 'Window', value: `${r._autoWindowUsed ?? r.windowType ?? 'rectangular'} (auto)` });
+    rows.push({ label: 'Leakage detection', value: r._autoLeakageDetected ? 'true' : 'false' });
+  } else if (windowParam) {
+    rows.push({ label: 'Window', value: windowParam });
+  }
+  rows.push({ label: 'TI cal sequence', value: (!tiCorrections || tiCorrections.toLowerCase() === 'none') ? 'None' : tiCorrections });
+  rows.push(
+    { label: 'ENOB(SNR)', value: `${r.enobSnrC.toFixed(2)} / ${r.enobSnrFs.toFixed(2)} bit` },
+    { label: 'ENOB(SNDR)', value: `${r.enobSndrC.toFixed(2)} / ${r.enobSndrFs.toFixed(2)} bit` },
+    { label: 'SNR', value: `${r.snrC.toFixed(2)} / ${r.snrFs.toFixed(2)} dB` },
+    { label: 'SNDR', value: `${r.sndrC.toFixed(2)} / ${r.sndrFs.toFixed(2)} dB` },
+    { label: 'THD', value: `${r.thdDb.toFixed(2)} dB` },
+    { label: 'Nrms', value: `${r.nrmsVm.toFixed(2)} mV` },
+    { label: 'Fund1', value: `${r.fundMhz} MHz  ${r.fundDbfs.toFixed(2)} dBFS` },
+      );
+  if (r.isDual && isFinite(r.fund2Mhz)) {
+    rows.push({
+      label: 'Fund2',
+      value: `${r.fund2Mhz} MHz  ${isFinite(r.fund2Dbfs) ? r.fund2Dbfs.toFixed(2) : 'N/A'} dBFS`
+    });
+    rows.push({
+      label: 'IM3',
+      value: `${isFinite(r.im3Dbc) ? r.im3Dbc.toFixed(1) : 'N/A'}dBc  @ ${isFinite(r.im3Mhz) ? r.im3Mhz : 'N/A'} MHz`
+    });
+  }
+  rows.push({ label: 'SFDR', value: `${r.sfdrDbcs.toFixed(2)} dBc  ${r.sfdrLabel ?? ''}  @ ${r.sfdrMhz.toFixed(2)} MHz` });
+  if (sfdrLeakageAvoidanceRadiusMhz > 0) {
+    rows.push({ label: 'SFDR avoid', value: `±${sfdrLeakageAvoidanceRadiusMhz} MHz` });
+  }
+  if (showWoTi && isFinite(r.sfdrWoTiDbcs) && r.sfdrWoTiBin !== r.sfdrBin) {
+    rows.push({ label: 'SFDR_woTI', value: `${r.sfdrWoTiDbcs.toFixed(2)} dBc  ${r.sfdrWoTiLabel ?? ''}  @ ${r.sfdrWoTiMhz.toFixed(2)} MHz` });
+  }
+  if (r.spursMinThresholdEn && isFinite(r.spursMinDbfs) && r.spursMinDbfs !== 0) {
+    rows.push({ label: 'Spur Thr.', value: `${r.spursMinDbfs.toFixed(1)} dBFS` });
+  }
+  // Harmonics: presentation-only cap at 10 rows (harmonic analysis itself is unchanged).
+  // Uses the figure-only threshold re-filter (see smeasFigureVisibleImEntries)
+  // so components below the displayed Spur Thr. line don't appear here.
+  const visibleIm = smeasFigureVisibleImEntries(r);
+  if (visibleIm.length > 0) {
+    for (const h of visibleIm.slice(0, 10)) {
+      rows.push({ label: h.symbol, value: `${(r.fundDbfs - h.dbfs).toFixed(2)} dBc  @ ${h.mhz.toFixed(3)} MHz` });
+    }
+  }
+  const hiddenIm = smeasFigureHiddenImEntries(r);
+  if (hiddenIm.length > 0) {
+    for (const h of hiddenIm.slice(0, 4)) {
+      rows.push({ label: `${h.symbol} (noise)`, value: `${(r.fundDbfs - h.dbfs).toFixed(2)} dBc  @ ${h.mhz.toFixed(3)} MHz` });
+    }
+  }
+  if (r.tiSpurEntries && r.tiSpurEntries.length > 0) {
+    for (const ti of r.tiSpurEntries as any[]) {
+      if (!isFinite(ti.dbfs)) continue;
+      rows.push({ label: `TI ${ti.label}`, value: `${(r.fundDbfs - ti.dbfs).toFixed(2)} dBc  @ ${ti.mhz.toFixed(3)} MHz` });
+    }
+  }
+  return rows;
+}
+
+/** Markers for the main spectrum figure (mirrors MainSpectrumFigure's markerTargets). */
+function smeasSpectrumMarkers(
+  r: any, freqMhz: number[], ps: number[], xMaxMhz: number, showHarmonics: boolean, showTiSpurs: boolean
+): NonNullable<PortableFigureDescription['markers']> {
+  const targets: Array<{ mhz: number; label: string; color: string; shape?: 'circle' | 'triangle'; rotate?: boolean }> = [];
+  targets.push({ mhz: r.fundMhz, label: `${r.isDual ? 'F1' : 'H1'} ${smeasFmtFreqLabel(r.fundMhz, xMaxMhz)}`, color: '#EF4444' });
+  if (r.isDual && r.fund2Bin > 0 && isFinite(r.fund2Dbfs)) {
+    targets.push({ mhz: r.fund2Mhz, label: `F2 ${smeasFmtFreqLabel(r.fund2Mhz, xMaxMhz)}`, color: '#F97316' });
+  }
+  if (r.isDual && isFinite(r.im3Dbc)) {
+    targets.push({ mhz: r.im3Mhz, label: `IM3 ${r.im3Dbc.toFixed(1)}dBc`, color: '#EAB308' });
+  }
+  // TI spurs are plotted before IM/harmonic markers — a bin can legitimately
+  // carry both classifications (they are independent, not mutually
+  // exclusive), so TI markers are drawn first and IM/harmonic markers
+  // afterward, on top, per requested z-order (TI then IM), without either
+  // one deleting/replacing the other.
+  if (showTiSpurs && r.tiSpurEntries) {
+    for (const ti of (r.tiSpurEntries as any[]).filter((t: any) => isFinite(t.dbfs))) {
+      targets.push({ mhz: ti.mhz, label: ti.label, color: '#06B6D4', shape: 'triangle' });
+    }
+  }
+  if (showHarmonics && r.imEntriesVisible) {
+    // Dual-tone IM-product labels (e.g. "3F1+2F2", "-F1+F2") are long and
+    // overlap when horizontal — rotate them vertically. Single-tone harmonic
+    // labels (e.g. "H2", "H3") stay short and horizontal. Only components
+    // still above the displayed Spur Thr. line get a marker (see
+    // smeasFigureVisibleImEntries) — this is display-only re-filtering; the
+    // underlying analysis/debug-table values are unaffected.
+    for (const h of smeasFigureVisibleImEntries(r)) {
+      targets.push({ mhz: h.mhz, label: h.symbol, color: '#A855F7', rotate: r.isDual === true });
+    }
+  }
+  if (r.sfdrBin !== undefined && r.sfdrBin >= 0) {
+    targets.push({ mhz: r.sfdrMhz, label: 'SFDR', color: '#22C55E' });
+  }
+  if (isFinite(r.sfdrWoTiDbcs) && r.sfdrWoTiBin !== r.sfdrBin) {
+    targets.push({ mhz: r.sfdrWoTiMhz, label: 'SFDR_woTI', color: '#2563EB' });
+  }
+  const markers: NonNullable<PortableFigureDescription['markers']> = [];
+  for (const t of targets) {
+    const y = smeasNearestFiniteY(freqMhz, ps, t.mhz);
+    if (y === undefined) continue;
+    markers.push({
+      x: t.mhz, y, label: t.label, color: t.color, shape: t.shape ?? 'circle',
+      ...(t.rotate ? { textRotation: -90 } : {}),
+    });
+  }
+  return markers;
+}
+
+/** Legend items for the main spectrum figure (mirrors MainSpectrumFigure's legendItems array). */
+function smeasSpectrumLegendItems(
+  r: any, rmhz: number, xMaxMhz: number, showHarmonics: boolean, showTiSpurs: boolean
+): NonNullable<PortableFigureDescription['legend']>['items'] {
+  const imArr: any[] = showHarmonics ? smeasFigureVisibleImEntries(r) : [];
+  const orderSuffix = (n: number) => (n === 2 ? '2nd' : n === 3 ? '3rd' : `${n}th`);
+  const harmLegendStr = imArr.length === 0 ? '' :
+    imArr.length === 1
+      ? `${orderSuffix(imArr[0].order)} order`
+      : `${orderSuffix(imArr[0].order)}…${orderSuffix(imArr[imArr.length - 1].order)} order`;
+
+  const items: NonNullable<PortableFigureDescription['legend']>['items'] = [
+    { color: '#6366F1', label: 'Spectrum' },
+    { color: '#EF4444', label: `${r.isDual ? 'F1' : 'H1'} ${smeasFmtFreqLabel(r.fundMhz, xMaxMhz)}`, shape: 'circle' },
+  ];
+  if (r.isDual && isFinite(r.fund2Mhz)) items.push({ color: '#F97316', label: `F2 ${smeasFmtFreqLabel(r.fund2Mhz, xMaxMhz)}`, shape: 'circle' });
+  if (r.isDual && isFinite(r.im3Dbc)) items.push({ color: '#EAB308', label: `IM3 ${r.im3Dbc.toFixed(1)}dBc`, shape: 'circle' });
+  items.push({ color: '#22C55E', label: `SFDR ${r.sfdrDbcs.toFixed(2)}dBc @ ${r.sfdrMhz.toFixed(2)} MHz`, shape: 'circle' });
+  if (isFinite(r.sfdrWoTiDbcs) && r.sfdrWoTiBin !== r.sfdrBin) {
+    items.push({ color: '#2563EB', label: `SFDR_woTI ${r.sfdrWoTiDbcs.toFixed(2)}dBc @ ${r.sfdrWoTiMhz.toFixed(2)}MHz [${r.sfdrWoTiLabel ?? ''}]`, shape: 'circle' });
+  }
+  if (imArr.length > 0) items.push({ color: '#A855F7', label: `Harmonics/IM (${harmLegendStr})`, shape: 'circle' });
+  if (showHarmonics && smeasFigureHiddenImEntries(r).length > 0) {
+    items.push({ color: '#6B7280', label: `${smeasFigureHiddenImEntries(r).length} spur(s) below noise threshold` });
+  }
+  if (showTiSpurs && r.tiSpurEntries && r.tiSpurEntries.length > 0) {
+    items.push({ color: '#06B6D4', label: `TI spurs (${r.numberOfCores} cores)`, shape: 'triangle' });
+  }
+  if (rmhz > 0) {
+    items.push({ color: 'rgba(251,191,36,0.35)', label: `SFDR detection forbidden zone (±${rmhz} MHz around fund/DC/Nyquist)`, shape: 'area' });
+  }
+  return items;
+}
+
+function getSmeasSpectrumFigureData(data: SmeasFigureData): PortableFigureDescription {
+  const r: any = data.results;
+  const rmhz = data.sfdrLeakageAvoidanceRadiusMhz ?? 0;
+  const xMax = (data.fsHz / 1e9 * 1000) / 2; // Nyquist, MHz
+  const freqMhz = r.freqMhz as number[];
+  const ps = r.PsDbfs as number[];
+  const showHarmonics = true;
+  const showTiSpurs = true;
+
+  const referenceLines: NonNullable<PortableFigureDescription['referenceLines']> = [];
+  if (r.spursMinThresholdEn && isFinite(r.spursMinDbfs) && r.spursMinDbfs !== 0) {
+    referenceLines.push({ axis: 'y', value: r.spursMinDbfs, label: 'spur min threshold' });
+  }
+
+  const finiteVals = ps.filter((v) => isFinite(v));
+  const yMin = Math.max(-160, finiteVals.length ? Math.floor(Math.min(...finiteVals) / 10) * 10 : -150);
+  const yMax = 10;
+
+  // Title: single-tone keeps "Fund=<f> MHz"; dual-tone shows both tones
+  // since a single "Fund" value is misleading once two real fundamentals
+  // are present (F1/F2 are already used consistently elsewhere: markers,
+  // legend, resultsPanel).
+  const fundLabel = r.isDual && isFinite(r.fund2Mhz)
+    ? `F1=${smeasFmtFreqLabel(r.fundMhz, xMax)}, F2=${smeasFmtFreqLabel(r.fund2Mhz, xMax)}`
+    : `Fund=${smeasFmtFreqLabel(r.fundMhz, xMax)}`;
+
+  return {
+    figure: 'spectrum',
+    title: `Spectrum — ENOB_SNDR_FS=${r.enobSndrFs.toFixed(2)}bits ${fundLabel} SFDR=${r.sfdrDbcs.toFixed(2)}dBc`,
+    x: { label: 'frequency (MHz)', data: freqMhz.slice(), ticks: smeasXTicks(0, xMax) },
+    series: [{ name: 'PS [dBFS]', y: ps.map(nnSmeas) }],
+    y: { label: 'power [dBFS]', ticks: smeasYTicks(yMin, yMax) },
+    legend: { enabled: true, items: smeasSpectrumLegendItems(r, rmhz, xMax, showHarmonics, showTiSpurs) },
+    grid: { x: true, y: true },
+    referenceLines,
+    referenceAreas: smeasAvoidanceAreas(r, rmhz, xMax),
+    markers: smeasSpectrumMarkers(r, freqMhz, ps, xMax, showHarmonics, showTiSpurs),
+    resultsPanel: smeasResultsPanelRows(r, data.fsHz, rmhz, true, data.windowParam, data.tiCorrections),
+  };
+}
+
+function getSmeasTiDeembeddedFigureData(data: SmeasFigureData): PortableFigureDescription | undefined {
+  const r: any = data.results;
+  // Mirrors the React placeholder: no meaningful figure when TI is disabled.
+  if (!r.numberOfCores || r.numberOfCores <= 1) return undefined;
+
+  const rmhz = data.sfdrLeakageAvoidanceRadiusMhz ?? 0;
+  const xMax = (data.fsHz / 1e9 * 1000) / 2;
+  const freqMhz = r.freqMhz as number[];
+  const psWoTi = r.PsDbfsWoTi as number[];
+  const harmArr: any[] = smeasFigureVisibleImEntries(r);
+  const tiArr: any[] = r.tiSpurEntries ? r.tiSpurEntries as any[] : [];
+  const harmLegend = harmArr.length === 0 ? '' :
+    harmArr.length === 1 ? `H${harmArr[0].order}` : `H${harmArr[0].order}…H${harmArr[harmArr.length - 1].order}`;
+  const tiLegend = tiArr.length <= 2
+    ? tiArr.map((t: any) => t.label).join(', ')
+    : `${tiArr[0].label}…${tiArr[tiArr.length - 1].label}`;
+
+  // Fund1/Fund2 are immune from TI removal (see PsDbfsWoTi construction) and
+  // are always shown, mirroring the main-spectrum figure's F1/F2 marker
+  // convention (generalized here from a Fund1-only marker to also cover
+  // Fund2 in dual-tone mode).
+  const targets: Array<{ mhz: number; label: string; color: string; rotate?: boolean }> = [
+    { mhz: r.fundMhz, label: `${r.isDual ? 'F1' : 'H1'} ${smeasFmtFreqLabel(r.fundMhz, xMax)}`, color: '#EF4444' },
+  ];
+  if (r.isDual && r.fund2Bin > 0 && isFinite(r.fund2Dbfs)) {
+    targets.push({ mhz: r.fund2Mhz, label: `F2 ${smeasFmtFreqLabel(r.fund2Mhz, xMax)}`, color: '#F97316' });
+  }
+  if (isFinite(r.sfdrWoTiDbcs)) targets.push({ mhz: r.sfdrWoTiMhz, label: 'SFDR_woTI', color: '#2563EB' });
+  for (const h of harmArr) targets.push({ mhz: h.mhz, label: h.symbol, color: '#A855F7', rotate: r.isDual === true });
+  const markers: NonNullable<PortableFigureDescription['markers']> = [];
+  for (const t of targets) {
+    const y = smeasNearestFiniteY(freqMhz, psWoTi, t.mhz);
+    if (y === undefined) continue;
+    markers.push({
+      x: t.mhz, y, label: t.label, color: t.color, shape: 'circle',
+      ...(t.rotate ? { textRotation: -90 } : {}),
+    });
+  }
+
+  const legendItems: NonNullable<PortableFigureDescription['legend']>['items'] = [
+    { color: '#6366F1', label: 'Spectrum (TI spurs removed)' },
+    { color: '#EF4444', label: `${r.isDual ? 'F1' : 'H1'} @ ${smeasFmtFreqLabel(r.fundMhz, xMax)}`, shape: 'circle' },
+  ];
+  if (r.isDual && r.fund2Bin > 0 && isFinite(r.fund2Dbfs)) {
+    legendItems.push({ color: '#F97316', label: `F2 @ ${smeasFmtFreqLabel(r.fund2Mhz, xMax)}`, shape: 'circle' });
+  }
+  if (harmArr.length > 0) legendItems.push({ color: '#A855F7', label: `Harmonics (${harmLegend}) — visible, not removed`, shape: 'circle' });
+  if (isFinite(r.sfdrWoTiDbcs)) {
+    legendItems.push({ color: '#2563EB', label: `SFDR_woTI ${r.sfdrWoTiDbcs.toFixed(2)}dBc @ ${smeasFmtFreqLabel(r.sfdrWoTiMhz, xMax)} [${r.sfdrWoTiLabel ?? ''}]`, shape: 'circle' });
+  }
+  if (tiArr.length > 0) legendItems.push({ color: '#9CA3AF', label: `TI spurs zeroed (${tiLegend})` });
+
+  const finiteVals = psWoTi.filter((v) => isFinite(v));
+  const yMin = finiteVals.length ? Math.floor(Math.min(...finiteVals) / 10) * 10 : -150;
+  const yMax = 10;
+
+  const referenceLines: NonNullable<PortableFigureDescription['referenceLines']> = [];
+
+  const fundLabelTi = r.isDual && isFinite(r.fund2Mhz)
+    ? `F1=${smeasFmtFreqLabel(r.fundMhz, xMax)}, F2=${smeasFmtFreqLabel(r.fund2Mhz, xMax)}`
+    : `Fund=${smeasFmtFreqLabel(r.fundMhz, xMax)}`;
+
+  return {
+    figure: 'spectrum_ti_deembedded',
+    title: `Spectrum (TI spurs removed) — ${fundLabelTi} SFDR_woTI=${r.sfdrWoTiDbcs.toFixed(2)}dBc`,
+    x: { label: 'frequency (MHz)', data: freqMhz.slice(), ticks: smeasXTicks(0, xMax) },
+    series: [{ name: 'PS [dBFS] (TI spurs removed)', y: psWoTi.map(nnSmeas) }],
+    y: { label: 'power [dBFS]', ticks: smeasYTicks(yMin, yMax) },
+    legend: { enabled: true, items: legendItems },
+    grid: { x: true, y: true },
+    referenceLines,
+    referenceAreas: smeasAvoidanceAreas(r, rmhz, xMax),
+    markers,
+    resultsPanel: smeasResultsPanelRows(r, data.fsHz, rmhz, true, data.windowParam, data.tiCorrections),
+  };
+}
+
+function getSmeasNoiseSpectrumFigureData(data: SmeasFigureData): PortableFigureDescription | undefined {
+  const r: any = data.results;
+  // Mirrors the React placeholder: noise spectrum requires a fresh analysis pass.
+  if (!r.PsDbfsNoise) return undefined;
+
+  const xMax = (data.fsHz / 1e9 * 1000) / 2;
+  const freqMhz = r.freqMhz as number[];
+  const psNoise = r.PsDbfsNoise as number[];
+  const harmArr: any[] = r.harmonicEntries ? r.harmonicEntries as any[] : [];
+  const harmLegend = harmArr.length === 0 ? '' :
+    harmArr.length === 1 ? `H${harmArr[0].order}` : `H${harmArr[0].order}…H${harmArr[harmArr.length - 1].order}`;
+
+  const legendItems: NonNullable<PortableFigureDescription['legend']>['items'] = [
+    { color: '#34D399', label: 'Noise floor (fund/harm/TI removed)' },
+    { color: '#EF4444', label: `H1 removed @ ${smeasFmtFreqLabel(r.fundMhz, xMax)}` },
+  ];
+  if (harmArr.length > 0) legendItems.push({ color: '#A855F7', label: `Harmonics removed (${harmLegend})` });
+  if (isFinite(r.sfdrWoTiDbcs)) {
+    legendItems.push({ color: '#2563EB', label: `SFDR_woTI ${r.sfdrWoTiDbcs.toFixed(2)}dBc @ ${smeasFmtFreqLabel(r.sfdrWoTiMhz, xMax)} [${r.sfdrWoTiLabel ?? ''}]` });
+  }
+
+  const finiteVals = psNoise.filter((v) => isFinite(v));
+  const yMin = finiteVals.length ? Math.floor(Math.min(...finiteVals) / 10) * 10 : -150;
+  const yMax = 10;
+
+  return {
+    figure: 'spectrum_noise',
+    title: `Noise Spectrum — Nrms=${r.nrmsVm.toFixed(2)}mV SNR=${r.snrC.toFixed(2)}dBc`,
+    x: { label: 'frequency (MHz)', data: freqMhz.slice(), ticks: smeasXTicks(0, xMax) },
+    series: [{ name: 'Noise floor [dBFS]', y: psNoise.map(nnSmeas) }],
+    y: { label: 'power [dBFS]', ticks: smeasYTicks(yMin, yMax) },
+    legend: { enabled: true, items: legendItems },
+    grid: { x: true, y: true },
+    resultsPanel: smeasResultsPanelRows(r, data.fsHz, 0, false, data.windowParam, data.tiCorrections),
+  };
+}
+
+
 // ── Figure declarations ───────────────────────────────────────────────────────
 const smeasFigures: PluginFigure[] = [
   {
@@ -2847,6 +3400,7 @@ const smeasFigures: PluginFigure[] = [
       { key: 'showTiSpurs',   type: 'toggle', label: 'Show TI spurs',                                 default: true  },
     ],
     component: MainSpectrumFigure,
+    getData: (data) => getSmeasSpectrumFigureData(data as SmeasFigureData),
   },
 ];
 
@@ -2855,12 +3409,14 @@ smeasFigures.push({
   id: 'spectrum_ti_deembedded',
   label: 'Spectrum (TI spurs artificially removed)',
   component: TiDeembeddedFigure,
+  getData: (data) => getSmeasTiDeembeddedFigureData(data as SmeasFigureData),
 });
 
 smeasFigures.push({
   id: 'spectrum_noise',
   label: 'Noise Spectrum',
   component: NoiseSpectrumFigure,
+  getData: (data) => getSmeasNoiseSpectrumFigureData(data as SmeasFigureData),
 });
 
 /**
@@ -3058,6 +3614,10 @@ function _smeasRunCore(
       }
 
       chosenResults._autoWindowUsed = chosenWindow;
+      // "Leakage detection": true when leakage was present and windowing was
+      // chosen over rectangular (mirrors the decision already made above —
+      // not a new calculation, just exposing it for reporting).
+      chosenResults._autoLeakageDetected = chosenWindow !== 'rectangular';
       return chosenResults;
     }
 
@@ -3154,6 +3714,8 @@ function _smeasRunCore(
     toneMode,
     spursMinDbfs: results.spursMinDbfs,
     spursMinActive: results.spursMinThresholdEn && results.spursMinDbfs !== 0,
+    windowParam: String(params.window),
+    tiCorrections: String(params.tiCorrections ?? 'none'),
   };
 
   const r = results;
@@ -3731,22 +4293,8 @@ export const smeasPlugin: Plugin<SmeasParams> = {
     };
   },
 
-  run: async (file: File, params: SmeasParams): Promise<Record<string, string | number>> => {
-    // Thin shim: delegate all I/O to the ingestion layer, then call the pure kernel.
-    params = {
-      ...params,
-      fftLength:     Math.max(4, Math.round(parseFftLength(params.fftLength) || 8192)),
-      numAveraging:  Math.max(1, Math.round(Number(params.numAveraging)  || 1)),
-      numberOfCores: Math.max(1, Math.round(Number(params.numberOfCores) || 1)),
-    };
-    const packet = await ingestFile(file, smeasIngestHints(params));
-    params = smeasAutoSeedFromPacket(params, packet);
-    const fsHz   = resolveFsHz(packet, params);
-    const { scalarResult } = _smeasRunCore(packet.waveform, fsHz, file.name, params);
-    return scalarResult;
-  },
-
-  runFromWaveform: async (packet, params: SmeasParams) => {
+  run: async (packet, params: SmeasParams): Promise<Record<string, string | number>> => {
+    // packet is already IR — no file handling, no ingestion, no format detection.
     params = smeasAutoSeedFromPacket({
       ...params,
       fftLength:     Math.max(4, Math.round(parseFftLength(params.fftLength) || 8192)),
@@ -3758,7 +4306,13 @@ export const smeasPlugin: Plugin<SmeasParams> = {
     return scalarResult;
   },
 
-  prepareDataFromWaveform: async (packet, params: SmeasParams) => {
+  prepareData: async (
+    packet,
+    params: SmeasParams,
+  ): Promise<{
+    figureData?: unknown;
+    debugTables?: import('../../lib/pluginTypes').PluginDebugTable[];
+  }> => {
     params = smeasAutoSeedFromPacket({
       ...params,
       fftLength:     Math.max(4, Math.round(parseFftLength(params.fftLength) || 8192)),
@@ -3770,24 +4324,5 @@ export const smeasPlugin: Plugin<SmeasParams> = {
     return { figureData, debugTables };
   },
 
-  prepareData: async (file: File, params: SmeasParams): Promise<{
-    figureData?: unknown;
-    debugTables?: import('../../lib/pluginTypes').PluginDebugTable[];
-  }> => {
-    // Thin shim: delegate all I/O to the ingestion layer, then call the pure kernel.
-    params = {
-      ...params,
-      fftLength:     Math.max(4, Math.round(parseFftLength(params.fftLength) || 8192)),
-      numAveraging:  Math.max(1, Math.round(Number(params.numAveraging)  || 1)),
-      numberOfCores: Math.max(1, Math.round(Number(params.numberOfCores) || 1)),
-    };
-    const packet = await ingestFile(file, smeasIngestHints(params));
-    params = smeasAutoSeedFromPacket(params, packet);
-    const fsHz   = resolveFsHz(packet, params);
-    const { figureData, debugTables } = _smeasRunCore(packet.waveform, fsHz, file.name, params);
-    return { figureData, debugTables };
-  },
-
   figures: smeasFigures,
 };
-

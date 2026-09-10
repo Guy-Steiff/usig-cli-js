@@ -276,6 +276,9 @@ function parseArgs(args) {
     startSample: null,
     endSample: null,
     overwrite: false,
+    // Global: when true, every generated figure also emits a sibling
+    // PortableFigureDescription JSON file. Off by default (SVG/PNG/JPEG only).
+    figAsJson: false,
     inputFormat: null,
     // Set when a positional output arg follows two or more inputs that have
     // no individual output of their own (e.g. "-i A -i B out.xlsx"). This
@@ -421,6 +424,8 @@ function parseArgs(args) {
       result.format = String(args[++i]).toLowerCase();
     } else if (arg === '-y') {
       result.overwrite = true;
+    } else if (arg === '-fig_as_json') {
+      result.figAsJson = true;
     } else if (arg === '-v' || arg === '-verbose') {
       result.verbose = true;
     } else if (arg === '-h' || arg === '-help') {
@@ -2668,6 +2673,88 @@ function buildConversionMetadata({
   };
 }
 
+// Minimal Levenshtein edit distance, used only for "Did you mean ...?"
+// suggestions on unknown -p parameter names. No external dependency needed.
+function levenshteinDistance(a, b) {
+  const m = a.length, n = b.length;
+  const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      dp[i][j] = a[i - 1] === b[j - 1]
+        ? dp[i - 1][j - 1]
+        : 1 + Math.min(dp[i - 1][j - 1], dp[i - 1][j], dp[i][j - 1]);
+    }
+  }
+  return dp[m][n];
+}
+
+// Combines plugin.manifest.paramSchema (typed/validated fields) with
+// plugin.paramFields (InferredParamField — also valid -p keys, e.g.
+// toneMode, tiCorrections, fsGhz) into a single de-duplicated map keyed by
+// field.key. This is the existing declarative param schema; no new
+// parameter architecture is introduced here.
+function collectKnownParamFields(plugin) {
+  const fields = [
+    ...(plugin?.manifest?.paramSchema ?? []),
+    ...(plugin?.paramFields ?? []),
+  ];
+  const byKey = new Map();
+  for (const field of fields) {
+    if (!field?.key || byKey.has(field.key)) continue;
+    byKey.set(field.key, field);
+  }
+  return byKey;
+}
+
+// Rejects the command (process.exit(1)) before any analysis/output when an
+// explicit -p key does not match any known paramSchema/paramFields key or
+// alias for the resolved plugin. Prints the full list of valid parameter
+// names (with possible values, when declared) and a closest-match
+// suggestion when one is plausible.
+function validateKnownParams(pluginId, plugin, explicitParams) {
+  const known = collectKnownParamFields(plugin);
+  const knownNames = new Set(known.keys());
+  for (const field of known.values()) {
+    if (Array.isArray(field.aliases)) {
+      for (const alias of field.aliases) knownNames.add(alias);
+    }
+  }
+
+  for (const key of Object.keys(explicitParams ?? {})) {
+    if (knownNames.has(key)) continue;
+
+    console.error(`[usig] Unknown parameter: ${key}`);
+    console.error('');
+    console.error(`Valid parameters for plugin "${pluginId}":`);
+    for (const field of known.values()) {
+      const values =
+        Array.isArray(field.possibleValues) && field.possibleValues.length > 0 ? field.possibleValues
+        : Array.isArray(field.options) && field.options.length > 0 ? field.options
+        : null;
+      const valuesStr = values ? ` (values: ${values.join(' | ')})` : '';
+      console.error(`  ${field.key}${valuesStr}`);
+    }
+
+    let bestMatch = null;
+    let bestDistance = Infinity;
+    for (const name of knownNames) {
+      const distance = levenshteinDistance(key, name);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestMatch = name;
+      }
+    }
+    if (bestMatch && bestDistance > 0 && bestDistance <= 3 && bestDistance < key.length) {
+      console.error('');
+      console.error(`Did you mean ${bestMatch}?`);
+    }
+
+    process.exit(1);
+  }
+}
+
 function printPluginHelp(pluginId, plugin) {
   console.log(`USIG — ${pluginId} plugin`);
   console.log('');
@@ -3002,6 +3089,7 @@ async function main() {
     startSample,
     endSample,
     overwrite,
+    figAsJson,
     multiInputSharedOutputAttempt,
     unattachedPositionalOutput,
   } = parseArgs(args);
@@ -3508,6 +3596,11 @@ if (args.length === 0) {
   const allInputSummaries = {};  // keyed by plugin id
   const allParamSchemas = {};  // keyed by plugin id
   const debugTablesToPrint = [];
+  // File/figure write confirmations ("WROTE: ...") are collected here and
+  // flushed at the very end (after the Inputs/Outputs report and debug
+  // table previews), so console verbosity reads top-to-bottom: what was
+  // analyzed, then what was produced from it.
+  const wroteMessages = [];
 
   for (const job of jobs) {
   const { frame, inputFileName, filenameParamHints } = job.inputFrame;
@@ -3552,6 +3645,9 @@ if (args.length === 0) {
 
     // Merge explicit params: global CLI params then per-invocation params override
     const mergedExplicitParams = { ...(params ?? {}), ...(invocation.params ?? {}) };
+
+    // Reject unknown -p parameter names before any analysis/output.
+    validateKnownParams(resolvedPluginId, plugin, mergedExplicitParams);
 
     let finalParams = {
       ...plugin.defaultParams,
@@ -3718,6 +3814,9 @@ if (args.length === 0) {
 
 
         for (const table of debugTables) {
+          // Path supplied does not suppress the console preview — same
+          // "always previewed" contract as the single-table request below.
+          debugTablesToPrint.push(table);
           const filename = `${table.id}.csv`;
           const target = path.join(outDir, filename);
           try {
@@ -3738,7 +3837,7 @@ if (args.length === 0) {
               rows.push(row);
             }
             await writeStructuredRowsToFile(headers, rows, target, true);
-            console.error(`WROTE: ${target}`);
+            wroteMessages.push(`WROTE: ${target}`);
           } catch (err) {
             console.error(`ERROR: writing ${target}:`, err?.stack ?? err);
             process.exitCode = 4;
@@ -3857,7 +3956,7 @@ if (args.length === 0) {
               true
             );
           }
-          console.error(`WROTE: ${target}`);
+          wroteMessages.push(`WROTE: ${target}`);
 
         } catch (err) {
           console.error(
@@ -3904,6 +4003,11 @@ if (args.length === 0) {
       // artifact format; defaults to .svg when no extension is present.
       const writeFigureArtifact = async (fig, targetPath) => {
         const desc = fig.getData(figureData, {});
+        if (desc === undefined) {
+          console.error(`[FIGURE] figure '${fig.id}' produced no data for this input (not applicable) — skipping`);
+          process.exitCode = 3;
+          return;
+        }
         const svg = renderFigureToSvg(desc);
         const ext = (path.extname(targetPath).toLowerCase().replace('.', '')) || 'svg';
 
@@ -3921,13 +4025,15 @@ if (args.length === 0) {
         } else {
           throw new Error(`unsupported figure output extension: .${ext}`);
         }
-        console.error(`WROTE: ${targetPath}`);
+        wroteMessages.push(`WROTE: ${targetPath}`);
 
-        const jsonPath = targetPath.slice(0, targetPath.length - (ext.length + 1)) + '.json';
-        const jsonShouldWrite = await confirmOutputOverwrite(jsonPath, overwrite);
-        if (jsonShouldWrite) {
-          await fs.writeFile(jsonPath, JSON.stringify(desc, null, 2), 'utf8');
-          console.error(`WROTE: ${jsonPath}`);
+        if (figAsJson) {
+          const jsonPath = targetPath.slice(0, targetPath.length - (ext.length + 1)) + '.json';
+          const jsonShouldWrite = await confirmOutputOverwrite(jsonPath, overwrite);
+          if (jsonShouldWrite) {
+            await fs.writeFile(jsonPath, JSON.stringify(desc, null, 2), 'utf8');
+            wroteMessages.push(`WROTE: ${jsonPath}`);
+          }
         }
       };
 
@@ -4045,6 +4151,13 @@ if (args.length === 0) {
   // Debug tables are printed only after the normal Inputs/Outputs report.
   for (const table of debugTablesToPrint) {
     printDebugTableHead(table);
+  }
+
+  // File/figure write confirmations are deferred to the very end of console
+  // verbosity — after the analysis report and any debug table previews —
+  // so output reads as: what was analyzed, then what was produced from it.
+  for (const msg of wroteMessages) {
+    console.error(msg);
   }
 
   // If an output file was requested, write a machine-readable serialization
