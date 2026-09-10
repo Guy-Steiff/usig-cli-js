@@ -10,7 +10,14 @@
  *
  * Ticks: when the description does not provide explicit tick values, this
  * renderer derives its own "nice" ticks from the data domain.
+ *
+ * Heatmap support: `desc.heatmap` (a generic 2D grid, see pluginTypes.ts)
+ * is rasterized to a PNG (via `sharp`) and embedded as a base64 data-URI
+ * `<image>` element. This is why renderFigureToSvg() is async — its one
+ * call site (usig.mjs) awaits it.
  */
+
+import sharp from 'sharp';
 
 const DEFAULT_WIDTH = 960;
 const DEFAULT_HEIGHT = 560;
@@ -79,12 +86,84 @@ function finiteValues(arr) {
 }
 
 /**
+ * Generic min→max normalized colormap for a single grid cell value.
+ * 'heat' (default): a common red→yellow→white ramp, not domain-specific.
+ * 'grayscale': plain intensity ramp.
+ * Returns [r, g, b] each 0-255.
+ */
+function colormapValue(t, colorScale) {
+  const c = Math.max(0, Math.min(1, t));
+  if (colorScale === 'grayscale') {
+    const v = Math.round(c * 255);
+    return [v, v, v];
+  }
+  // 'heat': ramps red -> yellow -> white across three equal thirds.
+  const r = Math.min(255, Math.floor(255 * (c * 3)));
+  const g = Math.min(255, Math.floor(255 * Math.max(0, c * 3 - 1)));
+  const b = Math.min(255, Math.floor(255 * Math.max(0, c * 3 - 2)));
+  return [r, g, b];
+}
+
+/**
+ * Rasterize a generic PortableFigureDescription heatmap grid into a PNG,
+ * returned as a base64 data URI ready for an SVG <image> element. Purely
+ * mechanical (normalize + colorize); has no knowledge of what the grid
+ * values represent. See pluginTypes.ts for the row-major/orientation
+ * convention (grid row 0 == extent[2]/yMin; last row == extent[3]/yMax).
+ */
+async function rasterizeHeatmapToDataUri(heatmap) {
+  const { grid, width: gw, height: gh, colorScale } = heatmap;
+  const finite = finiteValues(grid);
+  // Manual min/max loop instead of Math.min(...)/Math.max(...): spreading
+  // large grids (e.g. 500x1000 = 500,000 values) into Math.min/max
+  // overflows the JS call stack (V8 argument limit).
+  let maxVal = 0;
+  let minVal = 0;
+  if (finite.length) {
+    maxVal = finite[0];
+    minVal = finite[0];
+    for (const v of finite) {
+      if (v > maxVal) maxVal = v;
+      if (v < minVal) minVal = v;
+    }
+  }
+  // Small floor above the minimum so sparse single-count noise pixels
+  // don't visually dominate/obscure the plot's actual structure — a
+  // generic default, not tuned to any specific plugin's data.
+  const floor = minVal + (maxVal - minVal) * 0.05;
+  const span = Math.max(maxVal - floor, 1e-12);
+
+  const buf = Buffer.alloc(gw * gh * 4);
+  for (let row = 0; row < gh; row++) {
+    // Flip vertically: grid row 0 = yMin (bottom) but PNG row 0 = image top.
+    const srcRow = gh - 1 - row;
+    for (let col = 0; col < gw; col++) {
+      const val = grid[srcRow * gw + col];
+      const idx = (row * gw + col) * 4;
+      if (!Number.isFinite(val) || val <= floor) {
+        buf[idx + 3] = 0; // transparent
+        continue;
+      }
+      const t = (val - floor) / span;
+      const [r, g, b] = colormapValue(t, colorScale);
+      buf[idx] = r;
+      buf[idx + 1] = g;
+      buf[idx + 2] = b;
+      buf[idx + 3] = 220;
+    }
+  }
+
+  const png = await sharp(buf, { raw: { width: gw, height: gh, channels: 4 } }).png().toBuffer();
+  return `data:image/png;base64,${png.toString('base64')}`;
+}
+
+/**
  * Render a PortableFigureDescription (see pluginTypes.ts) to an SVG string.
  * @param {import('./pluginTypes').PortableFigureDescription} desc
  * @param {{width?: number, height?: number}} [opts]
  * @returns {string} SVG markup
  */
-export function renderFigureToSvg(desc, opts = {}) {
+export async function renderFigureToSvg(desc, opts = {}) {
   const baseWidth = opts.width ?? DEFAULT_WIDTH;
   const baseHeight = opts.height ?? DEFAULT_HEIGHT;
 
@@ -127,8 +206,8 @@ export function renderFigureToSvg(desc, opts = {}) {
 
   const xData = desc.x?.data ?? [];
   const xFinite = finiteValues(xData);
-  const xMin = xFinite.length ? Math.min(...xFinite) : 0;
-  const xMax = xFinite.length ? Math.max(...xFinite) : 1;
+  let xMin = xFinite.length ? Math.min(...xFinite) : 0;
+  let xMax = xFinite.length ? Math.max(...xFinite) : 1;
   const allY = [];
   for (const s of desc.series ?? []) {
     for (const v of s.y) if (typeof v === 'number' && Number.isFinite(v)) allY.push(v);
@@ -154,6 +233,13 @@ export function renderFigureToSvg(desc, opts = {}) {
   if ((desc.markers ?? []).length) {
     yMax += (yMax - yMin) * 0.08;
   }
+  // A heatmap's extent is the authoritative domain (an exact data-space
+  // rectangle, e.g. an eye diagram's fixed voltage rails) — use it as-is,
+  // without the padding/headroom applied above for line-series domains.
+  if (desc.heatmap && Array.isArray(desc.heatmap.extent) && desc.heatmap.extent.length === 4) {
+    const [hx1, hx2, hy1, hy2] = desc.heatmap.extent;
+    xMin = hx1; xMax = hx2; yMin = hy1; yMax = hy2;
+  }
 
   const xSpan = xMax - xMin || 1;
   const ySpan = yMax - yMin || 1;
@@ -173,6 +259,21 @@ export function renderFigureToSvg(desc, opts = {}) {
       `<text x="${width / 2}" y="24" text-anchor="middle" font-size="16" font-family="sans-serif" fill="${COLORS.title}" font-weight="600">${escapeXml(
         desc.title
       )}</text>`
+    );
+  }
+
+  // Heatmap — a generic rasterized 2D grid (see pluginTypes.ts), drawn as
+  // the plot's background so series/markers/reference lines/areas layer
+  // on top of it, exactly like a plotted series would.
+  if (desc.heatmap && Array.isArray(desc.heatmap.grid) && desc.heatmap.grid.length > 0) {
+    const dataUri = await rasterizeHeatmapToDataUri(desc.heatmap);
+    const [hx1, hx2, hy1, hy2] = desc.heatmap.extent;
+    const imgX = toPx(hx1);
+    const imgYTop = toPy(hy2); // extent[3] (yMax) maps to the top of the image
+    const imgW = toPx(hx2) - toPx(hx1);
+    const imgH = toPy(hy1) - toPy(hy2); // extent[2] (yMin) maps to the bottom
+    parts.push(
+      `<image x="${imgX.toFixed(2)}" y="${imgYTop.toFixed(2)}" width="${imgW.toFixed(2)}" height="${imgH.toFixed(2)}" href="${dataUri}" preserveAspectRatio="none"/>`
     );
   }
 

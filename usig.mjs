@@ -1447,35 +1447,44 @@ function collectDisplayFields(plugin) {
 function fieldMatchesFilenameToken(field, token) {
   if (!field?.key || !token?.key) return false;
 
-  const fieldKey = normalizeMetadataKey(field.key);
-  if (!fieldKey) return false;
-
   const candidates = buildFilenameTokenCandidates(token);
 
-  // Direct match:
-  //
-  // filename: fs2p25ghz
-  // token:    fs + 2.25 + ghz
-  // field:    fsGhz
-  //
-  // => fsg hz == fsghz
-  if (candidates.has(fieldKey)) {
-    return true;
-  }
+  // A field may be reached either by its own key or by any declared alias
+  // (paramSchema[].aliases — the same list already used for CLI "-p" name
+  // validation/"did you mean" suggestions). Reusing aliases here lets a
+  // plugin author declare short/abbreviated filename tokens (e.g. "fin",
+  // "nfft") without inventing a second, filename-specific alias mechanism.
+  const names = [field.key, ...(Array.isArray(field.aliases) ? field.aliases : [])];
 
-  // Also allow a field key to carry a unit suffix while the filename
-  // token supplies that unit separately.
-  //
-  // This remains generic: no knowledge of "fs", "ghz", "v", etc.
-  if (token.unit) {
-    const unit = normalizeMetadataKey(token.unit);
+  for (const name of names) {
+    const fieldKey = normalizeMetadataKey(name);
+    if (!fieldKey) continue;
 
-    if (
-      fieldKey.endsWith(unit) &&
-      fieldKey.slice(0, -unit.length) ===
-        normalizeMetadataKey(token.key)
-    ) {
+    // Direct match:
+    //
+    // filename: fs2p25ghz
+    // token:    fs + 2.25 + ghz
+    // field:    fsGhz
+    //
+    // => fsghz == fsghz
+    if (candidates.has(fieldKey)) {
       return true;
+    }
+
+    // Also allow a field key/alias to carry a unit suffix while the
+    // filename token supplies that unit separately.
+    //
+    // This remains generic: no knowledge of "fs", "ghz", "v", etc.
+    if (token.unit) {
+      const unit = normalizeMetadataKey(token.unit);
+
+      if (
+        fieldKey.endsWith(unit) &&
+        fieldKey.slice(0, -unit.length) ===
+          normalizeMetadataKey(token.key)
+      ) {
+        return true;
+      }
     }
   }
 
@@ -1494,6 +1503,36 @@ function resolveFilenameTokenForField(field, filename) {
       value = token.value;
     } else {
       continue;
+    }
+
+    // Compact-form tokens (no explicit '~' separator) encode <key><digits>
+    // e.g. "prbs2". For non-numeric (text/enum) fields the digit suffix
+    // alone is meaningless in isolation — the field expects the whole
+    // descriptive token (e.g. "prbs2"), not just "2". Numeric fields still
+    // want the extracted numeric value (e.g. fin0p59993ghz -> 0.59993).
+    // Explicit '~' tokens (e.g. "tonemode~single") are unaffected: their
+    // value already excludes the key.
+    //
+    // Field "text-ness" is inferred generically (works for both
+    // manifest.paramSchema fields and legacy paramFields entries, which
+    // have different shapes):
+    //   - manifest.paramSchema: explicit `type: 'text'` (or 'boolean').
+    //   - paramFields: an enum/options list or a string defaultValue
+    //     signals a non-numeric field (numeric paramFields never set
+    //     `options`/a string defaultValue).
+    const isTextLikeField =
+      field.type === 'text' ||
+      field.type === 'boolean' ||
+      (Array.isArray(field.options) && field.options.length > 0) ||
+      typeof field.defaultValue === 'string';
+    const usedExplicitSeparator = token.token.includes('~');
+    if (isTextLikeField && !usedExplicitSeparator) {
+      return {
+        value: token.token,
+        source: 'filename',
+        token: token.token,
+        unit: token.unit ?? '',
+      };
     }
 
     let normalized = String(value);
@@ -2390,10 +2429,6 @@ async function runConversionMode({
 }
 
 function resolvePluginId(pluginId) {
-  if (pluginId === 'hsio') {
-    console.warn('[usig] WARNING: plugin "hsio" is deprecated; using "hsioalpha"');
-    return 'hsioalpha';
-  }
   return pluginId;
 }
 
@@ -4008,7 +4043,7 @@ if (args.length === 0) {
           process.exitCode = 3;
           return;
         }
-        const svg = renderFigureToSvg(desc);
+        const svg = await renderFigureToSvg(desc);
         const ext = (path.extname(targetPath).toLowerCase().replace('.', '')) || 'svg';
 
         const shouldWrite = await confirmOutputOverwrite(targetPath, overwrite);

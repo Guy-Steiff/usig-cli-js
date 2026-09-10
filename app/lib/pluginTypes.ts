@@ -207,6 +207,38 @@ export interface PortableFigureDescription {
     label: string;
     value: string;
   }>;
+  /**
+   * Optional 2D density/raster plot — a generic grid-based visual
+   * primitive for any plugin whose figure is fundamentally a 2D grid
+   * rather than an x/y line series (e.g. eye diagrams, spectrograms, 2D
+   * histograms/heatmaps). Deliberately generic: the renderer only knows
+   * how to normalize and colorize a numeric grid onto a data-space
+   * extent — it has no idea what the grid values represent.
+   *
+   * When present, the heatmap is drawn first (as the plot's background
+   * raster); series/markers/referenceLines/referenceAreas are layered on
+   * top using the same coordinate mapping as the rest of the figure.
+   *
+   * Row-major layout convention (matches common "origin at bottom-left"
+   * scientific-plot / image conventions, e.g. numpy's `origin='lower'`):
+   * `grid[0..width-1]` is the FIRST row and maps to `extent[2]` (yMin);
+   * the LAST row maps to `extent[3]` (yMax). Renderers must flip rows
+   * when rasterizing top-down.
+   */
+  heatmap?: {
+    /** Row-major grid values, length === width * height. Plugins may
+     * pre-scale values (e.g. log10) however is meaningful for their data;
+     * the renderer only normalizes min→max for colorization. */
+    grid: number[];
+    /** Number of columns in the grid. */
+    width: number;
+    /** Number of rows in the grid. */
+    height: number;
+    /** Data-space extent the grid maps onto: [xMin, xMax, yMin, yMax]. */
+    extent: [number, number, number, number];
+    /** Optional generic color-scale hint (not domain-specific). Defaults to 'heat'. */
+    colorScale?: 'heat' | 'grayscale';
+  };
 }
 
 
@@ -422,6 +454,14 @@ export interface InferredParamField {
   regexTitle?: string;
   /** Optional: tooltip shown on the replace input. */
   replaceTitle?: string;
+  /**
+   * Optional: alternate names this field is also known by.
+   * Mirrors `paramSchema[].aliases` — consulted by the generic CLI
+   * filename-token inference (usig.mjs) and unknown-parameter validation
+   * so a plugin can declare short/abbreviated filename tokens (e.g. "fin",
+   * "nfft") without a second, field-type-specific alias mechanism.
+   */
+  aliases?: string[];
   /**
    * Optional transform: raw extracted string → stored value.
    * If omitted, the raw string is stored as-is.

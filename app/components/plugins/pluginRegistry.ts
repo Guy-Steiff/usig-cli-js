@@ -27,14 +27,13 @@
 import { Plugin } from '../../lib/pluginTypes';
 import { sinlPlugin }        from './sinlPlugin';        // signal: Sine INL/DNL
 import { smeasPlugin }       from './smeasPlugin';       // signal: FFT Spectrum
-import { hsioalphaPlugin }        from './hsioalphaPlugin';        // signal: HSIO Eye Diagram
-// import { hsioPlugin }        from './hsioPlugin';        // signal: HSIO Eye & Jitter
+import { hsioPlugin }        from './hsioPlugin';        // signal: HSIO Eye Diagram
 // import { minimalPlugin }     from './minimalPlugin';     // template: bare minimum
 // import { minimalPlotPlugin } from './minimalPlotPlugin'; // template: minimum + figure
 
 // const BUILTIN_PLUGINS: Plugin<any>[] = [sinlPlugin, smeasPlugin, hsioPlugin, minimalPlugin, minimalPlotPlugin]; // eslint-disable-line @typescript-eslint/no-explicit-any
 // const BUILTIN_PLUGINS: Plugin<any>[] = [sinlPlugin, smeasPlugin, minimalPlugin, minimalPlotPlugin]; // eslint-disable-line @typescript-eslint/no-explicit-any
-const BUILTIN_PLUGINS: Plugin<any>[] = [sinlPlugin, smeasPlugin, hsioalphaPlugin]; // eslint-disable-line @typescript-eslint/no-explicit-any
+const BUILTIN_PLUGINS: Plugin<any>[] = [sinlPlugin, smeasPlugin, hsioPlugin]; // eslint-disable-line @typescript-eslint/no-explicit-any
 
 // Runtime-registered plugins (user-uploaded or future marketplace installs)
 // eslint-disable-next-line @typescript-eslint/no-explicit-any

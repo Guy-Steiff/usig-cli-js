@@ -733,6 +733,8 @@ import {
   type InferredParamField,
   type PluginFigure,
   type PluginDebugTable,
+  type PortableFigureDescription,
+  type WaveformPacket,
 } from '../../lib/pluginTypes';
 
 interface hsioParams {
@@ -742,6 +744,20 @@ interface hsioParams {
   signalType: string;
   vtThreshold: number | string;
   eyeSamples: number | string;
+  berTarget: number | string;
+  // Informational-only fields captured from golden HSIO filenames
+  // (e.g. prbs2_finnoncoh600p00mhz_fin0p59993ghz_fs100p00ghz_nfft4194304_
+  //  rjstd0p00ps_pjamp0p00ps_pjfreq1p00Mhz_sscamp0p00ps_sscfreq100p00khz_
+  //  noisestd1p0mv). These describe the synthetic jitter/noise injected
+  // when the golden file was generated — they are NOT consumed by
+  // analyzehsio()/computeJitter() and must never be confused with the
+  // real computed jitter outputs (rjSigmaPs, pjFreqMhz, etc.).
+  rjStdTargetPs: number | string;
+  pjAmpTargetPs: number | string;
+  pjFreqTargetMhz: number | string;
+  sscAmpTargetPs: number | string;
+  sscFreqTargetKhz: number | string;
+  noiseStdTargetMv: number | string;
 }
 
 interface hsioFigureData {
@@ -755,6 +771,46 @@ interface hsioFigureData {
   fsHz: number;
   fileName: string;
   status: string;
+  // ── Jitter decomposition / bathtub / SSC (additive; optional — omitted
+  // when jitter computation fails or is skipped, see analyzehsio()). ──────
+  tieDisplayPs?: number[];
+  tieResidualPs?: number[];
+  tieBinsPs?: number[];
+  tieCounts?: number[];
+  tjRmsPs?: number;
+  tjPkpkPs?: number;
+  rjSigmaPs?: number;
+  pjPkpkPs?: number;
+  pjFreqMhz?: number;
+  dcdPs?: number;
+  ujPkpkPs?: number;
+  ddjPkpkPs?: number;
+  ddjProfileRunLengths?: number[];
+  ddjProfileRisingPs?: number[];
+  ddjProfileFallingPs?: number[];
+  nEdgesJitter?: number;
+  // Bathtub
+  bathtubXUi?: number[];
+  bathtubLogBer?: number[];
+  bathtubEmpLogBer?: number[];
+  bathtubBerTarget?: number;
+  bathtubDdMarginPctUi?: number;
+  bathtubEmpMarginPctUi?: number;
+  // SSC / wander
+  sscWanderTimeUs?: number[];
+  sscWanderPs?: number[];
+  sscSwingPpm?: number;
+  // Set when jitter computation threw and was caught (eye-diagram outputs
+  // above remain valid/unaffected).
+  jitterStatus?: string;
+}
+
+/** Ingestion hints so the pipeline selects the correct CSV/XLSX column
+ * (mirrors smeasIngestHints / sinlPlugin's column-select convention). */
+function hsioIngestHints(params: hsioParams): import('../../lib/ingest').IngestHints {
+  return {
+    signalColumn: params.signalColumn?.trim() || undefined,
+  };
 }
 
 const manifest: PluginManifest = {
@@ -768,12 +824,96 @@ const manifest: PluginManifest = {
   reportTitle: 'hsio Eye Diagram Analysis',
   category: 'signal',
   paramSchema: [
-    { key: 'signalColumn', label: 'Signal Column', type: 'column-select', required: true, description: 'CSV column with time-domain voltage samples.' },
-    { key: 'uiRateGbps', label: 'Bit Rate (Gbps)', type: 'number', required: true, description: 'Nominal bit rate used for UI folding.' },
-    { key: 'fsGhz', label: 'Sample Rate (GHz)', type: 'number', required: true, description: 'Acquisition sample rate.' },
-    { key: 'signalType', label: 'Signal Type', type: 'text', required: false, description: 'clock | prbs7 | prbs31 (or similar).' },
-    { key: 'vtThreshold', label: 'Voltage Threshold (V)', type: 'number', required: false, description: 'Threshold for edge extraction. 0 = auto.' },
-    { key: 'eyeSamples', label: 'Eye Fold Samples', type: 'number', required: false, description: 'Maximum samples folded into eye grid.' },
+    { key: 'signalColumn', label: 'Signal Column', type: 'column-select', required: true, description: 'CSV column with time-domain voltage samples.', aliases: ['sample', 'samples', 'voltage', 'voltageColumn'] },
+    { key: 'uiRateGbps', label: 'Bit Rate (Gbps)', type: 'number', required: true, description: 'Nominal bit rate used for UI folding.', aliases: ['bitRate', 'dataRate', 'uiRate', 'fin'], unit: 'Gbps' },
+    { key: 'fsGhz', label: 'Sample Rate (GHz)', type: 'number', required: true, description: 'Acquisition sample rate.', aliases: ['fs', 'samplingFrequency', 'sampleRate'], unit: 'GHz' },
+    { key: 'signalType', label: 'Signal Type', type: 'text', required: false, description: 'clock | prbs7 | prbs31 (or similar).', aliases: ['pattern', 'patternType', 'prbs'] },
+    { key: 'vtThreshold', label: 'Voltage Threshold (V)', type: 'number', required: false, description: 'Threshold for edge extraction. 0 = auto.', aliases: ['threshold', 'vth'], unit: 'V' },
+    { key: 'eyeSamples', label: 'Eye Fold Samples', type: 'number', required: false, description: 'Maximum samples folded into eye grid.', aliases: ['maxFoldSamples', 'nfft'] },
+    { key: 'berTarget', label: 'BER Target', type: 'text', required: false, description: 'Target bit-error-rate used for bathtub-curve extrapolation.', aliases: ['ber'] },
+    // Informational-only fields captured from golden HSIO filenames.
+    // These describe the synthetic jitter/noise injected when the golden
+    // file was generated. They are recognized/displayed but never fed
+    // into analyzehsio()/computeJitter() as analysis inputs.
+    { key: 'rjStdTargetPs', label: 'RJ Std (target, ps)', type: 'number', required: false, description: 'Informational: random-jitter sigma used to synthesize the golden file.', aliases: ['rjstd'], unit: 'ps' },
+    { key: 'pjAmpTargetPs', label: 'PJ Amplitude (target, ps)', type: 'number', required: false, description: 'Informational: periodic-jitter amplitude used to synthesize the golden file.', aliases: ['pjamp'], unit: 'ps' },
+    { key: 'pjFreqTargetMhz', label: 'PJ Frequency (target, MHz)', type: 'number', required: false, description: 'Informational: periodic-jitter frequency used to synthesize the golden file.', aliases: ['pjfreq'], unit: 'MHz' },
+    { key: 'sscAmpTargetPs', label: 'SSC Amplitude (target, ps)', type: 'number', required: false, description: 'Informational: spread-spectrum-clocking wander amplitude used to synthesize the golden file.', aliases: ['sscamp'], unit: 'ps' },
+    { key: 'sscFreqTargetKhz', label: 'SSC Frequency (target, kHz)', type: 'number', required: false, description: 'Informational: spread-spectrum-clocking modulation frequency used to synthesize the golden file.', aliases: ['sscfreq'], unit: 'kHz' },
+    { key: 'noiseStdTargetMv', label: 'Noise Std (target, mV)', type: 'number', required: false, description: 'Informational: additive-noise sigma used to synthesize the golden file.', aliases: ['noisestd'], unit: 'mV' },
+  ],
+
+  // Declarative debug table capabilities. Lightweight metadata only —
+  // prepareData() still generates the actual PluginDebugTable objects at
+  // runtime (see SMEAS/SINL convention).
+  debugTables: [
+    {
+      id: 'eye_metadata',
+      label: 'Eye metadata',
+      description: 'Scalar eye-diagram metrics (edge count, UI, height, width) as a key/value table.',
+      columns: ['key', 'value'],
+    },
+    {
+      id: 'jitter_metrics',
+      label: 'Jitter metrics',
+      description: 'Scalar jitter-decomposition metrics (TJ rms/pk-pk, RJ sigma, DJ pk-pk, PJ pk-pk/freq, DCD, UJ, N edges) as a key/value table.',
+      columns: ['key', 'value'],
+    },
+    {
+      id: 'jitter_tie_histogram',
+      label: 'TIE histogram',
+      description: '64-bin TIE (time-interval-error) histogram: bin center (ps) and count.',
+      columns: ['tie_bin_ps', 'count'],
+    },
+    {
+      id: 'jitter_tie_series',
+      label: 'TIE time series',
+      description: 'Downsampled TIE time series (ps) alongside the TIE residual (TIE minus synthesized periodic-jitter component).',
+      columns: ['tie_ps', 'tie_residual_ps'],
+    },
+    {
+      id: 'jitter_ddj_profile',
+      label: 'DDJ profile',
+      description: 'Data-dependent-jitter profile: per bit-history-state (or run-length fallback) mean TIE, rising/falling.',
+      columns: ['state_or_run_length', 'tie_rising_ps', 'tie_falling_ps'],
+    },
+    {
+      id: 'bathtub_curve',
+      label: 'Bathtub curve',
+      description: 'Dual-Dirac and empirical bathtub-curve log10(BER) vs. UI phase.',
+      columns: ['x_ui', 'dd_log_ber', 'emp_log_ber'],
+    },
+    {
+      id: 'ssc_wander',
+      label: 'SSC / wander',
+      description: 'Spread-spectrum-clocking / wander profile: low-pass-filtered TIE (wander, ps) vs. time (us).',
+      columns: ['time_us', 'wander_ps'],
+    },
+  ],
+
+  // Declarative figure capabilities. Safe to enumerate via `-figure list`
+  // without ingesting an input.
+  figures: [
+    {
+      id: 'eye',
+      label: 'Eye Diagram',
+      description: '2D folded eye density diagram (voltage vs. UI phase), with 0/1 UI boundary reference lines.',
+    },
+    {
+      id: 'jitter',
+      label: 'Jitter Decomposition',
+      description: 'TIE histogram with dual-Dirac/DDJ/PJ scalar jitter metrics in the results panel (see the jitter_tie_series/jitter_ddj_profile debug tables for the full time-series/DDJ data).',
+    },
+    {
+      id: 'bathtub',
+      label: 'Bathtub Curve',
+      description: 'Dual-Dirac (solid) and empirical (dashed) bathtub curves (log10(BER) vs. UI phase) with BER-target reference line and margins.',
+    },
+    {
+      id: 'ssc',
+      label: 'SSC Profile',
+      description: 'Spread-spectrum-clocking / wander profile (ps vs. time), with SSC swing (ppm) in the results panel.',
+    },
   ],
 };
 
@@ -802,7 +942,8 @@ const paramFields: InferredParamField[] = [
     max: 224,
     step: 0.1,
     unit: 'Gbps',
-    title: 'Nominal bit rate used to fold the eye. Auto-extracted from finused…MHz/GHz in filename.',
+    aliases: ['fin'],
+    title: 'Nominal bit rate used to fold the eye. Auto-extracted from finused…MHz/GHz in filename, or fin…ghz (e.g. fin0p59993ghz → 0.59993 Gbps).',
     transform: (raw: string) => {
       // raw is "digits.digits unit" e.g. "599.93mhz" or "10.00ghz"
       // applyRegexToFilename joins group1.group2 then appends group3 if available
@@ -826,6 +967,7 @@ const paramFields: InferredParamField[] = [
     max: 500,
     step: 1,
     unit: 'GHz',
+    aliases: ['fs'],
     title: 'Acquisition sample rate. Auto-extracted from fs…GHz in filename.',
   },
   {
@@ -840,12 +982,8 @@ const paramFields: InferredParamField[] = [
       ...Array.from({ length: 29 }, (_, i) => `prbs${i + 3}`),
     ],
     selectStyle: 'dropdown' as const,
-    title: 'prbs2/clock: rising edges only (1010… pattern). PRBS-N (N≥3): both edges.',
-    transform: (raw: string) => {
-      const s = raw.trim().toLowerCase();
-      if (s === 'clock' || s === 'prbs2') return 'prbs2/clock';
-      return s;
-    },
+    aliases: ['prbs'],
+    title: 'prbs2/clock: rising edges only (1010… pattern). PRBS-N (N≥3): both edges. Auto-extracted from the filename\'s prbsN token (e.g. prbs2 → "prbs2"); analyzehsio() already normalizes prbs2/clock/"prbs2" identically.',
   },
   {
     key: 'vtThreshold',
@@ -867,7 +1005,88 @@ const paramFields: InferredParamField[] = [
     min: 1000,
     max: 2000000,
     step: 10000,
-    title: 'Upper bound on folded eye samples',
+    aliases: ['nfft'],
+    title: 'Upper bound on folded eye samples. Auto-extracted from nfft… in filename.',
+  },
+  {
+    key: 'berTarget',
+    label: 'BER Target',
+    defaultScope: 'global',
+    defaultRegex: '',
+    defaultReplace: '',
+    defaultValue: '1e-12',
+    aliases: ['ber'],
+    title: 'Target bit-error-rate used for dual-Dirac bathtub-curve extrapolation.',
+  },
+  // ── Informational-only fields extracted from golden HSIO filenames ──────
+  // These describe the synthetic jitter/noise injected when the golden
+  // file was generated. Recognized/displayed only — never fed into
+  // analyzehsio()/computeJitter() as analysis inputs.
+  {
+    key: 'rjStdTargetPs',
+    label: 'RJ Std (target)',
+    defaultScope: 'global',
+    defaultRegex: '',
+    defaultReplace: '',
+    defaultValue: 0,
+    unit: 'ps',
+    aliases: ['rjstd'],
+    title: 'Informational: random-jitter sigma used to synthesize the golden file.',
+  },
+  {
+    key: 'pjAmpTargetPs',
+    label: 'PJ Amplitude (target)',
+    defaultScope: 'global',
+    defaultRegex: '',
+    defaultReplace: '',
+    defaultValue: 0,
+    unit: 'ps',
+    aliases: ['pjamp'],
+    title: 'Informational: periodic-jitter amplitude used to synthesize the golden file.',
+  },
+  {
+    key: 'pjFreqTargetMhz',
+    label: 'PJ Frequency (target)',
+    defaultScope: 'global',
+    defaultRegex: '',
+    defaultReplace: '',
+    defaultValue: 0,
+    unit: 'MHz',
+    aliases: ['pjfreq'],
+    title: 'Informational: periodic-jitter frequency used to synthesize the golden file.',
+  },
+  {
+    key: 'sscAmpTargetPs',
+    label: 'SSC Amplitude (target)',
+    defaultScope: 'global',
+    defaultRegex: '',
+    defaultReplace: '',
+    defaultValue: 0,
+    unit: 'ps',
+    aliases: ['sscamp'],
+    title: 'Informational: spread-spectrum-clocking wander amplitude used to synthesize the golden file.',
+  },
+  {
+    key: 'sscFreqTargetKhz',
+    label: 'SSC Frequency (target)',
+    defaultScope: 'global',
+    defaultRegex: '',
+    defaultReplace: '',
+    defaultValue: 0,
+    unit: 'kHz',
+    aliases: ['sscfreq'],
+    title: 'Informational: spread-spectrum-clocking modulation frequency used to synthesize the golden file.',
+  },
+  {
+    key: 'noiseStdTargetMv',
+    label: 'Noise Std (target)',
+    defaultScope: 'global',
+    defaultRegex: '',
+    defaultReplace: '',
+    defaultValue: 0,
+    unit: 'mV',
+    aliases: ['noisestd'],
+    title: 'Informational: additive-noise sigma used to synthesize the golden file.',
   },
 ];
 
@@ -878,18 +1097,14 @@ const defaultParams: hsioParams = {
   signalType: 'prbs2/clock',
   vtThreshold: 0,
   eyeSamples: 200000,
+  berTarget: '1e-12',
+  rjStdTargetPs: 0,
+  pjAmpTargetPs: 0,
+  pjFreqTargetMhz: 0,
+  sscAmpTargetPs: 0,
+  sscFreqTargetKhz: 0,
+  noiseStdTargetMv: 0,
 };
-
-function parseSimpleCsv(text: string): { headers: string[]; rows: string[][] } {
-  const lines = text
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0);
-  if (lines.length < 2) return { headers: [], rows: [] };
-  const headers = lines[0].split(',').map((h) => h.trim().replace(/^"|"$/g, ''));
-  const rows = lines.slice(1).map((l) => l.split(',').map((c) => c.trim().replace(/^"|"$/g, '')));
-  return { headers, rows };
-}
 
 function median(vals: number[]): number {
   if (vals.length === 0) return 0;
@@ -901,8 +1116,16 @@ function median(vals: number[]): number {
 function autoDetectVth(samples: number[]): number {
   if (samples.length < 2) return 0;
   const nBins = 200;
-  const mn = Math.min(...samples);
-  const mx = Math.max(...samples);
+  // Manual min/max loop instead of Math.min(...samples)/Math.max(...samples):
+  // spreading large sample arrays into Math.min/max overflows the JS call
+  // stack (V8 argument limit). Numerically identical result, just safe for
+  // large N.
+  let mn = samples[0];
+  let mx = samples[0];
+  for (const v of samples) {
+    if (v < mn) mn = v;
+    if (v > mx) mx = v;
+  }
   const span = mx - mn;
   if (span <= 1e-15) return mn;
   const w = span / nBins;
@@ -943,6 +1166,596 @@ function extractEdges(samples: number[], fsHz: number, vth: number, risingOnly: 
     out.push((i - 1 + frac) * dt);
   }
   return out;
+}
+
+/**
+ * extractEdgesWithPolarity — same as extractEdges but also returns
+ * rising(+1)/falling(-1) polarity per edge. Ported VERBATIM from
+ * hsioalphaPlugin.tsx (legacy reference implementation); numerically
+ * identical to extractEdges (confirmed by inspection — same threshold
+ * crossing / linear-interpolation arithmetic).
+ */
+function extractEdgesWithPolarity(
+  samples: number[], fsHz: number, vth: number, risingOnly: boolean,
+): { times: number[]; pols: Int8Array } {
+  const times: number[] = [];
+  const polsArr: number[] = [];
+  const dt = 1 / fsHz;
+  for (let i = 1; i < samples.length; i++) {
+    const v0 = samples[i - 1], v1 = samples[i];
+    const rising  = v0 <  vth && v1 >= vth;
+    const falling = !risingOnly && v0 >= vth && v1 < vth;
+    if (!(rising || falling)) continue;
+    const den  = v1 - v0;
+    const frac = Math.abs(den) < 1e-15 ? 0 : (vth - v0) / den;
+    times.push((i - 1 + frac) * dt);
+    polsArr.push(rising ? 1 : -1);
+  }
+  return { times, pols: new Int8Array(polsArr) };
+}
+
+// ── Jitter analysis helpers (ported VERBATIM from hsioalphaPlugin.tsx) ──────
+
+/**
+ * normPpf — inverse normal CDF (probit function).
+ * Peter Acklam's rational approximation; max error ~1.15e-9.
+ * Matches scipy.stats.norm.ppf used in shio.py _dual_dirac / _compute_uj.
+ */
+function normPpf(p: number): number {
+  if (p <= 0) return -Infinity;
+  if (p >= 1) return Infinity;
+  // Coefficients
+  const a = [-3.969683028665376e+01, 2.209460984245205e+02,
+             -2.759285104469687e+02, 1.383577518672690e+02,
+             -3.066479806614716e+01, 2.506628277459239e+00];
+  const b = [-5.447609879822406e+01, 1.615858368580409e+02,
+             -1.556989798598866e+02, 6.680131188771972e+01,
+             -1.328068155288572e+01];
+  const c = [-7.784894002430293e-03, -3.223964580411365e-01,
+             -2.400758277161838e+00, -2.549732539343734e+00,
+              4.374664141464968e+00,  2.938163982698783e+00];
+  const d = [ 7.784695709041462e-03,  3.224671290700398e-01,
+              2.445134137142996e+00,  3.754408661907416e+00];
+  const pLow = 0.02425, pHigh = 1 - pLow;
+  let q: number;
+  if (p < pLow) {
+    q = Math.sqrt(-2 * Math.log(p));
+    return (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) /
+           ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1);
+  } else if (p <= pHigh) {
+    q = p - 0.5;
+    const r = q * q;
+    return (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*q /
+           (((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r+1);
+  } else {
+    q = Math.sqrt(-2 * Math.log(1 - p));
+    return -(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) /
+             ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1);
+  }
+}
+
+/**
+ * erfc — complementary error function, Horner polynomial approximation.
+ * Max error ≈ 1.5e-7. Matches scipy.special.erfc used in shio.py bathtub.
+ */
+function erfc(x: number): number {
+  const t = 1.0 / (1.0 + 0.3275911 * Math.abs(x));
+  const poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+  const res = poly * Math.exp(-x * x);
+  return x >= 0 ? res : 2.0 - res;
+}
+/** Q(z) = 0.5 * erfc(z / sqrt(2))  — complementary Gaussian CDF */
+const qFunc = (z: number) => 0.5 * erfc(z / Math.SQRT2);
+
+/**
+ * dualDiracFit — Q-scale tail fitting matching shio.py _dual_dirac.
+ *
+ * Sorts the TIE array, assigns plotting positions (i+0.5)/N → Q-scale values
+ * via normPpf, then fits linear models to the left and right Gaussian tails.
+ * The slope average gives RJ sigma; the intercept difference gives DJ pk-pk.
+ *
+ * Tail selection: data beyond ±2σ_robust from the median (threshold-based),
+ * falling back to percentile-based selection when the threshold yields too few points.
+ * Exactly mirrors shio.py _dual_dirac(tie, tail_sigma=2.0, min_tail_count=200).
+ */
+function dualDiracFit(tie: number[]): { rjSigmaPs: number; djPkpkPs: number } {
+  const n = tie.length;
+  // Fallback to std for tiny arrays
+  if (n < 40) {
+    let s = 0, s2 = 0;
+    for (const v of tie) { s += v; s2 += v * v; }
+    const mu = s / n;
+    return { rjSigmaPs: Math.sqrt(Math.max(0, s2 / n - mu * mu)) * 1e12, djPkpkPs: 0 };
+  }
+
+  // Sort a copy
+  const sorted = Float64Array.from(tie).sort();
+
+  // Robust sigma (1.4826 × MAD) to set the tail threshold
+  const medIdx1 = (n - 1) >> 1, medIdx2 = n >> 1;
+  const med = n % 2 ? sorted[medIdx1] : 0.5 * (sorted[medIdx1] + sorted[medIdx2]);
+  const mads = Float64Array.from(sorted, v => Math.abs(v - med)).sort();
+  const madVal = n % 2 ? mads[medIdx1] : 0.5 * (mads[medIdx1] + mads[medIdx2]);
+  const robustSigma = Math.max(1.4826 * madVal, 1e-30);
+  const threshold = 2.0 * robustSigma;  // tail_sigma = 2.0
+
+  // Plotting positions (Hazen) → Q-values
+  const qVals = new Float64Array(n);
+  for (let i = 0; i < n; i++) qVals[i] = normPpf((i + 0.5) / n);
+
+  // Tail extent by threshold
+  let leftEnd = 0, rightStart = n;
+  for (let i = 0; i < n; i++) { if (sorted[i] >= med - threshold) { leftEnd = i; break; } }
+  for (let i = n - 1; i >= 0; i--) { if (sorted[i] <= med + threshold) { rightStart = i + 1; break; } }
+
+  // Fallback: percentile-based tails when threshold gives too few points
+  const minPts = Math.max(5, Math.min(50, Math.floor(n / 20)));
+  if (leftEnd < minPts || (n - rightStart) < minPts) {
+    const tailN = Math.max(minPts, Math.floor(n * Math.max(0.01, Math.min(0.10, 1000 / n))));
+    leftEnd = tailN;
+    rightStart = n - tailN;
+  }
+
+  // Linear least-squares: t = slope*q + intercept
+  const linFit = (start: number, end: number): [number, number] => {
+    const cnt = end - start;
+    if (cnt < 2) return [0, 0];
+    let sx = 0, sy = 0, sxx = 0, sxy = 0;
+    for (let i = start; i < end; i++) {
+      sx += qVals[i]; sy += sorted[i]; sxx += qVals[i] * qVals[i]; sxy += qVals[i] * sorted[i];
+    }
+    const det = cnt * sxx - sx * sx;
+    if (Math.abs(det) < 1e-40) return [0, sy / cnt];
+    return [(cnt * sxy - sx * sy) / det, (sy * sxx - sx * sxy) / det];
+  };
+
+  const [lSlope, lIntercept] = linFit(0, leftEnd);
+  const [rSlope, rIntercept] = linFit(rightStart, n);
+
+  // RJ sigma = average of tail slopes, capped by std
+  let s = 0, s2 = 0;
+  for (const v of tie) { s += v; s2 += v * v; }
+  const mu = s / n;
+  const stdVal = Math.sqrt(Math.max(0, s2 / n - mu * mu));
+  const rjSigma = Math.min((Math.abs(lSlope) + Math.abs(rSlope)) / 2.0, stdVal);
+
+  // DJ pk-pk = intercept difference (same as shio.py dj_pkpk = |rfit[1] - lfit[1]|)
+  const djPkpk = Math.abs(rIntercept - lIntercept);
+
+  return { rjSigmaPs: rjSigma * 1e12, djPkpkPs: djPkpk * 1e12 };
+}
+
+/** Radix-2 Cooley-Tukey FFT in-place.  Length must be a power of 2. */
+function fftInPlace(re: Float64Array, im: Float64Array): void {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      let t = re[i]; re[i] = re[j]; re[j] = t;
+      t = im[i]; im[i] = im[j]; im[j] = t;
+    }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = -2 * Math.PI / len;
+    const wRe = Math.cos(ang), wIm = Math.sin(ang);
+    for (let i = 0; i < n; i += len) {
+      let cRe = 1, cIm = 0;
+      for (let k = 0; k < (len >> 1); k++) {
+        const uRe = re[i + k], uIm = im[i + k];
+        const half = i + k + (len >> 1);
+        const vRe = cRe * re[half] - cIm * im[half];
+        const vIm = cRe * im[half] + cIm * re[half];
+        re[i + k] = uRe + vRe; im[i + k] = uIm + vIm;
+        re[half]  = uRe - vRe; im[half]  = uIm - vIm;
+        const nr = cRe * wRe - cIm * wIm;
+        cIm = cRe * wIm + cIm * wRe; cRe = nr;
+      }
+    }
+  }
+}
+
+/**
+ * computeJitter — shio.py-style jitter decomposition in TypeScript.
+ * Ported VERBATIM from hsioalphaPlugin.tsx (legacy reference implementation).
+ *
+ * Pipeline (mirrors shio.py analyze()):
+ *   1. TIE = edge_time − (t0 + round(Δt/UI) × UI)
+ *   2. Linear detrend (removes frequency offset / slow drift)
+ *   3. TJ rms / pk-pk from detrended TIE
+ *   4. RJ σ via dual-Dirac Q-scale tail fitting (matches shio.py _dual_dirac)
+ *   5. Histogram (64 bins, matches shio.py)
+ *   6. PJ via Hann-windowed FFT → dominant spectral tone
+ *   7. DCD from rising vs falling TIE means (before de-skewing)
+ *   8. DDJ via N-bit history grouping (matches shio.py _estimate_ddj_history style)
+ *   9. UJ @ BER=1e-6 via dual-Dirac: 2 × Q⁻¹(BER/2) × RJ + DJ
+ *
+ * @param rawSamples  optional raw waveform for bit-history DDJ computation
+ * @param fsHz        optional sample rate (Hz) for bit-history DDJ computation
+ * @param vth         optional voltage threshold for bit-history DDJ computation
+ */
+function computeJitter(
+  edges:      number[],
+  pols:       Int8Array | null,
+  uiSec:      number,
+  isClockSig: boolean,
+  edgeRateHz: number,
+  rawSamples?: number[],
+  fsHz_opt?:   number,
+  vth_opt?:    number,
+  berTarget?:  number,
+): {
+  tieDisplayPs: number[]; tieResidualPs: number[];
+  tieBinsPs: number[]; tieCounts: number[];
+  tjRmsPs: number; tjPkpkPs: number; rjSigmaPs: number;
+  pjPkpkPs: number; pjFreqMhz: number;
+  dcdPs: number; ujPkpkPs: number; ddjPkpkPs: number;
+  ddjProfileRunLengths: number[];
+  ddjProfileRisingPs: number[];
+  ddjProfileFallingPs: number[];
+  bathtubXUi: number[]; bathtubLogBer: number[]; bathtubEmpLogBer: number[];
+  bathtubDdMarginPctUi: number; bathtubEmpMarginPctUi: number;
+  sscWanderTimeUs: number[]; sscWanderPs: number[]; sscSwingPpm: number;
+} {
+  const ber = berTarget ?? 1e-12;
+  const EMPTY = {
+    tieDisplayPs: [], tieResidualPs: [], tieBinsPs: [], tieCounts: [],
+    tjRmsPs: 0, tjPkpkPs: 0, rjSigmaPs: 0,
+    pjPkpkPs: 0, pjFreqMhz: 0, dcdPs: 0, ujPkpkPs: 0, ddjPkpkPs: 0,
+    ddjProfileRunLengths: [] as number[],
+    ddjProfileRisingPs:   [] as number[],
+    ddjProfileFallingPs:  [] as number[],
+    bathtubXUi: [] as number[], bathtubLogBer: [] as number[], bathtubEmpLogBer: [] as number[],
+    bathtubDdMarginPctUi: 0, bathtubEmpMarginPctUi: 0,
+    sscWanderTimeUs: [] as number[], sscWanderPs: [] as number[], sscSwingPpm: 0,
+  };
+  if (edges.length < 8) return EMPTY;
+
+  // ── Step 1: TIE (seconds) — USE ROUND-HALF-EVEN to match numpy.round ────────
+  // JavaScript's Math.round uses round-half-up: Math.round(0.5) = 1.
+  // Python's numpy.round uses banker's rounding: np.round(0.5) = 0.
+  // For edges near exactly ±0.5 UI the assignment can differ.
+  // Implement round-half-to-even to exactly match shio.py's _compute_tie.
+  const roundHalfEven = (x: number): number => {
+    const fl = Math.floor(x), frac = x - fl;
+    if (frac !== 0.5) return Math.round(x);
+    return fl % 2 === 0 ? fl : fl + 1;   // round to even
+  };
+  const t0 = edges[0];
+  const tieRaw = edges.map(t => {
+    const nu = roundHalfEven((t - t0) / uiSec);
+    return t - (t0 + nu * uiSec);
+  });
+  const n = tieRaw.length;
+
+  // ── Step 2: Linear detrend ───────────────────────────────────────────────
+  let sx = 0, sy = 0, sxx = 0, sxy = 0;
+  for (let i = 0; i < n; i++) { sx += i; sy += tieRaw[i]; sxx += i*i; sxy += i*tieRaw[i]; }
+  const det = n * sxx - sx * sx;
+  const slope = det !== 0 ? (n * sxy - sx * sy) / det : 0;
+  const inter = (sy - slope * sx) / n;
+  const tie = tieRaw.map((v, i) => v - (slope * i + inter));
+
+  // ── Step 3: DCD from raw (pre-correction) polarity split ─────────────────
+  let dcdPs = 0;
+  let rMeanRaw = 0, fMeanRaw = 0;
+  if (!isClockSig && pols && pols.length === n) {
+    let rSum = 0, fSum = 0, rN = 0, fN = 0;
+    for (let i = 0; i < n; i++) {
+      if (pols[i] > 0) { rSum += tie[i]; rN++; } else { fSum += tie[i]; fN++; }
+    }
+    rMeanRaw = rN > 0 ? rSum / rN : 0;
+    fMeanRaw = fN > 0 ? fSum / fN : 0;
+    if (rN > 0 && fN > 0) dcdPs = Math.abs(rMeanRaw - fMeanRaw) * 1e12;
+  }
+
+  // ── Step 4: Per-polarity de-skewing (shio.py lines 3608–3612) ────────────
+  const tieCorrected = tie.slice();
+  if (!isClockSig && pols && pols.length === n) {
+    for (let i = 0; i < n; i++) {
+      tieCorrected[i] -= (pols[i] > 0 ? rMeanRaw : fMeanRaw);
+    }
+  }
+
+  // ── Step 5: TJ metrics ───────────────────────────────────────────────────
+  let sumV = 0, sumV2 = 0, tMin = Infinity, tMax = -Infinity;
+  for (const v of tieCorrected) {
+    sumV += v; sumV2 += v * v;
+    if (v < tMin) tMin = v; if (v > tMax) tMax = v;
+  }
+  const meanC  = sumV / n;
+  const tjRmsPs  = Math.sqrt(Math.max(0, sumV2 / n - meanC * meanC)) * 1e12;
+  const tjPkpkPs = (tMax - tMin) * 1e12;
+
+  // ── Step 6: RJ via dual-Dirac Q-scale tail fitting ───────────────────────
+  // Matches shio.py _dual_dirac exactly: sort TIE, assign plotting positions,
+  // compute Q-scale values via normPpf, fit lines to left/right tails,
+  // slope average = RJ sigma, intercept difference = DJ pk-pk.
+  const { rjSigmaPs, djPkpkPs } = dualDiracFit(Array.from(tieCorrected));
+
+  // ── Step 7: TIE histogram (64 bins, matches shio.py) ─────────────────────
+  const tieCorPs = tieCorrected.map(v => v * 1e12);
+  const hMin = tMin * 1e12, hMax = tMax * 1e12;
+  const nBins = 64;
+  const bw = Math.max(1e-9, (hMax - hMin) / nBins);
+  const tieBinsPs = Array.from({ length: nBins }, (_, b) => hMin + (b + 0.5) * bw);
+  const tieCounts = new Array<number>(nBins).fill(0);
+  for (const v of tieCorPs) {
+    tieCounts[Math.min(nBins - 1, Math.max(0, Math.floor((v - hMin) / bw)))]++;
+  }
+
+  // ── Step 8: Downsampled TIE for time-series display ──────────────────────
+  const step = Math.max(1, Math.floor(n / 2000));
+  const tieDisplayPs = tieCorPs.filter((_, i) => i % step === 0);
+
+  // ── Step 9: PJ via Hann-windowed FFT — matching shio.py _extract_pj_tones ──
+  // shio.py pipeline:
+  //   1. Mean-subtract + Hann window the TIE
+  //   2. rfft → one-sided amplitude with coherent-gain correction: amp = |FFT|*2/(N*cg)
+  //   3. amp_pkpk = amp * 2*sqrt(2)  (legacy scaling, used throughout shio.py)
+  //   4. Floor = median + 1.4826*MAD of spectrum * 10^(floor_db/20), with SNR gate
+  // This replaces the previous under-normalized formula that was ~5.6x too small.
+  let pjPkpkPs = 0, pjFreqMhz = 0, pjPhaseRad = 0;
+  if (n >= 64 && edgeRateHz > 0) {
+    let fftLen = 64;
+    while (fftLen < Math.min(n, 4096)) fftLen <<= 1;
+    const re = new Float64Array(fftLen);
+    const im = new Float64Array(fftLen);
+
+    // Compute mean for mean-subtraction (shio.py subtracts mean before windowing)
+    let tieMean = 0;
+    for (let i = 0; i < n; i++) tieMean += tieCorrected[i];
+    tieMean /= n;
+
+    // Hann window — compute coherent gain (mean of window)
+    let cgSum = 0;
+    for (let i = 0; i < fftLen; i++) {
+      const w = 0.5 * (1 - Math.cos(2 * Math.PI * i / (fftLen - 1)));
+      cgSum += w;
+      re[i] = (i < n ? (tieCorrected[i] - tieMean) : 0) * w;
+    }
+    const cg = Math.max(cgSum / fftLen, 1e-15);  // ≈ 0.5 for Hann
+
+    fftInPlace(re, im);
+
+    // One-sided amplitude spectrum with coherent-gain correction
+    // amp[k] = |FFT[k]| * 2 / (N * cg)  → physical sinusoidal amplitude
+    const half = fftLen >> 1;
+
+    // Noise floor estimate (median + 1.4826*MAD of spectrum, same as shio.py)
+    const amps = new Float64Array(half - 3);
+    for (let k = 3; k < half; k++) {
+      amps[k - 3] = Math.sqrt(re[k]*re[k] + im[k]*im[k]) * 2.0 / (fftLen * cg);
+    }
+    const sortedAmps = amps.slice().sort();
+    const nA = sortedAmps.length;
+    const medA = nA % 2 ? sortedAmps[(nA-1)>>1] : 0.5*(sortedAmps[(nA>>1)-1]+sortedAmps[nA>>1]);
+    const madAmps = new Float64Array(nA);
+    for (let i = 0; i < nA; i++) madAmps[i] = Math.abs(sortedAmps[i] - medA);
+    madAmps.sort();
+    const madA = nA % 2 ? madAmps[(nA-1)>>1] : 0.5*(madAmps[(nA>>1)-1]+madAmps[nA>>1]);
+    const floorDb = 10.0;  // matches shio.py default pj_floor_db=10.0
+    const noiseFloor = Math.max(medA + 1.4826 * madA, 1e-30);
+    const ampFloor = noiseFloor * Math.pow(10, floorDb / 20);
+
+    let peakAmpS = 0, peakBin = 0;
+    for (let k = 3; k < half; k++) {
+      const ampS = amps[k - 3];
+      // Require amplitude above noise floor AND SNR > 2dB (snr_db_min=8 in shio.py, but
+      // we use the floor threshold as the primary gate to match default behaviour)
+      if (ampS >= ampFloor && ampS >= 1.5 * noiseFloor && ampS > peakAmpS) {
+        peakAmpS = ampS; peakBin = k;
+      }
+    }
+    // Fallback: highest bin if nothing passes the floor
+    if (peakBin === 0) {
+      for (let k = 3; k < half; k++) {
+        const ampS = amps[k - 3];
+        if (ampS > peakAmpS) { peakAmpS = ampS; peakBin = k; }
+      }
+    }
+    if (peakAmpS > 0 && peakBin > 0) {
+      // shio.py: amp_pkpk_s = amp_s * 2 * sqrt(2)  (legacy scaling)
+      pjPkpkPs = peakAmpS * 2.0 * Math.SQRT2 * 1e12;
+      pjFreqMhz = (peakBin * edgeRateHz / fftLen) / 1e6;
+      // Store phase for PJ synthesis (used to build residual TIE)
+      pjPhaseRad = Math.atan2(im[peakBin], re[peakBin]);
+    }
+  }
+  // pjPhaseRad is in scope because it was declared with let before the if-block
+
+  // ── Step 10: DDJ profile ─────────────────────────────────────────────────
+  // Primary path: N-bit history grouping (mirrors shio.py _estimate_ddj_history).
+  //   1. Reconstruct bit sequence by interpolating raw samples at UI centres.
+  //   2. For each edge, pack the preceding N bits into an integer state key.
+  //   3. Group corrected TIE by state key; compute mean TIE per group.
+  //   4. Result: up to 2^N bars, looks like a "continuous line" for PRBS.
+  //
+  // Fallback (no raw samples): run-length profile from inter-edge intervals.
+  //
+  const HIST_DEPTH = 8;   // 8-bit history → up to 256 states (same as shio.py default)
+  const ddjProfileRunLengths: number[] = [];
+  const ddjProfileRisingPs:   number[] = [];
+  const ddjProfileFallingPs:  number[] = [];
+  let ddjPkpkPs = 0;
+
+  const doBitHistory = rawSamples && rawSamples.length > 0 && fsHz_opt && vth_opt !== undefined;
+  if (doBitHistory) {
+    const fs = fsHz_opt!;
+    const vt = vth_opt!;
+    const samps = rawSamples!;
+    const nSamp = samps.length;
+    const t0 = edges[0];
+    // Number of complete UI windows in the capture
+    const nUI = Math.floor(((nSamp / fs) - t0) / uiSec) - 1;
+
+    if (nUI > HIST_DEPTH + 4) {
+      // Step 1: bit sequence at UI centres
+      const bits = new Uint8Array(nUI);
+      for (let k = 0; k < nUI; k++) {
+        const tCentre = t0 + (k + 0.5) * uiSec;
+        const sIdx = tCentre * fs;
+        const i0 = Math.max(0, Math.min(nSamp - 2, Math.floor(sIdx)));
+        const frac = sIdx - i0;
+        const val = samps[i0] * (1 - frac) + samps[i0 + 1] * frac;
+        bits[k] = val >= vt ? 1 : 0;
+      }
+
+      // Step 2–3: for each edge, build history key and accumulate TIE
+      const stateGroups = new Map<number, number[]>();
+      for (let i = 0; i < n; i++) {
+        const uiIdx = Math.round((edges[i] - t0) / uiSec);
+        if (uiIdx < HIST_DEPTH || uiIdx >= nUI) continue;
+        // Pack HIST_DEPTH bits into integer key (MSB = oldest bit)
+        let key = 0;
+        for (let d = 0; d < HIST_DEPTH; d++) {
+          key = (key << 1) | bits[uiIdx - HIST_DEPTH + d];
+        }
+        if (!stateGroups.has(key)) stateGroups.set(key, []);
+        stateGroups.get(key)!.push(tieCorPs[i]);
+      }
+
+      // Step 4: compute mean TIE per group, collect occupied states
+      const minHits = 4;
+      const sortedKeys = [...stateGroups.keys()].sort((a, b) => a - b);
+      const allMeans: number[] = [];
+      for (const key of sortedKeys) {
+        const vals = stateGroups.get(key)!;
+        if (vals.length < minHits) continue;
+        const mean = vals.reduce((s, v) => s + v, 0) / vals.length;
+        ddjProfileRunLengths.push(key);
+        ddjProfileRisingPs.push(mean);
+        ddjProfileFallingPs.push(NaN);  // not used in bit-history mode
+        allMeans.push(mean);
+      }
+      if (allMeans.length > 1) {
+        ddjPkpkPs = Math.max(...allMeans) - Math.min(...allMeans);
+      }
+    }
+  }
+
+  // Fallback: run-length profile from inter-edge intervals
+  if (ddjProfileRunLengths.length === 0) {
+    const MAX_RL = 32;
+    const rlR = Array.from({length: MAX_RL + 1}, () => ({sum: 0, cnt: 0}));
+    const rlF = Array.from({length: MAX_RL + 1}, () => ({sum: 0, cnt: 0}));
+    for (let i = 1; i < n; i++) {
+      const rl = Math.min(MAX_RL, Math.max(1, Math.round((edges[i] - edges[i-1]) / uiSec)));
+      const ps = tieCorPs[i];
+      if (pols && pols.length > i && pols[i] > 0) { rlR[rl].sum += ps; rlR[rl].cnt++; }
+      else                                          { rlF[rl].sum += ps; rlF[rl].cnt++; }
+    }
+    for (let rl = 1; rl <= MAX_RL; rl++) {
+      if (rlR[rl].cnt >= 2 || rlF[rl].cnt >= 2) {
+        ddjProfileRunLengths.push(rl);
+        ddjProfileRisingPs.push(rlR[rl].cnt >= 2 ? rlR[rl].sum / rlR[rl].cnt : NaN);
+        ddjProfileFallingPs.push(rlF[rl].cnt >= 2 ? rlF[rl].sum / rlF[rl].cnt : NaN);
+      }
+    }
+    const allMeans = [...ddjProfileRisingPs.filter(isFinite), ...ddjProfileFallingPs.filter(isFinite)];
+    ddjPkpkPs = allMeans.length > 1 ? Math.max(...allMeans) - Math.min(...allMeans) : 0;
+  }
+
+  // ── Step 11: UJ @ BER=1e-6 ───────────────────────────────────────────────
+  const ujBer = 1e-6;
+  const qInv = normPpf(1.0 - ujBer / 2.0);  // ≈ 4.753
+  const ujPkpkPs = 2.0 * qInv * (rjSigmaPs / 1e12) * 1e12 + djPkpkPs;
+
+  // ── Step 12: Residual TIE = tieCorrected - PJ_synthesised ────────────────
+  // mirrors shio.py:  tie_residual = tie_model - pj_component
+  // The PJ component is a sine wave at the detected frequency and phase.
+  // amp_peak = amp_pkpk / 2 (half of the peak-to-peak, shio.py convention).
+  const tieResidual = tieCorrected.slice();
+  if (pjPkpkPs > 0 && pjFreqMhz > 0) {
+    const pjFreqHz  = pjFreqMhz * 1e6;
+    const pjAmpPeak = (pjPkpkPs / 1e12) / 2.0;  // seconds
+    for (let i = 0; i < n; i++) {
+      tieResidual[i] -= pjAmpPeak * Math.sin(2 * Math.PI * pjFreqHz * i * uiSec + pjPhaseRad);
+    }
+  }
+  const tieResidualPs = tieResidual.map(v => v * 1e12).filter((_, i) => i % Math.max(1, Math.floor(n / 2000)) === 0);
+
+  // ── Step 13: Bathtub curve (Dual-Dirac + Empirical) ───────────────────────
+  // shio.py _build_bathtub / _build_bathtub_empirical (lines 3114–3171).
+  const N_BATH   = 500;
+  const halfUiSec = uiSec / 2.0;
+  const rjSec    = Math.max(rjSigmaPs / 1e12, uiSec * 0.001);  // rj_eff
+  const halfDj   = Math.min(djPkpkPs / 2e12, halfUiSec * 0.9);
+
+  const bathtubXUi:      number[] = [];
+  const bathtubLogBer:   number[] = [];
+  const bathtubEmpLogBer: number[] = [];
+  const tieUiArr = tieCorrected.map(v => v / uiSec);  // TIE in UI units
+
+  let ddMarginUi = 0, empMarginUi = 0;
+  for (let i = 0; i < N_BATH; i++) {
+    const xUi  = -0.5 + i / (N_BATH - 1);
+    bathtubXUi.push(xUi);
+
+    // Dual-Dirac: Q((half_ui - |x*ui| - half_dj) / rj)
+    const margin = halfUiSec - Math.abs(xUi * uiSec) - halfDj;
+    const ddBer  = Math.max(1e-40, qFunc(margin / rjSec));
+    bathtubLogBer.push(Math.log10(ddBer));
+    if (i >= N_BATH / 2 && ddBer < ber) ddMarginUi = xUi;
+
+    // Empirical: fraction of edges with |TIE_ui| > (0.5 - |x|)
+    const thr = 0.5 - Math.abs(xUi);
+    let empBer: number;
+    if (thr <= 0) {
+      empBer = 1.0;
+    } else {
+      let above = 0;
+      for (const tv of tieUiArr) if (tv > thr || tv < -thr) above++;
+      empBer = Math.max(1e-40, above / Math.max(tieUiArr.length, 1));
+    }
+    bathtubEmpLogBer.push(Math.log10(empBer));
+    if (i >= N_BATH / 2 && empBer < ber) empMarginUi = xUi;
+  }
+  const bathtubDdMarginPctUi  = ddMarginUi  * 100;
+  const bathtubEmpMarginPctUi = empMarginUi * 100;
+
+  // ── Step 14: SSC / Wander profile via box-filter LPF ─────────────────────
+  // Box filter with span ≈ 2% of total edges extracts the slow wander component.
+  // Converts to PPM: (wander_ps / uiSec_ps) * 1e6.
+  const wSpan = Math.max(5, Math.round(n * 0.02));
+  const halfSpan = Math.floor(wSpan / 2);
+  const sscWanderTimeUs: number[] = [];
+  const sscWanderPs:     number[] = [];
+  let   wSum = 0;
+  // Prime the window
+  for (let i = 0; i < Math.min(wSpan, n); i++) wSum += tieCorrected[i];
+  const wanderRaw = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    const lo = i - halfSpan, hi = i + halfSpan;
+    if (lo >= 0 && hi < n) {
+      if (i === 0) { let s = 0; for (let j = 0; j <= 2*halfSpan && j < n; j++) s += tieCorrected[j]; wSum = s; }
+      else { if (lo - 1 >= 0) wSum -= tieCorrected[lo - 1]; if (hi < n) wSum += tieCorrected[hi]; }
+    }
+    const cnt = Math.min(hi + 1, n) - Math.max(lo, 0);
+    wanderRaw[i] = wSum / Math.max(cnt, 1);
+  }
+  const wStep = Math.max(1, Math.floor(n / 2000));
+  const uiSecPs = uiSec * 1e12;
+  let wMin = Infinity, wMax = -Infinity;
+  for (let i = 0; i < n; i += wStep) {
+    const tUs = (i * uiSec) * 1e6;
+    const wPs = wanderRaw[i] * 1e12;
+    sscWanderTimeUs.push(tUs);
+    sscWanderPs.push(wPs);
+    if (wPs < wMin) wMin = wPs; if (wPs > wMax) wMax = wPs;
+  }
+  const sscSwingPpm = uiSecPs > 0 ? ((wMax - wMin) / uiSecPs) * 1e6 : 0;
+
+  return {
+    tieDisplayPs, tieResidualPs, tieBinsPs, tieCounts,
+    tjRmsPs, tjPkpkPs, rjSigmaPs,
+    pjPkpkPs, pjFreqMhz, dcdPs, ujPkpkPs, ddjPkpkPs,
+    ddjProfileRunLengths, ddjProfileRisingPs, ddjProfileFallingPs,
+    bathtubXUi, bathtubLogBer, bathtubEmpLogBer,
+    bathtubDdMarginPctUi, bathtubEmpMarginPctUi,
+    sscWanderTimeUs, sscWanderPs, sscSwingPpm,
+  };
 }
 
 function estimateEyeWidthPctUi(samples: number[], fsHz: number, uiSec: number, t0: number, vth: number): number {
@@ -1095,7 +1908,10 @@ async function analyzehsio(samples: number[], params: hsioParams, fileName: stri
   let vth = Number(params.vtThreshold ?? 0);
   if (!isFinite(vth) || vth === 0) vth = autoDetectVth(samples);
 
-  const edges = extractEdges(samples, fsHz, vth, signalType === 'clock');
+  // extractEdgesWithPolarity is numerically identical to extractEdges (same
+  // threshold-crossing / linear-interpolation arithmetic) but additionally
+  // returns per-edge polarity, needed by computeJitter for DCD/DDJ.
+  const { times: edges, pols: edgePols } = extractEdgesWithPolarity(samples, fsHz, vth, signalType === 'clock');
   if (edges.length < 10) {
     throw new Error(`Too few edges (${edges.length}). Check threshold and signal type.`);
   }
@@ -1132,6 +1948,50 @@ async function analyzehsio(samples: number[], params: hsioParams, fileName: stri
   const eyeHeightV = cMax > cMin ? cMax - cMin : 0;
   const eyeWidthPctUi = estimateEyeWidthPctUi(samples, fsHz, uiSec, t0, vth);
 
+  // ── Jitter decomposition (TIE → RJ/PJ/DDJ/DCD/UJ), bathtub, SSC/wander ──
+  // Additive feature — must never break the existing eye-diagram outputs
+  // above. Any failure here is caught and the jitter fields are simply
+  // omitted from the returned figureData (status note via jitterStatus).
+  let jitterFields: Partial<hsioFigureData> = {};
+  try {
+    // Edge rate for PJ FFT frequency axis = 1/uiSec (bit rate), reusing OUR
+    // already-computed capturedRateGbps (median-based CDR) — NOT the
+    // reference file's own percentile-based CDR calculation.
+    const edgeRateHz = capturedRateGbps * 1e9;
+    const berTargetNum = parseFloat(String(params.berTarget ?? '1e-12')) || 1e-12;
+    const jitter = computeJitter(edges, edgePols, uiSec, signalType === 'clock', edgeRateHz, samples, fsHz, vth, berTargetNum);
+    jitterFields = {
+      tieDisplayPs: jitter.tieDisplayPs,
+      tieResidualPs: jitter.tieResidualPs,
+      tieBinsPs: jitter.tieBinsPs,
+      tieCounts: jitter.tieCounts,
+      tjRmsPs: jitter.tjRmsPs,
+      tjPkpkPs: jitter.tjPkpkPs,
+      rjSigmaPs: jitter.rjSigmaPs,
+      pjPkpkPs: jitter.pjPkpkPs,
+      pjFreqMhz: jitter.pjFreqMhz,
+      dcdPs: jitter.dcdPs,
+      ujPkpkPs: jitter.ujPkpkPs,
+      ddjPkpkPs: jitter.ddjPkpkPs,
+      ddjProfileRunLengths: jitter.ddjProfileRunLengths,
+      ddjProfileRisingPs: jitter.ddjProfileRisingPs,
+      ddjProfileFallingPs: jitter.ddjProfileFallingPs,
+      nEdgesJitter: edges.length,
+      bathtubXUi: jitter.bathtubXUi,
+      bathtubLogBer: jitter.bathtubLogBer,
+      bathtubEmpLogBer: jitter.bathtubEmpLogBer,
+      bathtubBerTarget: berTargetNum,
+      bathtubDdMarginPctUi: jitter.bathtubDdMarginPctUi,
+      bathtubEmpMarginPctUi: jitter.bathtubEmpMarginPctUi,
+      sscWanderTimeUs: jitter.sscWanderTimeUs,
+      sscWanderPs: jitter.sscWanderPs,
+      sscSwingPpm: jitter.sscSwingPpm,
+      jitterStatus: 'ok',
+    };
+  } catch (err) {
+    jitterFields = { jitterStatus: `jitter computation failed: ${err instanceof Error ? err.message : String(err)}` };
+  }
+
   return {
     eyeGridLog: eye.gridLog,
     eyeGridW: eye.gridW,
@@ -1149,6 +2009,7 @@ async function analyzehsio(samples: number[], params: hsioParams, fileName: stri
     nSamples: samples.length,
     uiPs: uiSec * 1e12,
     vthV: vth,
+    ...jitterFields,
   };
 }
 
@@ -1282,24 +2143,178 @@ const PlaceholderFigure = ({ label }: { label: string }) => (
   </div>
 );
 
+/**
+ * Portable (renderer-agnostic) description of the eye diagram, consumed by
+ * figureRenderSvg.mjs via the generic `heatmap` primitive (see
+ * pluginTypes.ts) — no HSIO-specific concepts leak into the renderer; it
+ * only ever sees a 2D grid + extent + reference lines/results panel.
+ */
+function getHsioEyeFigureData(data: hsioFigureData): PortableFigureDescription {
+  return {
+    figure: 'eye',
+    title: `Eye Diagram — H=${(data.eyeHeightV * 1e3).toFixed(1)}mV  W=${data.eyeWidthPctUi.toFixed(1)}%UI`,
+    x: { label: 'Phase (UI)', data: [data.eyeExtent[0], data.eyeExtent[1]] },
+    series: [],
+    y: { label: 'Voltage (V)' },
+    legend: { enabled: false },
+    grid: { x: false, y: false },
+    referenceLines: [
+      { axis: 'x', value: 0 },
+      { axis: 'x', value: 1 },
+      { axis: 'x', value: 0.5, label: 'center' },
+    ],
+    heatmap: {
+      grid: data.eyeGridLog,
+      width: data.eyeGridW,
+      height: data.eyeGridH,
+      extent: data.eyeExtent,
+    },
+    resultsPanel: [
+      { label: 'EYE HEIGHT', value: `${(data.eyeHeightV * 1e3).toFixed(1)} mV` },
+      { label: 'EYE WIDTH', value: `${data.eyeWidthPctUi.toFixed(1)} %UI` },
+      { label: 'UI', value: `${(data.uiSec * 1e12).toFixed(2)} ps` },
+      { label: 'SAMPLE RATE', value: `${(data.fsHz / 1e9).toFixed(4)} GHz` },
+      { label: 'FILE', value: data.fileName },
+    ],
+  };
+}
+
+/**
+ * getHsioJitterFigureData — portable description of the jitter-decomposition
+ * figure.
+ *
+ * KNOWN VISUAL-FIDELITY TRADE-OFF: the legacy reference implementation
+ * (hsioalphaPlugin.tsx's JitterFigure) renders a 3-panel SVG layout (TIE
+ * histogram / TIE time-series with residual overlay / DDJ bar profile).
+ * PortableFigureDescription currently only supports a single line/dashed-line
+ * `series` set over one shared `x.data` array — there is no multi-panel/
+ * subplot primitive and no bar-chart series type. Rather than shoehorning
+ * three semantically distinct panels into one axis (which would be
+ * misleading), this adapter renders ONLY the TIE histogram as the plotted
+ * series, and surfaces the scalar jitter metrics via `resultsPanel`. The full
+ * TIE time-series (+ residual) and DDJ profile are preserved losslessly via
+ * the `jitter_tie_series` / `jitter_ddj_profile` debug tables instead of a
+ * second/third visual panel here. If a genuine multi-panel/subplot (and/or
+ * bar-series) primitive is ever added to PortableFigureDescription, this
+ * adapter should be revisited to restore full 3-panel visual parity.
+ */
+function getHsioJitterFigureData(data: hsioFigureData): PortableFigureDescription | undefined {
+  if (data.jitterStatus !== 'ok' || !data.tieBinsPs || data.tieBinsPs.length === 0) return undefined;
+  return {
+    figure: 'jitter',
+    title: `Jitter Decomposition — TJrms=${(data.tjRmsPs ?? 0).toFixed(2)}ps  TJpk-pk=${(data.tjPkpkPs ?? 0).toFixed(2)}ps`,
+    x: { label: 'TIE (ps)', data: data.tieBinsPs },
+    series: [
+      { name: 'TIE histogram', y: (data.tieCounts ?? []).map((v) => (Number.isFinite(v) ? v : null)) },
+    ],
+    y: { label: 'Count' },
+    legend: { enabled: false },
+    grid: { x: true, y: true },
+    referenceLines: [{ axis: 'y', value: 0 }],
+    resultsPanel: [
+      { label: 'TJ RMS', value: `${(data.tjRmsPs ?? 0).toFixed(2)} ps` },
+      { label: 'TJ PK-PK', value: `${(data.tjPkpkPs ?? 0).toFixed(2)} ps` },
+      { label: 'RJ SIGMA', value: `${(data.rjSigmaPs ?? 0).toFixed(2)} ps` },
+      { label: 'PJ PK-PK', value: `${(data.pjPkpkPs ?? 0).toFixed(2)} ps` },
+      { label: 'PJ FREQ', value: `${(data.pjFreqMhz ?? 0).toFixed(4)} MHz` },
+      { label: 'DCD', value: `${(data.dcdPs ?? 0).toFixed(2)} ps` },
+      { label: 'DDJ PK-PK', value: `${(data.ddjPkpkPs ?? 0).toFixed(2)} ps` },
+      { label: 'UJ @ BER=1e-6', value: `${(data.ujPkpkPs ?? 0).toFixed(2)} ps` },
+      { label: 'N EDGES', value: `${data.nEdgesJitter ?? 0}` },
+    ],
+  };
+}
+
+/**
+ * getHsioBathtubFigureData — portable description of the bathtub-curve
+ * figure. Fits the existing PortableFigureDescription schema fully (single
+ * shared x-axis, two line series, reference lines, results panel) — no
+ * compromises needed here.
+ */
+function getHsioBathtubFigureData(data: hsioFigureData): PortableFigureDescription | undefined {
+  if (data.jitterStatus !== 'ok' || !data.bathtubXUi || data.bathtubXUi.length === 0) return undefined;
+  const berTarget = data.bathtubBerTarget ?? 1e-12;
+  const logBerTarget = Math.log10(berTarget);
+  const referenceLines: NonNullable<PortableFigureDescription['referenceLines']> = [
+    { axis: 'y', value: logBerTarget, label: `BER=${berTarget.toExponential(0)}` },
+  ];
+  if (data.bathtubDdMarginPctUi) {
+    referenceLines.push({ axis: 'x', value: data.bathtubDdMarginPctUi / 100, label: 'DD margin' });
+  }
+  if (data.bathtubEmpMarginPctUi) {
+    referenceLines.push({ axis: 'x', value: data.bathtubEmpMarginPctUi / 100, label: 'Emp margin' });
+  }
+  return {
+    figure: 'bathtub',
+    title: `Bathtub Curve — BER target=${berTarget.toExponential(0)}`,
+    x: { label: 'UI', data: data.bathtubXUi },
+    series: [
+      { name: 'Dual-Dirac log10(BER)', y: (data.bathtubLogBer ?? []).map((v) => (Number.isFinite(v) ? v : null)), style: 'solid' },
+      { name: 'Empirical log10(BER)', y: (data.bathtubEmpLogBer ?? []).map((v) => (Number.isFinite(v) ? v : null)), style: 'dashed' },
+    ],
+    y: { label: 'log10(BER)' },
+    legend: { enabled: true },
+    grid: { x: true, y: true },
+    referenceLines,
+    resultsPanel: [
+      { label: 'BER TARGET', value: berTarget.toExponential(2) },
+      { label: 'DD MARGIN', value: `${(data.bathtubDdMarginPctUi ?? 0).toFixed(2)} %UI` },
+      { label: 'EMPIRICAL MARGIN', value: `${(data.bathtubEmpMarginPctUi ?? 0).toFixed(2)} %UI` },
+    ],
+  };
+}
+
+/**
+ * getHsioSscFigureData — portable description of the SSC/wander-profile
+ * figure. Fits the existing PortableFigureDescription schema fully.
+ */
+function getHsioSscFigureData(data: hsioFigureData): PortableFigureDescription | undefined {
+  if (data.jitterStatus !== 'ok' || !data.sscWanderTimeUs || data.sscWanderTimeUs.length === 0) return undefined;
+  return {
+    figure: 'ssc',
+    title: `SSC / Wander Profile — swing=${(data.sscSwingPpm ?? 0).toFixed(2)} ppm`,
+    x: { label: 'Time (us)', data: data.sscWanderTimeUs },
+    series: [
+      { name: 'Wander (ps)', y: (data.sscWanderPs ?? []).map((v) => (Number.isFinite(v) ? v : null)) },
+    ],
+    y: { label: 'Wander (ps)' },
+    legend: { enabled: false },
+    grid: { x: true, y: true },
+    resultsPanel: [
+      { label: 'SSC SWING', value: `${(data.sscSwingPpm ?? 0).toFixed(2)} ppm` },
+    ],
+  };
+}
+
 const figures: PluginFigure[] = [
-  { id: 'eye', label: 'Eye Diagram', draw: drawEyeDiagram },
+  { id: 'eye', label: 'Eye Diagram', draw: drawEyeDiagram, getData: (data) => getHsioEyeFigureData(data as hsioFigureData) },
   {
     id: 'jitter',
     label: 'Jitter Decomposition',
-    component: () => <PlaceholderFigure label="Jitter Decomposition" />,
+    getData: (data) => getHsioJitterFigureData(data as hsioFigureData),
   },
   {
     id: 'bathtub',
     label: 'Bathtub Curve',
-    component: () => <PlaceholderFigure label="Bathtub Curve" />,
+    getData: (data) => getHsioBathtubFigureData(data as hsioFigureData),
   },
   {
     id: 'ssc',
     label: 'SSC Profile',
-    component: () => <PlaceholderFigure label="SSC Profile" />,
+    getData: (data) => getHsioSscFigureData(data as hsioFigureData),
   },
 ];
+
+/** Shared core: sample extraction + minimum-length validation, identical
+ * for run() and prepareData() — mirrors sinlPlugin's _sinlPrepareCore
+ * pattern (single source of truth for the packet -> samples boundary). */
+function samplesFromPacket(packet: WaveformPacket): number[] {
+  const samples = Array.from(packet.waveform as ArrayLike<number>);
+  if (samples.length < 200) {
+    throw new Error(`Too few valid samples (${samples.length}). Need at least 200.`);
+  }
+  return samples;
+}
 
 export const hsioPlugin: Plugin<hsioParams> = {
   id: 'hsio',
@@ -1308,6 +2323,7 @@ export const hsioPlugin: Plugin<hsioParams> = {
   manifest,
   paramFields,
   defaultParams,
+  getIngestHints: (params: hsioParams) => hsioIngestHints(params),
   outputColumns: [
     'status',
     'signal_type',
@@ -1321,27 +2337,13 @@ export const hsioPlugin: Plugin<hsioParams> = {
     'eye_height_mv',
     'eye_width_pct_ui',
   ],
-  run: async (file: File, params: hsioParams): Promise<Record<string, string | number>> => {
-    const text = await file.text();
-    const { headers, rows } = parseSimpleCsv(text);
-    if (headers.length === 0 || rows.length === 0) {
-      throw new Error('CSV is empty or malformed.');
-    }
-
-    const col = String(params.signalColumn || headers[0]);
-    const idx = headers.indexOf(col);
-    if (idx < 0) throw new Error(`Column "${col}" not found. Available: ${headers.join(', ')}`);
-
-    const samples: number[] = [];
-    for (const r of rows) {
-      const v = parseFloat(r[idx]);
-      if (!Number.isNaN(v)) samples.push(v);
-    }
-    if (samples.length < 200) throw new Error(`Too few valid samples (${samples.length}). Need at least 200.`);
-
-    const r = await analyzehsio(samples, params, file.name);
+  run: async (packet: WaveformPacket, params: hsioParams): Promise<Record<string, string | number>> => {
+    // packet is already IR — no file handling, no ingestion, no CSV parsing.
+    const samples = samplesFromPacket(packet);
+    const fileName = packet.metadata.sourceFile ?? 'waveform';
+    const r = await analyzehsio(samples, params, fileName);
     return {
-      filename: file.name,
+      filename: fileName,
       status: r.status,
       signal_type: String(params.signalType || 'prbs31'),
       sample_rate_ghz: Number(params.fsGhz),
@@ -1355,24 +2357,14 @@ export const hsioPlugin: Plugin<hsioParams> = {
       eye_width_pct_ui: Number(r.eyeWidthPctUi.toFixed(3)),
     };
   },
-  prepareData: async (file: File, params: hsioParams) => {
-    const text = await file.text();
-    const { headers, rows } = parseSimpleCsv(text);
-    if (headers.length === 0 || rows.length === 0) {
-      throw new Error('CSV is empty or malformed.');
-    }
-    const col = String(params.signalColumn || headers[0]);
-    const idx = headers.indexOf(col);
-    if (idx < 0) throw new Error(`Column "${col}" not found.`);
+  prepareData: async (
+    packet: WaveformPacket,
+    params: hsioParams,
+  ): Promise<{ figureData: hsioFigureData; debugTables: PluginDebugTable[] }> => {
+    const samples = samplesFromPacket(packet);
+    const fileName = packet.metadata.sourceFile ?? 'waveform';
 
-    const samples: number[] = [];
-    for (const r of rows) {
-      const v = parseFloat(r[idx]);
-      if (!Number.isNaN(v)) samples.push(v);
-    }
-    if (samples.length < 200) throw new Error(`Too few valid samples (${samples.length}). Need at least 200.`);
-
-    const figureData = await analyzehsio(samples, params, file.name);
+    const figureData = await analyzehsio(samples, params, fileName);
     const debugTables: PluginDebugTable[] = [
       {
         id: 'eye_metadata',
@@ -1391,6 +2383,75 @@ export const hsioPlugin: Plugin<hsioParams> = {
         },
       },
     ];
+
+    // Jitter/bathtub/SSC debug tables — only added when jitter computation
+    // succeeded (analyzehsio() catches jitter-computation errors internally
+    // and simply omits these fields; the eye-diagram table above is always
+    // produced regardless).
+    if (figureData.jitterStatus === 'ok') {
+      debugTables.push(
+        {
+          id: 'jitter_metrics',
+          label: 'Jitter metrics',
+          columns: {
+            key: ['tj_rms_ps', 'tj_pkpk_ps', 'rj_sigma_ps', 'pj_pkpk_ps', 'pj_freq_mhz', 'dcd_ps', 'ddj_pkpk_ps', 'uj_pkpk_ps', 'n_edges'],
+            value: [
+              Number((figureData.tjRmsPs ?? 0).toFixed(4)),
+              Number((figureData.tjPkpkPs ?? 0).toFixed(4)),
+              Number((figureData.rjSigmaPs ?? 0).toFixed(4)),
+              Number((figureData.pjPkpkPs ?? 0).toFixed(4)),
+              Number((figureData.pjFreqMhz ?? 0).toFixed(6)),
+              Number((figureData.dcdPs ?? 0).toFixed(4)),
+              Number((figureData.ddjPkpkPs ?? 0).toFixed(4)),
+              Number((figureData.ujPkpkPs ?? 0).toFixed(4)),
+              figureData.nEdgesJitter ?? 0,
+            ],
+          },
+        },
+        {
+          id: 'jitter_tie_histogram',
+          label: 'TIE histogram',
+          columns: {
+            tie_bin_ps: (figureData.tieBinsPs ?? []).map((v) => Number(v.toFixed(4))),
+            count: figureData.tieCounts ?? [],
+          },
+        },
+        {
+          id: 'jitter_tie_series',
+          label: 'TIE time series',
+          columns: {
+            tie_ps: (figureData.tieDisplayPs ?? []).map((v) => Number(v.toFixed(4))),
+            tie_residual_ps: (figureData.tieResidualPs ?? []).map((v) => Number(v.toFixed(4))),
+          },
+        },
+        {
+          id: 'jitter_ddj_profile',
+          label: 'DDJ profile',
+          columns: {
+            state_or_run_length: figureData.ddjProfileRunLengths ?? [],
+            tie_rising_ps: (figureData.ddjProfileRisingPs ?? []).map((v) => (Number.isFinite(v) ? Number(v.toFixed(4)) : null)),
+            tie_falling_ps: (figureData.ddjProfileFallingPs ?? []).map((v) => (Number.isFinite(v) ? Number(v.toFixed(4)) : null)),
+          },
+        },
+        {
+          id: 'bathtub_curve',
+          label: 'Bathtub curve',
+          columns: {
+            x_ui: (figureData.bathtubXUi ?? []).map((v) => Number(v.toFixed(6))),
+            dd_log_ber: (figureData.bathtubLogBer ?? []).map((v) => Number(v.toFixed(4))),
+            emp_log_ber: (figureData.bathtubEmpLogBer ?? []).map((v) => Number(v.toFixed(4))),
+          },
+        },
+        {
+          id: 'ssc_wander',
+          label: 'SSC / wander',
+          columns: {
+            time_us: (figureData.sscWanderTimeUs ?? []).map((v) => Number(v.toFixed(4))),
+            wander_ps: (figureData.sscWanderPs ?? []).map((v) => Number(v.toFixed(4))),
+          },
+        },
+      );
+    }
     return { figureData, debugTables };
   },
   figures,
