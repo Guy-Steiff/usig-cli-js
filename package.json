@@ -1,6 +1,6 @@
 {
-  "name": "image_site",
-  "version": "0.1.0",
+  "name": "usig-cli-js",
+  "version": "0.1.0-alpha.1",
   "private": true,
   "scripts": {
     "dev": "next dev --turbopack",
@@ -8,8 +8,9 @@
     "start": "next start",
     "lint": "next lint",
     "docs": "node scripts/md-to-ts.js",
-    "test:shio-plugin": "node scripts/test-shio-plugin.mjs",
-    "usig": "node usig.mjs"
+    "usig": "node usig.mjs",
+    "usig:help": "node usig.mjs -help",
+    "usig:check": "node --check usig.mjs"
   },
   "dependencies": {
     "@vercel/blob": "^2.3.3",

@@ -236,7 +236,7 @@ export class IRCache {
             frame.cacheKey.split(':')[0],
           numSamples,
           sampleRateHz,
-          units: metadata.units,
+          units: typeof metadata.units === "string" ? metadata.units : undefined,
           headers: frame.headers,
           ingestedAt: frame.ingestedAt,
           schemaVersion: frame.schemaVersion,

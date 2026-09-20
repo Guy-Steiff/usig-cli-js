@@ -2483,8 +2483,8 @@ async function ingestInputToIR({
     const mapperMod = await loadBinMapperModule();
 
     const packet = await mapperMod.mapBinaryToIRCandidate({
-      inputPath: inputFile,
       filename: inputFileName,
+      bytes: new Uint8Array(raw),
       hints,
     });
 

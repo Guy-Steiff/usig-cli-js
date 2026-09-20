@@ -874,12 +874,21 @@ const manifest: PluginManifest = {
        aliases: ['sample', 'samples', 'adcCode', 'adcCodes', 'voltage', 'data'],
      },
      {
-       key: 'fsGhzColumnRegex',
-       label: 'Sampling Frequency Column Pattern (Regex)',
+       key: 'fsGhz',
+       label: 'Sampling Frequency (GHz)',
+       type: 'number',
+       required: false,
+       description: 'Sampling frequency in GHz. USIG can infer this from filename metadata such as fs2p25ghz; provide a value to override inference.',
+       aliases: ['fs', 'fsghz', 'fsGhz', 'sampleRate', 'samplerate'],
+      },
+     {
+       key: 'toneMode',
+       label: 'Tone Mode',
        type: 'text',
        required: false,
-       description: 'Optional regex to match sampling frequency column name (e.g., "fs.*ghz|freq.*mhz"). Pattern is applied case-insensitively to column headers.',
-       aliases: ['fsGhz', 'fs', 'sampleRate'],
+       description: 'Stimulus tone mode. USIG can infer this from filename metadata such as tonemode~single; provide a value to override inference.',
+       aliases: ['tone', 'tonemode', 'toneMode'],
+       possibleValues: ['single', 'dual'],
      },
      {
        key: 'inputMode',
@@ -4240,6 +4249,8 @@ export const smeasPlugin: Plugin<SmeasParams> = {
 
   defaultParams: {
     targetColumn: '',   // populated at runtime from columnRequirements selection
+    fsGhz: 2.1,
+    toneMode: 'single',
     fsGhzColumnRegex: '',
     fsGhzRegex: '(?:sample[_\\-]?rate|[Ff][Ss])[_\\-]?(\\d+(?:p\\d+)?(?:e[+\\-]?\\d+)?(?:GHz|MHz|kHz|Hz)?)',
     fsGhzReplace: '',

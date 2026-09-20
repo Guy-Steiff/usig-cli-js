@@ -160,7 +160,6 @@
  *   • conversion pipeline
  */
 
-import * as fs from 'node:fs/promises';
 import type { WaveformPacket } from '../ingest/types';
 import {
   deserializeFrame,
@@ -168,6 +167,7 @@ import {
 } from './serializer';
 
 import { generateHypothesis } from './hypothesis_gen_for_ir_from_bin.js';
+import { asUint8Array } from './bytes';
 
 
 function materializeMetadataFields(
@@ -217,7 +217,7 @@ function materializeMetadataFields(
 }
 
 
-function normalizeChannels(mapped: any, raw: Buffer) {
+function normalizeChannels(mapped: any, raw: Uint8Array) {
   const channelDefinitions = mapped.channels;
 
   if (
@@ -313,9 +313,9 @@ function normalizeChannels(mapped: any, raw: Buffer) {
 
 
 function reconstructWaveform(
-      buffer: Buffer,
-      instructions: any
-    ) {
+  buffer: Uint8Array,
+  instructions: any,
+) {
   const {
     encoding,
     samples,
@@ -371,14 +371,12 @@ function reconstructWaveform(
 }
 
 export async function mapBinaryToIRCandidate({
-  inputPath,
   filename,
-  data,
+  bytes,
   hints: _hints = {},
 }: {
-  inputPath?: string;
   filename: string;
-  data?: Buffer;
+  bytes: Uint8Array | ArrayBuffer;
   hints?: Record<string, unknown>;
 }): Promise<{
   packet: WaveformPacket;
@@ -388,17 +386,7 @@ export async function mapBinaryToIRCandidate({
 
   console.log('[binMapper] mapping:', filename);
 
-  const raw =
-    data ??
-    (inputPath
-      ? await fs.readFile(inputPath)
-      : null);
-
-  if (!raw) {
-    throw new Error(
-      `Binary mapper requires either inputPath or data for "${filename}".`
-    );
-  }
+  const raw = asUint8Array(bytes);
 
 
 
