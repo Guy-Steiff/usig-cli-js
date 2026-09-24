@@ -565,13 +565,16 @@ export interface Plugin<P = Record<string, string>> {
    * Optional canonical prepareData counterpart.
    * Same as prepareData() but receives a WaveformPacket instead of a File.
    */
-  prepareData?: (
+  prepareDebugTables?: (
       packet: WaveformPacket,
       params: P,
-    ) => Promise<{
-      figureData?: unknown;
-      debugTables?: PluginDebugTable[];
-    }>;
+      requestedTableIds?: string[],
+    ) => Promise<PluginDebugTable[]>;
+
+  prepareFigureData?: (
+      packet: WaveformPacket,
+      params: P,
+    ) => Promise<unknown>;
 
   /**
    * Declared output column names — keys that run() will produce.
@@ -581,8 +584,21 @@ export interface Plugin<P = Record<string, string>> {
    */
   outputColumns?: string[];
 
-  /** Figures this plugin can draw — shown as plot buttons after a successful run. */
+    /** Figures this plugin can draw — shown as plot buttons after a successful run. */
   figures?: PluginFigure[];
+
+  /**
+   * Optional plugin-owned SVG assembly for a declared figure.
+   * When present, the CLI/web client calls this instead of its own
+   * figureRenderSvg renderer. Returns final SVG markup, or undefined
+   * if the figure is not applicable for the given figureData.
+   */
+
+  renderFigureSvg?: (
+      figureId: string,
+      figureData: unknown,
+      controls: FigureControlValues,
+    ) => Promise<string | undefined>;
 
   /**
    * Optional markdown documentation string. When provided, a collapsed "📖 plugin docs"

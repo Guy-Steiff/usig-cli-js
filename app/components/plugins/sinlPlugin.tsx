@@ -1,787 +1,58 @@
 /**
- * sinlPlugin.tsx — SINL (Sine INL/DNL) Analysis Pipeline Plugin
- *
- * Complete, self-contained plugin including:
- *   1. Okawara-T sine-histogram INL/DNL algorithm
- *   2. CSV file parsing with voltage normalization
- *   3. Recharts visualization components (PDF, DNL, INL)
- *   4. Plugin manifest and parameter handling
- *
- * Algorithm Reference: Okawara's paper on ADC sine-wave testing (Equations 27-29)
- * Ported from: inl_tool.py (Python reference implementation)
- */
-
-/*
- * ARCHITECTURAL MIGRATION NOTE — PARAMETER / METADATA INGESTION
- *
- * PURPOSE
- * -------
- * This plugin is being migrated from the original "hooks + defaults + plugin-side
- * inference" model to the USIG architecture in which the plugin declares the
- * parameters it needs and the CLI/framework is responsible for resolving those
- * parameters from available metadata and explicit CLI -p arguments.
- *
- * This comment is intentionally detailed so that, after SINL has been converted
- * and validated, the same architectural migration can be applied to SMEAS without
- * having to reconstruct the design decisions from the implementation history.
- *
- *
- * 1. CURRENT / LEGACY ARCHITECTURE
- * --------------------------------
- *
- * The current plugin contains several overlapping parameter-description systems:
- *
- *   - manifest.paramSchema
- *       Originally describes parameters for the framework/UI. The old UI has been
- *       deprecated in favor of the CLI, so this is not the authoritative mechanism
- *       for CLI parameter resolution.
- *
- *   - plugin.defaultParams
- *       Supplies values such as inputMode="codes", minCode=0, maxCode=2047,
- *       avoidanceRadius=40, etc.
- *
- *   - plugin.paramFields
- *       Contains UI-oriented fields and, historically, defaultRegex,
- *       defaultReplace, defaultValue, defaultScope, etc.
- *
- *   - plugin-specific inference helpers
- *       e.g. sinlAutoSeedFromPacket(), plus ingest-time logic.
- *
- *   - filename inference
- *       USIG can extract information from filenames, but the old architecture
- *       did not reliably convey those inferred parameters to the plugin in a
- *       semantically explicit way.
- *
- * This creates an undesirable split of responsibility:
- *
- *   filename -> USIG inference -> parameter matching
- *                            \
- *                             plugin hooks / defaults / local inference
- *
- * The plugin therefore has knowledge about how USIG happens to represent or
- * discover metadata, rather than simply declaring what it needs.
- *
- *
- * 2. IMPORTANT DESIGN DECISION: NO GLOBAL DEFAULT PARAMETERS
- * -----------------------------------------------------------
- *
- * USIG is intentionally AGNOSTIC about plugin parameter names and values.
- *
- * There must be no framework-level assumption that:
- *
- *   "fs" means sampling frequency
- *   "adcBits" means ADC resolution
- *   "window" means a particular windowing operation
- *   "nfft" means FFT length
- *   etc.
- *
- * The meaning of a parameter belongs to the plugin that consumes it.
- *
- * Consequently, USIG must not manufacture semantic defaults for plugin
- * parameters merely because a value is convenient or historically common.
- *
- * In particular, plugin parameters which materially affect an algorithm must
- * not silently acquire framework defaults.
- *
- * A missing parameter should remain missing unless the plugin itself explicitly
- * defines that the parameter is optional and has an internally meaningful
- * algorithmic default.
- *
- * The long-term rule is:
- *
- *   USIG supplies facts.
- *   The plugin declares meanings and requirements.
- *   The plugin performs the algorithm.
- *
- * USIG must not invent facts.
- *
- *
- * 3. FILENAME INFERENCE FIX
- * --------------------------
- *
- * The repaired USIG filename-inference path now produces inferred metadata and
- * makes it available to plugin parameter resolution instead of merely displaying
- * the inference or keeping it isolated inside the CLI.
- *
- * For example, a filename containing:
- *
- *   sine_fs2p25ghz_...
- *
- * can produce an inferred parameter whose semantic information includes the
- * extracted value and its unit.
- *
- * The important architectural realization is that the filename itself is NOT
- * the contract between USIG and a plugin.
- *
- * The plugin declares what it wants.
- *
- * USIG takes available inferred facts and attempts to satisfy those declared
- * requirements.
- *
- *
- * 4. PLUGIN PARAMETERS BECOME THE AUTHORITATIVE CONTRACT
- * -------------------------------------------------------
- *
- * Each plugin should declare a parameter manifest describing every parameter
- * required or optionally accepted by its algorithm.
- *
- * This manifest is NOT merely a UI description.
- *
- * It is the machine-readable contract between USIG and the plugin.
- *
- * The manifest should describe, for each parameter:
- *
- *   - canonical key
- *   - aliases
- *   - expected semantic type
- *   - expected unit, where applicable
- *   - whether a unit is mandatory / meaningful
- *   - allowed categorical values, where applicable
- *   - numeric constraints, where applicable
- *   - whether the parameter is required
- *   - optionally, documentation intended for CLI disclosure
- *
- * Example conceptual declaration:
- *
- *   {
- *     key: 'fsGhz',
- *     aliases: ['fs', 'samplingFrequency', 'sampleRate'],
- *     type: 'number',
- *     unit: 'GHz',
- *     required: true
- *   }
- *
- * The exact TypeScript representation should follow the existing USIG plugin
- * types rather than introducing a parallel metadata system unnecessarily.
- *
- *
- * 5. ALIASES REPLACE PLUGIN-SIDE REGEX MATCHING
- * ---------------------------------------------
- *
- * Plugin parameters should NOT contain filename regexes.
- *
- * The plugin should not know whether a value originated from:
- *
- *   - filename inference
- *   - future metadata sources
- *   - CLI -p
- *   - another USIG ingestion layer
- *
- * Instead, the plugin declares aliases describing acceptable semantic names.
- *
- * Alias matching is case-insensitive / case-agnostic.
- *
- * For example:
- *
- *   aliases: ['fs', 'samplingFrequency', 'sampleRate']
- *
- * means that all of:
- *
- *   fs
- *   FS
- *   Fs
- *   samplingFrequency
- *   SamplingFrequency
- *   SAMPLE_RATE
- *   sampleRate
- *
- * can be considered candidates after canonical normalization.
- *
- * The alias list is deliberately extensible. As real datasets reveal additional
- * legitimate naming conventions, aliases can be added without changing the
- * plugin algorithm or the USIG inference engine.
- *
- * The plugin therefore says:
- *
- *   "I accept these semantic names."
- *
- * It does NOT say:
- *
- *   "Search filenames using this particular regex."
- *
- *
- * 6. USIG IR / METADATA LAYER
- * ----------------------------
- *
- * The filename inference result should be represented as structured metadata
- * in the USIG intermediate representation / metadata layer before plugin
- * execution.
- *
- * Conceptually, the flow should be:
- *
- *   input file
- *       |
- *       v
- *   ingestion
- *       |
- *       v
- *   filename / source inference
- *       |
- *       v
- *   normalized metadata / IR
- *       |
- *       v
- *   plugin parameter resolver
- *       |
- *       v
- *   resolved plugin parameter object
- *       |
- *       v
- *   plugin execution
- *
- * The plugin should receive resolved parameters, not raw filename syntax.
- *
- * Whether the concrete existing implementation calls this object an IR frame,
- * WaveformPacket metadata, or another name is secondary. The architectural
- * requirement is that inferred facts exist as structured metadata before the
- * plugin consumes them.
- *
- *
- * 7. UNITS BELONG IN THE PARAMETER CONTRACT
- * ------------------------------------------
- *
- * Every inferred variable should carry a unit field.
- *
- * This also applies to categorical / unitless parameters.
- *
- * Example:
- *
- *   nfft4
- *
- * may infer a numeric value of 4 but has no physical unit.
- *
- * The metadata representation should nevertheless contain a unit field whose
- * value represents "no unit".
- *
- * In JavaScript, the intended representation for this absence is NaN where
- * that is consistent with the surrounding IR representation.
- *
- * The important point is that "unit absent" must be represented explicitly,
- * rather than having two structurally different kinds of inferred variables.
- *
- *
- * 8. FREQUENCY UNIT NORMALIZATION
- * -------------------------------
- *
- * Unit conversion should be performed by USIG's parameter-resolution layer,
- * rather than independently by every plugin.
- *
- * For frequency, USIG should understand SI prefixes and normalize the source
- * value to a canonical base unit before satisfying a plugin's requested unit.
- *
- * The initial frequency-prefix dictionary should include:
- *
- *   Q = 1e30
- *   R = 1e27
- *   Y = 1e24
- *   Z = 1e21
- *   E = 1e18
- *   P = 1e15
- *   T = 1e12
- *   G = 1e9
- *   M = 1e6
- *   k = 1e3
- *   h = 1e2
- *   d = 1e-1
- *   c = 1e-2
- *   m = 1e-3
- *   u = 1e-6
- *   n = 1e-9
- *   p = 1e-12
- *   f = 1e-15
- *   a = 1e-18
- *   z = 1e-21
- *   y = 1e-24
- *   r = 1e-27
- *   q = 1e-30
- *
- * "da" / deka is deliberately excluded from the first implementation.
- *
- * Do NOT infer units merely from the first character of an arbitrary unit
- * string. That approach becomes ambiguous very quickly.
- *
- * Instead, frequency units should be recognized through an explicit dictionary.
- *
- * The conversion conceptually has two stages:
- *
- *   source value + source unit
- *       ->
- *   canonical base unit (Hz)
- *       ->
- *   plugin-requested unit (e.g. GHz)
- *
- * Thus:
- *
- *   2250 MHz
- *       -> 2.25e9 Hz
- *       -> 2.25 GHz
- *
- * The plugin should receive 2.25 if its declared unit is GHz.
- *
- * This keeps unit handling out of the algorithm itself.
- *
- *
- * 9. CATEGORICAL PARAMETERS
- * --------------------------
- *
- * Not every parameter is a physical quantity.
- *
- * For categorical parameters, the manifest may declare a finite set of
- * acceptable values.
- *
- * Example for SMEAS:
- *
- *   window:
- *     allowedValues:
- *       ['auto', 'hanning', 'hamming', ...]
- *
- * This is preferable to allowing arbitrary strings through to the algorithm.
- *
- * "auto" has NO universal meaning in USIG.
- *
- * It is simply one legitimate value of SMEAS's "window" parameter.
- *
- * Another plugin may legitimately define a completely different parameter
- * whose value "auto" means something else.
- *
- * Therefore USIG must never assign semantics to the word "auto".
- *
- * The semantic meaning comes entirely from the plugin manifest.
- *
- *
- * 10. STRICT VALUE VALIDATION
- * ---------------------------
- *
- * Parameter resolution should reject values which do not satisfy the plugin's
- * declared contract.
- *
- * There are two major categories:
- *
- *   categorical:
- *       value must belong to allowedValues
- *
- *   numeric:
- *       value must satisfy its declared numeric constraints
- *
- * Numeric constraints may include:
- *
- *   - integer
- *   - float / number
- *   - minimum
- *   - maximum
- *   - finite
- *   - other constraints required by the plugin
- *
- * Do not assume that a parameter named "fftLength" must necessarily be an
- * integer merely because FFT lengths are conventionally integral.
- *
- * The plugin's declared type/constraint is authoritative.
- *
- * If the implementation intentionally permits a numeric value such as 4.0
- * and JavaScript considers it numerically equal to 4, it should not be rejected
- * merely because the textual representation contains a decimal point.
- *
- * Validation should operate on the resolved semantic value, not unnecessarily
- * on its source spelling.
- *
- *
- * 11. CLI -p VALUES
- * -----------------
- *
- * CLI -p parameters and inferred filename parameters must converge on the same
- * resolution path.
- *
- * The user invoking:
- *
- *   -p key=value
- *
- * is assumed to understand the plugin's declared manifest.
- *
- * Therefore the CLI should disclose the plugin manifest / parameter contract so
- * that users can see:
- *
- *   - parameter names
- *   - aliases
- *   - expected type
- *   - expected unit
- *   - allowed categorical values
- *   - numeric ranges / constraints
- *   - required vs optional status
- *
- * Explicit CLI values should be treated as explicit user input.
- *
- * Inferred metadata should be treated as available facts.
- *
- * The resolver combines these sources according to a deterministic precedence
- * policy, with explicit CLI values taking precedence over inference where both
- * attempt to supply the same parameter.
- *
- * The exact precedence policy should remain centralized in USIG rather than
- * implemented separately in plugins.
- *
- *
- * 12. RESOLVED PARAMETERS ENTER THE PLUGIN
- * -----------------------------------------
- *
- * By the time execution reaches the plugin algorithm, the plugin should receive
- * a clean parameter object in the plugin's own canonical vocabulary.
- *
- * For example:
- *
- *   {
- *     sampleColumn: 'data',
- *     fsGhz: 2.25,
- *     window: 'hanning',
- *     fftLength: 8192
- *   }
- *
- * The plugin should NOT have to:
- *
- *   - inspect filenames
- *   - search aliases
- *   - lowercase arbitrary metadata keys
- *   - parse SI prefixes
- *   - convert MHz to GHz
- *   - determine whether a categorical value is valid
- *   - distinguish inferred metadata from CLI metadata
- *   - apply framework defaults
- *
- * Those are USIG parameter-resolution responsibilities.
- *
- *
- * 13. SIMPLIFYING THE PLUGIN
- * --------------------------
- *
- * One of the principal benefits of this migration is that the plugin should
- * become smaller.
- *
- * Remove plugin-side infrastructure whose only purpose was to compensate for
- * the old architecture.
- *
- * In particular, migrate away from:
- *
- *   - filename regex hooks
- *   - defaultRegex
- *   - defaultReplace
- *   - defaultValue as an inference mechanism
- *   - defaultScope
- *   - plugin-side alias matching
- *   - plugin-side unit parsing for metadata
- *   - plugin-side filename parameter discovery
- *   - automatic framework-style parameter seeding
- *
- * Keep code that is genuinely algorithmic.
- *
- * Keep explicit transformations that are part of the algorithm itself.
- *
- * Do not remove legitimate algorithmic behavior merely because it happens to
- * use the word "auto".
- *
- *
- * 14. DEFAULTS VS OPTIONAL PARAMETERS
- * -----------------------------------
- *
- * The old plugin defaultParams object must be reconsidered carefully.
- *
- * A value should not exist merely because the old UI expected every field to
- * display something.
- *
- * If a parameter is algorithmically required and no universal value exists,
- * it should be required and unresolved rather than silently defaulted.
- *
- * If a parameter genuinely has a mathematically / algorithmically intrinsic
- * default, that default may remain a plugin-level algorithmic default, but it
- * must not be confused with USIG metadata inference.
- *
- * In particular, remove historical defaults such as:
- *
- *   inputMode = 'codes'
- *   minCode = 0
- *   maxCode = 2047
- *
- * when those values were merely conveniences of the old UI rather than facts
- * known about the input.
- *
- * The goal is full agnosticism outside the plugin's declared semantic contract.
- *
- *
- * 15. SAMPLE COLUMN
- * -----------------
- *
- * sampleColumn is different from physical inferred parameters.
- *
- * It is fundamentally a selection of an available input column.
- *
- * USIG can expose available columns to the plugin resolver / CLI, and the
- * plugin can declare that sampleColumn is required and column-select-like.
- *
- * If a source contains an obvious signal column, USIG may infer that fact if
- * the existing ingestion architecture already supports such inference.
- *
- * But this must remain distinct from filename parameter inference.
- *
- *
- * 16. SMEAS-SPECIFIC "AUTO"
- * -------------------------
- *
- * SMEAS has a parameter called "window" for which "auto" is a real, intentional
- * algorithmic mode.
- *
- * "auto" is NOT a USIG concept.
- *
- * The SMEAS manifest should declare it as an allowed categorical value.
- *
- * When SMEAS receives:
- *
- *   window = 'auto'
- *
- * the SMEAS algorithm may take its special optimization/evaluation-window
- * path.
- *
- * This behavior belongs entirely to SMEAS.
- *
- * USIG must not assume that:
- *
- *   auto = optimize
- *   auto = infer
- *   auto = choose automatically
- *   auto = missing value
- *
- * Another plugin can define "auto" differently.
- *
- *
- * 17. TARGET ARCHITECTURE
- * -----------------------
- *
- * The desired architecture is:
- *
- *   FILE / CLI INPUT
- *        |
- *        v
- *   INGESTION
- *        |
- *        +----------------------+
- *        |                      |
- *        v                      v
- *   filename inference       waveform/data metadata
- *        |                      |
- *        +----------+-----------+
- *                   |
- *                   v
- *             USIG IR / METADATA
- *                   |
- *                   v
- *          PLUGIN PARAMETER MANIFEST
- *                   |
- *                   v
- *          PARAMETER RESOLUTION
- *                   |
- *          +--------+---------+
- *          |                  |
- *       aliases           unit conversion
- *          |                  |
- *       validation       normalization
- *          |                  |
- *          +--------+---------+
- *                   |
- *                   v
- *          RESOLVED PLUGIN PARAMS
- *                   |
- *                   v
- *                PLUGIN
- *                   |
- *                   v
- *              ALGORITHM
- *                   |
- *                   v
- *               OUTPUT
- *
- *
- * 18. RESPONSIBILITY BOUNDARIES
- * -----------------------------
- *
- * USIG owns:
- *
- *   - ingestion
- *   - metadata extraction
- *   - filename inference
- *   - IR representation
- *   - alias matching
- *   - case-insensitive matching
- *   - unit recognition
- *   - canonical unit conversion
- *   - conversion into plugin-requested units
- *   - categorical validation
- *   - numeric validation
- *   - CLI parameter parsing
- *   - precedence between explicit and inferred values
- *   - exposing the plugin manifest to the CLI/user
- *
- * The plugin owns:
- *
- *   - semantic meaning of its parameters
- *   - parameter names exposed by the plugin
- *   - aliases
- *   - expected units
- *   - allowed values
- *   - parameter constraints
- *   - algorithmic defaults that are genuinely intrinsic to the algorithm
- *   - interpretation of values such as SMEAS's "window='auto'"
- *   - actual algorithm execution
- *   - plugin outputs
- *
- * The plugin should NOT own:
- *
- *   - knowledge of filename syntax
- *   - generic unit conversion
- *   - generic metadata discovery
- *   - generic alias matching
- *   - generic CLI parsing
- *
- *
- * 19. SINL MIGRATION TARGET
- * -------------------------
- *
- * SINL should be converted first because it is substantially shorter and
- * battle-tested.
- *
- * After migration, verify that:
- *
- *   node usig.mjs -i <known-sine-file> -plugin sinl
- *
- * produces the same numerical results as the current implementation when
- * supplied with equivalent explicit parameters.
- *
- * The existing golden sine file is particularly useful because its filename
- * contains parameters such as:
- *
- *   fs2p25ghz
- *   fftlength8192
- *   numaveraging4
- *   numberofcores8
- *   ticorrections~ogp
- *
- * SINL should not consume parameters merely because they happen to exist in
- * the filename.
- *
- * Only parameters declared by SINL's manifest should be resolved for SINL.
- *
- * For example, fsGhz may not be a SINL parameter at all. Its presence in the
- * IR does not mean SINL should receive it.
- *
- *
- * 20. SMEAS MIGRATION AFTER SINL
- * ------------------------------
- *
- * Once SINL is converted and proven, apply the same architecture to SMEAS.
- *
- * SMEAS should then declare parameters such as its sampling frequency and
- * evaluation window through the same manifest mechanism.
- *
- * The filename inference layer should remain completely ignorant of the
- * meaning of those variables.
- *
- * If a filename contains:
- *
- *   fs2p25ghz
- *
- * and SMEAS declares:
- *
- *   key: 'fsGhz'
- *   aliases: ['fs', 'samplingFrequency', 'sampleRate']
- *   unit: 'GHz'
- *
- * USIG should resolve the inferred source value to:
- *
- *   fsGhz = 2.25
- *
- * before invoking SMEAS.
- *
- * If another plugin declares:
- *
- *   key: 'fsHz'
- *   aliases: ['fs', 'samplingFrequency', 'sampleRate']
- *   unit: 'Hz'
- *
- * the same underlying IR fact should resolve to:
- *
- *   fsHz = 2250000000
- *
- * without modifying the filename inference engine.
- *
- *
- * 21. CORE PRINCIPLE FOR FUTURE DEVELOPMENT
- * ------------------------------------------
- *
- * Do not make USIG smarter by teaching it what individual plugin parameters
- * mean.
- *
- * Make USIG smarter by making its generic parameter-resolution machinery better.
- *
- * The plugin manifest is the semantic bridge.
- *
- * Filename inference produces facts.
- *
- * The manifest says which facts a plugin can consume.
- *
- * The resolver matches them, validates them, and converts their units.
- *
- * The plugin receives only the resolved values it declared.
- *
- * This preserves complete agnosticism in USIG while allowing plugins to become
- * increasingly expressive and precise about their own requirements.
- *
- *
- * 22. MIGRATION CHECKLIST
- * -----------------------
- *
- * When converting this plugin:
- *
- *   [ ] Define the plugin's authoritative parameter manifest.
- *   [ ] Add canonical parameter keys.
- *   [ ] Add aliases where useful.
- *   [ ] Make alias matching case-agnostic.
- *   [ ] Declare units explicitly for physical quantities.
- *   [ ] Represent unitless parameters with the established no-unit value.
- *   [ ] Declare allowed categorical values.
- *   [ ] Declare numeric constraints where required.
- *   [ ] Remove filename regex hooks from the plugin.
- *   [ ] Remove plugin-side metadata matching.
- *   [ ] Remove generic unit conversion from the plugin.
- *   [ ] Remove framework/UI-era default inference machinery.
- *   [ ] Reconsider/remove defaultParams values that are not intrinsic algorithmic
- *       defaults.
- *   [ ] Ensure missing required values remain unresolved and are reported.
- *   [ ] Ensure CLI -p values and inferred metadata use the same resolver.
- *   [ ] Ensure explicit CLI values have deterministic precedence.
- *   [ ] Ensure the CLI can disclose the plugin manifest.
- *   [ ] Ensure the resolved parameter object contains canonical plugin keys.
- *   [ ] Verify numerical output against the existing battle-tested SINL output.
- *   [ ] Only after SINL passes, repeat the architecture for SMEAS.
- *
- * The finished plugin should look conceptually like:
- *
- *   manifest / parameter contract
- *          +
- *   algorithm
- *          +
- *   visualization/output
- *
- * rather than:
- *
- *   manifest
- *   + defaults
- *   + UI fields
- *   + regex inference
- *   + metadata inference
- *   + unit conversion
- *   + algorithm
- *   + visualization/output
- *
- * The migration is therefore not merely a refactor of SINL's hooks. It is a
- * deliberate relocation of generic parameter-resolution responsibility from
- * plugins into USIG, leaving each plugin with a clean declaration of what it
- * needs and a clean implementation of what it does.
+ * app/components/plugins/sinlPlugin.tsx — SINL (Sine USHAPE based INL/DNL) Analysis Plugin
+ * ─────────────────────────────────────────────────────────────────────────────────────────
+ * Sine-histogram INL/DNL analysis for clipped (saturated) sine-wave ADC
+ * captures, using the Okawara-T truncated sine-histogram estimator
+ * (Okawara equations 27–29; ported from inl_tool.py).
+ *
+ * Not intended for ENOB measurement — use SMEAS for that.
+ *
+ * ALGORITHM
+ *   1. Ingest: waveform arrives as an IR WaveformPacket (raw ADC codes or
+ *      voltages). Auto-seeding switches to voltage mode and derives the
+ *      min/max voltage range (with a 2% margin) when metadata reports volts.
+ *   2. Histogram: integer code histogram over 2^adcRes bins; voltage input is
+ *      normalized to a fixed 10-bit (1024-code) histogram.
+ *   3. Truncation: reachable-code bounds (minSizeBin threshold) define the
+ *      integration range; a peak-search avoidance radius locates the true
+ *      sine peaks near each end for the truncation points.
+ *   4. Okawara-T estimation:
+ *        • PDF → CDF → cos(π·CDF)
+ *        • codeSizeOverAmp from the cos-CDF difference across the truncated
+ *          range (LSB size relative to sine amplitude)
+ *        • DNL = -Δcos(π·CDF)/codeSizeOverAmp − 1
+ *        • INL = cumulative cos-based deviation from the ideal ramp
+ *        • 3rd-order least-squares polynomial fit of INL (trend line)
+ *   5. Metrics: INL max/min and p2p (polynomial), DNL max/min/RMS, and
+ *      missing-code count (DNL below missingThreshold, default −0.9 LSB).
+ *
+ * INPUT MODES
+ *   • codes   — raw ADC integer codes; adcRes derived from minCode/maxCode.
+ *   • voltage — floating-point volts; normalized to minCode/maxCode range,
+ *               fixed 10-bit (1024-code) histogram.
+ *
+ * ARCHITECTURE
+ *   A cached single-analysis kernel (getSinlAnalysis) computes singulars +
+ *   results + figureData + debugTables once per (packet, params); run(),
+ *   prepareDebugTables() (with requestedTableIds cherry-picking) and
+ *   prepareFigureData() all share that result — no duplicate computation.
+ *
+ * RENDERING
+ *   Three figures (pdf, dnl, inl) are rendered via Recharts components
+ *   (React) and a portable DOM-free SVG path for CLI export — both consume
+ *   the same PortableFigureDescription built from figureData.
+ *
+ * USAGE (syntax)
+ *   node usig.mjs -i <capture.csv> -plugin sinl \
+ *     -debug inl_dnl_series \
+ *     -figure pdf=/tmp/pdf.svg,dnl=/tmp/dnl.svg,inl=/tmp/inl.svg
+ *
+ *   Figures: pdf | dnl | inl
+ *   Debug tables: inl_dnl_series
+ *
+ * NOTE: This plugin will undergo a further revision to align its parameter
+ * naming, metric definitions, and reporting conventions with USB-IF SigTest
+ * methodology. Treat current outputs as baseline/reference until then.
  */
 
 import {
@@ -1636,32 +907,6 @@ function InlFigure({ data, controls }: { data: unknown; controls: Record<string,
   );
 }
 
-/** Shared figure/debug-table preparation kernel — used by prepareData and prepareDataFromWaveform. */
-function _sinlPrepareCore(
-  samples: number[], adcRes: number, avoidanceRadius: number,
-  minSizeBin: number, missingThreshold: number,
-  fileName: string, minCode: number, maxCode: number,
-  inputMode: 'codes' | 'voltage' = 'codes',
-): { figureData: SinlFigureData; debugTables: PluginDebugTable[] } {
-  const { results, singulars } = runInlTool(samples, adcRes, avoidanceRadius, minSizeBin, missingThreshold);
-  const figureData: SinlFigureData = { results, singulars, fileName, adcRes, minCode, maxCode, inputMode };
-  const nanToNull = (v: number) => (isFinite(v) ? v : null);
-  const debugTables: PluginDebugTable[] = [{
-    id: 'inl_dnl_series',
-    label: 'INL / DNL per-code series',
-    columns: {
-      code:           results.codes,
-      pdf:            results.pdf.map(nanToNull),
-      cdf:            results.cdf.map(nanToNull),
-      cos_cdf:        results.cosCdf.map(nanToNull),
-      dnl:            results.dnl.map(nanToNull),
-      inl:            results.inl.map(nanToNull),
-      inl_polynomial: results.inlPolynomial.map(nanToNull),
-    },
-  }];
-  return { figureData, debugTables };
-}
-
 // ── Portable (renderer-agnostic) figure data ──────────────────────────────────
 // Consumes the same SinlFigureData produced by prepareData() — no analysis
 // recomputation. Used by the CLI to generate SVG/PNG/JPEG figures and a
@@ -1759,6 +1004,86 @@ const sinlFigures: PluginFigure[] = [
   { id: 'inl', label: 'INL + polynomial', component: InlFigure, getData: (data) => getSinlInlFigureData(data as SinlFigureData) },
 ];
 
+// ── Cached single-analysis kernel ─────────────────────────────────────────────
+// One analysis per (packet, params) per invocation. run(), prepareDebugTables()
+// and prepareFigureData() all share this result — no duplicate computation.
+
+interface SinlAnalysis {
+  singulars: InlSingulars;
+  results: InlResults;
+  figureData: SinlFigureData;
+  debugTables: PluginDebugTable[];
+}
+
+const sinlAnalysisCache = new WeakMap<
+  WaveformPacket,
+  { paramsKey: string; analysis: SinlAnalysis }
+>();
+
+function getSinlAnalysis(
+  packet: WaveformPacket,
+  params: SinlParams,
+): SinlAnalysis {
+  const resolved = inferSinlParamsFromPacket(params, packet);
+  const paramsKey = JSON.stringify(resolved);
+  const cached = sinlAnalysisCache.get(packet);
+  if (cached && cached.paramsKey === paramsKey) return cached.analysis;
+
+  const {
+    minCode,
+    maxCode,
+    adcRes,
+    avoidanceRadius,
+    minSizeBin,
+    missingThreshold,
+  } = normalizeSinlParams(resolved);
+
+  const samples = samplesToCodes(
+    packet.waveform,
+    resolved.inputMode,
+    minCode,
+    maxCode,
+    adcRes,
+  );
+
+  const { results, singulars } = runInlTool(
+    samples,
+    adcRes,
+    avoidanceRadius,
+    minSizeBin,
+    missingThreshold,
+  );
+
+  const figureData: SinlFigureData = {
+    results,
+    singulars,
+    fileName: packet.metadata.sourceFile ?? 'waveform',
+    adcRes,
+    minCode,
+    maxCode,
+    inputMode: resolved.inputMode,
+  };
+
+  const nanToNull = (v: number) => (isFinite(v) ? v : null);
+  const debugTables: PluginDebugTable[] = [{
+    id: 'inl_dnl_series',
+    label: 'INL / DNL per-code series',
+    columns: {
+      code:           results.codes,
+      pdf:            results.pdf.map(nanToNull),
+      cdf:            results.cdf.map(nanToNull),
+      cos_cdf:        results.cosCdf.map(nanToNull),
+      dnl:            results.dnl.map(nanToNull),
+      inl:            results.inl.map(nanToNull),
+      inl_polynomial: results.inlPolynomial.map(nanToNull),
+    },
+  }];
+
+  const analysis: SinlAnalysis = { singulars, results, figureData, debugTables };
+  sinlAnalysisCache.set(packet, { paramsKey, analysis });
+  return analysis;
+}
+
 
 // ── Plugin ────────────────────────────────────────────────────────────────────
 export const sinlPlugin: Plugin<SinlParams> = {
@@ -1787,61 +1112,27 @@ export const sinlPlugin: Plugin<SinlParams> = {
   ],
 
   run: async (packet, params: SinlParams) => {
-    // packet is already IR
-    // no file handling
-    // no ingestion
-    // no format detection
-    params = inferSinlParamsFromPacket(params, packet);
-    const isVolt           = params.inputMode === 'voltage';
-    const minCode          = isVolt ? Number(params.minCode) : Math.round(Number(params.minCode) ?? 0);
-    const maxCode          = isVolt ? Number(params.maxCode) : Math.round(Number(params.maxCode) ?? 2047);
-    const adcRes           = isVolt ? 10 : deriveAdcRes(Math.round(minCode), Math.round(maxCode));
-    const avoidanceRadius  = Math.max(0, Math.round(Number(params.avoidanceRadius) ?? 40));
-    const minSizeBin       = Math.max(1, Math.round(Number(params.minSizeBin)      ?? 2));
-    const missingThreshold = Number(params.missingThreshold) ?? -0.9;
-    const samples          = samplesToCodes(packet.waveform, params.inputMode, minCode, maxCode, 10);
-    const { singulars }    = runInlTool(samples, adcRes, avoidanceRadius, minSizeBin, missingThreshold);
-    const fileName         = packet.metadata.sourceFile ?? 'waveform';
-    return singularsToOutput(singulars, fileName);
+    const { singulars, figureData } = getSinlAnalysis(packet, params);
+    return singularsToOutput(singulars, figureData.fileName);
   },
 
-  prepareData: async (
+    prepareDebugTables: async (
     packet: WaveformPacket,
     params: SinlParams,
-  ): Promise<{
-    figureData: SinlFigureData;
-    debugTables: PluginDebugTable[];
-  }> => {
-    params = inferSinlParamsFromPacket(params, packet);
+    requestedTableIds?: string[],
+  ): Promise<PluginDebugTable[]> => {
+    const { debugTables } = getSinlAnalysis(packet, params);
+    if (!requestedTableIds || requestedTableIds.includes('all')) {
+      return debugTables;
+    }
+    return debugTables.filter((table) => requestedTableIds.includes(table.id));
+  },
 
-    const {
-      minCode,
-      maxCode,
-      adcRes,
-      avoidanceRadius,
-      minSizeBin,
-      missingThreshold,
-    } = normalizeSinlParams(params);
-
-    const samples = samplesToCodes(
-      packet.waveform,
-      params.inputMode,
-      minCode,
-      maxCode,
-      adcRes,
-    );
-
-    return _sinlPrepareCore(
-      samples,
-      adcRes,
-      avoidanceRadius,
-      minSizeBin,
-      missingThreshold,
-      packet.metadata.sourceFile ?? 'waveform',
-      minCode,
-      maxCode,
-      params.inputMode,
-    );
+    prepareFigureData: async (
+    packet: WaveformPacket,
+    params: SinlParams,
+  ): Promise<SinlFigureData> => {
+    return getSinlAnalysis(packet, params).figureData;
   },
 
   figures: sinlFigures,

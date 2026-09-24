@@ -1,792 +1,81 @@
 /**
  * app/components/plugins/smeasPlugin.tsx — SMEAS (Spectrum Measurement) for sine analysis
- *
- * Analyzes single-tone sine waves via FFT, computes SNR, SNDR, ENOB, THD, SFDR.
- * Supports time_domain_codes and time_domain_volts input.
- * v1: Single-tone only, int_number_of_cores=1 (no TI spurs), rectangular windowing + options.
- */
-
-/*
- * ═══════════════════════════════════════════════════════════════════════════════
- * MIGRATION NOTE: OLD FILE-BASED PLUGIN ARCHITECTURE → IR/WAVEFORM ARCHITECTURE
- * ═══════════════════════════════════════════════════════════════════════════════
- *
- * PURPOSE
- * -------
- * This plugin must operate on the canonical IR WaveformPacket. The old plugin
- * architecture passed a File into run(), and the plugin itself performed file
- * ingestion, format detection, column selection, etc. That is no longer the
- * architecture.
- *
- * OLD ARCHITECTURE
- * ----------------
- *
- *     CLI / UI
- *        |
- *        v
- *     plugin.run(file, params)
- *        |
- *        +--> plugin reads File
- *        +--> plugin calls ingestFile()
- *        +--> plugin selects a column
- *        +--> plugin performs format-specific handling
- *        +--> plugin analyzes samples
- *
- * NEW ARCHITECTURE
- * ----------------
- *
- *     CLI / UI
- *        |
- *        v
- *     IREngine.getOrIngest(file, hints)
- *        |
- *        +--> ingestAllColumns()        [metadata / headers / captured vars]
- *        |
- *        +--> ingestFile(file, hints)   [canonical waveform]
- *        |
- *        v
- *     SignalFrame
- *        |
- *        +--> frame.packet
- *        |       |
- *        |       +--> waveform: Float32Array
- *        |       +--> metadata: WaveformMetadata
- *        |
- *        +--> frame.headers
- *        +--> frame.singleValueColumns
- *        +--> frame.capturedVars
- *        |
- *        v
- *     plugin.run(frame.packet, params)
- *
- *
- * IMPORTANT: THE CANONICAL API IS run(packet, params)
- * --------------------------------------------------
- *
- * pluginTypes.ts now defines:
- *
- *     run: (
- *       packet: WaveformPacket,
- *       params: P,
- *     ) => Promise<Record<string, string | number>>;
- *
- * Therefore the plugin's run() must NOT expect a File.
- *
- * Correct:
- *
- *     run: async (packet, params) => {
- *       const samples = packet.waveform;
- *       ...
- *     }
- *
- * Incorrect:
- *
- *     run: async (file, params) => {
- *       const packet = await ingestFile(file);
- *       ...
- *     }
- *
- * Also incorrect:
- *
- *     run: async (packet, params) => {
- *       const packet = await ingestFile(packet);
- *       ...
- *     }
- *
- * The packet has ALREADY been ingested by the pipeline.
- *
- *
- * DO NOT REINTRODUCE runFromWaveform()
- * ------------------------------------
- *
- * During migration it is tempting to preserve both:
- *
- *     run(file, params)
- *
- * and:
- *
- *     runFromWaveform(packet, params)
- *
- * That creates two competing plugin APIs and is unnecessary.
- *
- * The final architecture should use:
- *
- *     run(packet, params)
- *
- * The CLI/pipeline should call:
- *
- *     plugin.run(frame.packet, finalParams)
- *
- * not:
- *
- *     plugin.runFromWaveform(...)
- *
- * and not:
- *
- *     plugin.run(file, ...)
- *
- * The temporary compatibility check in the CLI may accept an old
- * runFromWaveform export while migrating plugins, but new/migrated plugins
- * should expose the standard run(packet, params) API.
- *
- *
- * THE MOST IMPORTANT MIGRATION PITFALL
- * ------------------------------------
- *
- * DO NOT ASSUME THAT packet IS THE SAME OBJECT AS THE OLD INGESTION RESULT.
- *
- * The canonical packet has this shape conceptually:
- *
- *     {
- *       waveform: Float32Array,
- *       metadata: {
- *         ...
- *       }
- *     }
- *
- * Therefore:
- *
- *     packet.waveform
- *
- * is the sample array.
- *
- * Metadata is accessed through:
- *
- *     packet.metadata
- *
- * For example:
- *
- *     packet.metadata.units
- *
- *     packet.metadata.sourceFile
- *
- *     packet.metadata.numSamples
- *
- * NEVER write code that assumes:
- *
- *     packet.units
- *
- *     packet.sourceFile
- *
- *     packet.numSamples
- *
- * when those values are actually inside packet.metadata.
- *
- *
- * A PARTICULAR MIGRATION PITFALL: undefined metadata
- * --------------------------------------------------
- *
- * If code is executed with the wrong object, this:
- *
- *     packet.metadata.units
- *
- * can fail with:
- *
- *     TypeError: Cannot read properties of undefined (reading 'units')
- *
- * This happened during migration when inferSinlParamsFromPacket() was called
- * with something that was not the canonical WaveformPacket.
- *
- * The correct call is:
- *
- *     params = inferSinlParamsFromPacket(params, packet);
- *
- * where packet is the actual:
- *
- *     frame.packet
- *
- * returned by:
- *
- *     irEngine.getOrIngest(...)
- *
- * Do not "fix" this by randomly adding optional chaining everywhere. First
- * verify that the object being passed is actually the canonical packet.
- *
- * Optional chaining can hide an architectural error if the wrong object is
- * being passed.
- *
- *
- * WHERE INGESTION NOW BELONGS
- * ---------------------------
- *
- * File ingestion belongs upstream in IREngine:
- *
- *     const frame = await irEngine.getOrIngest(file, hints);
- *
- * The engine does:
- *
- *     ingestAllColumns(file)
- *
- * when necessary for column/header/captured-variable information, and then:
- *
- *     ingestFile(file, hints)
- *
- * to construct the canonical WaveformPacket.
- *
- * The plugin receives the result:
- *
- *     frame.packet
- *
- * The plugin must not call ingestFile().
- *
- *
- * COLUMN SELECTION PITFALL
- * ------------------------
- *
- * Old plugins often had logic resembling:
- *
- *     ingestFile(file, ...)
- *
- * followed by:
- *
- *     selectColumn(...)
- *
- * or direct parsing of a particular CSV column.
- *
- * That logic must NOT simply be copied into the new run().
- *
- * Column selection is now part of ingestion / parameter resolution.
- *
- * If a plugin needs a column selection parameter, declare it through the
- * declarative plugin parameter system, normally using:
- *
- *     paramFields
- *
- * and/or:
- *
- *     manifest.paramSchema
- *
- * The ingestion layer / pipeline resolves the selected signal into the
- * canonical packet.
- *
- * The plugin then analyzes:
- *
- *     packet.waveform
- *
- * not the original CSV.
- *
- *
- * DO NOT USE File APIs INSIDE THE ANALYSIS PATH
- * ---------------------------------------------
- *
- * A migrated plugin should not contain analysis-time code such as:
- *
- *     file.text()
- *     file.arrayBuffer()
- *     FileReader
- *     Papa.parse(...)
- *     ingestFile(...)
- *     ingestAllColumns(...)
- *     format detection
- *     CSV parsing
- *     XLSX parsing
- *
- * Those responsibilities belong upstream.
- *
- * The plugin should be format-independent.
- *
- * A CSV file, TXT file, XLSX-derived signal, binary-derived signal, etc. should
- * all arrive at the plugin as the same canonical WaveformPacket abstraction.
- *
- *
- * PRESERVE THE ALGORITHM; CHANGE THE INPUT BOUNDARY
- * -------------------------------------------------
- *
- * The safest migration strategy is:
- *
- *     1. Leave the core algorithm alone.
- *     2. Remove file ingestion from the plugin.
- *     3. Change the algorithm's input from the old parsed representation to
- *        packet.waveform.
- *     4. Move any required file/format knowledge into the ingestion layer.
- *     5. Move column-selection UI/parameter declarations into paramFields and
- *        manifest.paramSchema.
- *     6. Use packet.metadata for signal metadata.
- *
- * In other words, do NOT rewrite the mathematical algorithm merely because
- * the architecture changed.
- *
- *
- * EXAMPLE OF THE DESIRED PATTERN
- * ------------------------------
- *
- *     run: async (packet, params) => {
- *       const samples = packet.waveform;
- *
- *       // Analysis only.
- *       const result = runSomeAlgorithm(samples, params);
- *
- *       const fileName = packet.metadata.sourceFile ?? 'waveform';
- *
- *       return {
- *         filename: fileName,
- *         ...
- *       };
- *     },
- *
- *
- * PREPAREDATA MUST FOLLOW THE SAME RULE
- * -------------------------------------
- *
- * If the plugin has prepareData(), it receives the same canonical packet:
- *
- *     prepareData: async (packet, params) => {
- *       const samples = packet.waveform;
- *       ...
- *     }
- *
- * It must NOT ingest the File again.
- *
- * Correct:
- *
- *     prepareData(packet, params)
- *
- * Incorrect:
- *
- *     prepareData(file, params)
- *
- * Incorrect:
- *
- *     prepareData(packet, params) {
- *       return ingestFile(packet);
- *     }
- *
- *
- * METADATA PITFALL
- * ----------------
- *
- * Old code may have obtained metadata from the file parser, for example:
- *
- *     parsed.units
- *     parsed.filename
- *     parsed.sampleRate
- *
- * After migration, check the WaveformMetadata definition and use the canonical
- * location.
- *
- * Typical access is:
- *
- *     packet.metadata.units
- *     packet.metadata.sourceFile
- *
- * Do not invent new top-level packet properties just to make old code work.
- *
- *
- * PARAMETER INFERENCE PITFALL
- * ---------------------------
- *
- * Filename-derived and captured-variable parameters are resolved by the
- * pipeline before plugin.run().
- *
- * The CLI currently constructs:
- *
- *     let finalParams = { ...plugin.defaultParams, ...params };
- *
- * then builds the input summary and finally applies the resolved input-summary
- * values:
- *
- *     for (const row of inputSummary) {
- *       finalParams[row.key] = row.value;
- *     }
- *
- * Therefore plugin.run() should consume the resolved params.
- *
- * Do not duplicate the entire filename-inference / captured-variable pipeline
- * inside the plugin.
- *
- * Plugin-specific parameter declarations belong in:
- *
- *     paramFields
- *
- * and/or:
- *
- *     manifest.paramSchema
- *
- *
- * PARAMETER TYPES AND VALUES
- * --------------------------
- *
- * Be careful during migration because CLI-derived parameters can arrive as
- * strings even when the logical parameter is numeric.
- *
- * Existing plugins commonly normalize explicitly:
- *
- *     Number(params.someValue)
- *
- *     Math.round(Number(params.someValue))
- *
- *     Math.max(...)
- *
- * Preserve the existing normalization semantics when migrating.
- *
- * Do not assume that TypeScript's declared type guarantees the runtime value's
- * representation at the CLI boundary.
- *
- *
- * DEFAULTS MUST REMAIN CONSISTENT
- * -------------------------------
- *
- * Keep:
- *
- *     defaultParams
- *
- * consistent with:
- *
- *     manifest.paramSchema
- *
- * and:
- *
- *     paramFields
- *
- * In particular, do not accidentally remove a parameter from defaultParams
- * because it is now declared in paramFields.
- *
- * The declarative parameter system describes the UI/inference behavior;
- * defaultParams still provides the plugin's baseline parameter object.
- *
- *
- * MULTI-PLUGIN / CLI PITFALL
- * -------------------------
- *
- * The CLI now obtains one shared IR frame and runs multiple plugins against
- * that frame.
- *
- * Conceptually:
- *
- *     const frame = await irEngine.getOrIngest(file, sharedHints);
- *
- *     for (const plugin of plugins) {
- *       const result = await plugin.run(frame.packet, finalParams);
- *     }
- *
- * Therefore a plugin MUST NOT mutate packet.waveform or packet.metadata in a
- * way that changes the input for another plugin.
- *
- * Treat the packet as read-only.
- *
- * If the algorithm needs a mutable working array, make a copy:
- *
- *     const samples = new Float32Array(packet.waveform);
- *
- * or otherwise use a non-mutating algorithm.
- *
- *
- * HINTS PITFALL
- * -------------
- *
- * Ingestion hints are an upstream concern.
- *
- * If the plugin requires a particular column, the plugin should DECLARE the
- * requirement so the pipeline can construct the correct packet.
- *
- * Do not solve a missing-column problem by reopening and reparsing the File
- * inside run().
- *
- * The intended flow is:
- *
- *     plugin declaration
- *          |
- *          v
- *     pipeline determines hints
- *          |
- *          v
- *     IREngine.getOrIngest(file, hints)
- *          |
- *          v
- *     canonical packet
- *          |
- *          v
- *     plugin.run(packet, params)
- *
- *
- * CACHE PITFALL
- * -------------
- *
- * IREngine caches frames by file + ingestion hints.
- *
- * This means:
- *
- *     getOrIngest(file)
- *
- * and:
- *
- *     getOrIngest(file, hints)
- *
- * can represent different cached frames.
- *
- * Do not bypass the engine and perform ad-hoc ingestion in the plugin. Doing
- * so defeats the IR cache and can cause repeated file reads.
- *
- *
- * DO NOT CONFUSE COLUMNAR DATA WITH THE WAVEFORM PACKET
- * -----------------------------------------------------
- *
- * The engine exposes both:
- *
- *     frame.headers
- *     frame.singleValueColumns
- *     frame.capturedVars
- *
- * and:
- *
- *     frame.packet
- *
- * These have different purposes.
- *
- * frame.packet is the canonical signal consumed by the analysis algorithm.
- *
- * frame.headers / singleValueColumns / capturedVars are pipeline metadata used
- * for parameter resolution, UI, inference, etc.
- *
- * Do not reconstruct the signal from frame.headers or capturedVars inside the
- * plugin.
- *
- *
- * CLI COMPATIBILITY CHECK PITFALL
- * -------------------------------
- *
- * During migration the CLI may contain a compatibility check such as:
- *
- *     if (
- *       !pluginExport ||
- *       (
- *         typeof pluginExport.run !== 'function' &&
- *         typeof pluginExport.runFromWaveform !== 'function'
- *       )
- *     ) {
- *       throw new Error(...);
- *     }
- *
- * This DOES NOT mean a migrated plugin should implement both APIs.
- *
- * It merely allows the CLI to recognize plugins during the transition.
- *
- * The desired migrated plugin API is:
- *
- *     run(packet, params)
- *
- * The actual execution path for the migrated architecture should be:
- *
- *     scalarResult = await plugin.run(frame.packet, finalParams);
- *
- * If compatibility code still references runFromWaveform, do not use that as
- * a reason to reintroduce runFromWaveform into the plugin. Remove the
- * compatibility branch once all plugins have migrated.
- *
- *
- * SEARCH/VERIFY CHECKLIST AFTER MIGRATION
- * ---------------------------------------
- *
- * After converting a plugin, search for old file-based execution and ingestion.
- *
- * Useful checks:
- *
- *     grep -RIn --exclude-dir=node_modules --exclude-dir=.git \
- *       "ingestFile" app/components/plugins/<plugin>Plugin.tsx
- *
- *     grep -RIn --exclude-dir=node_modules --exclude-dir=.git \
- *       "ingestAllColumns" app/components/plugins/<plugin>Plugin.tsx
- *
- *     grep -RIn --exclude-dir=node_modules --exclude-dir=.git \
- *       "\.run(file" app usig.mjs
- *
- *     grep -RIn --exclude-dir=node_modules --exclude-dir=.git \
- *       "runFromWaveform" app usig.mjs
- *
- * For a fully migrated plugin, ingestion should not appear in the plugin's
- * implementation, and the plugin should expose:
- *
- *     run: async (packet, params) => ...
- *
- *
- * VERIFY THE CLI EXECUTION SITE
- * -----------------------------
- *
- * The critical CLI line should be equivalent to:
- *
- *     scalarResult = await plugin.run(frame.packet, finalParams);
- *
- * NOT:
- *
- *     scalarResult = await plugin.run(file, finalParams);
- *
- * The distinction is crucial. If the CLI passes File while the plugin expects
- * WaveformPacket, the plugin may fail later with misleading errors such as:
- *
- *     Cannot read properties of undefined (reading 'units')
- *
- * because File does not have the canonical packet structure.
- *
- *
- * VERIFY THE FRAME CONSTRUCTION
- * -----------------------------
- *
- * The CLI should obtain the frame through:
- *
- *     const frame = await irEngine.getOrIngest(
- *       file,
- *       Object.keys(hints).length ? hints : undefined
- *     );
- *
- * Then:
- *
- *     frame.packet
- *
- * is what gets passed to the plugin.
- *
- * A useful debug check during migration is:
- *
- *     console.error({
- *       hasFrame: !!frame,
- *       hasPacket: !!frame?.packet,
- *       hasWaveform: !!frame?.packet?.waveform,
- *       hasMetadata: !!frame?.packet?.metadata,
- *       units: frame?.packet?.metadata?.units,
- *       numSamples: frame?.packet?.metadata?.numSamples,
- *     });
- *
- * Remove temporary debugging once migration is verified.
- *
- *
- * SINL MIGRATION LESSON
- * ---------------------
- *
- * SINL demonstrated the intended final pattern:
- *
- *     run: async (packet, params) => {
- *       params = inferSinlParamsFromPacket(params, packet);
- *
- *       ...
- *
- *       const samples = samplesToCodes(
- *         packet.waveform,
- *         params.inputMode,
- *         minCode,
- *         maxCode,
- *         10,
- *       );
- *
- *       ...
- *
- *       const fileName =
- *         packet.metadata.sourceFile ?? 'waveform';
- *
- *       return singularsToOutput(singulars, fileName);
- *     }
- *
- * The important part is not the SINL-specific algorithm. The important part is
- * the boundary:
- *
- *     packet.waveform
- *     packet.metadata
- *
- * The algorithm is now completely independent of the original file format.
- *
- *
- * FINAL MIGRATION RULE
- * --------------------
- *
- * When converting an old plugin, think:
- *
- *     "Move ingestion OUT of the plugin, not INTO a differently named function."
- *
- * Old:
- *
- *     File
- *       -> plugin
- *       -> ingest
- *       -> parse
- *       -> select column
- *       -> analyze
- *
- * New:
- *
- *     File
- *       -> IREngine
- *       -> ingest
- *       -> select/resolve signal
- *       -> WaveformPacket
- *       -> plugin
- *       -> analyze
- *
- * The plugin begins at the final arrow.
- *
- * The plugin receives:
- *
- *     packet: WaveformPacket
- *
- * and should principally operate on:
- *
- *     packet.waveform
- *
- * with signal metadata from:
- *
- *     packet.metadata
- *
- * and resolved algorithm parameters from:
- *
- *     params
- *
- * If code inside the plugin needs to reopen the File, parse CSV/XLSX/TXT,
- * detect the format, or call ingestFile(), the migration is incomplete.
- *
- * ═══════════════════════════════════════════════════════════════════════════════
- */
-
-/**
- * ═══════════════════════════════════════════════════════════════════════════════
- * DUAL-TONE SUPPORT STATUS — IMPLEMENTED BUT UNVALIDATED
- * ═══════════════════════════════════════════════════════════════════════════════
- *
- * `toneMode: 'dual'` is a real, fully-wired code path — not a stub or
- * placeholder. It exists through the entire pipeline:
- *
- *   - kernel (analyzeSpectrum): F2 peak detection, IM3 sideband calculation
- *     (min of the 2·F2−F1 / 2·F1−F2 bins), dual-aware TI-spur exclusion,
- *     dual-aware noise-floor subtraction (see `isDual` branches throughout
- *     analyzeSpectrum).
- *   - scalar output: `fund2_mhz`, `fund2_dbfs`, `im3_dbc`, `im3_mhz` are
- *     added to the result row whenever `toneMode === 'dual'`.
- *   - figures: F1/F2/IM3 markers, dual-tone combinational-product harmonic
- *     markers (e.g. "3F1+2F2"), legend entries, and results-panel rows are
- *     all generated correctly when `isDual` is true (getSmeasSpectrumFigureData
- *     / getSmeasTiDeembeddedFigureData and their marker/legend/resultsPanel
- *     helpers).
- *
- * What is MISSING:
- *
- *   - No genuine two-tone golden dataset exists in test/golden_raw_data/.
- *   - No regression test currently exercises `toneMode=dual` end-to-end, so
- *     the numerical correctness of F2 detection / IM3 calculation has never
- *     been validated against a known-good two-tone capture.
- *   - An exploratory test (forcing `-p toneMode=dual` on a genuinely
- *     single-tone golden file) confirmed the plumbing runs without errors
- *     end-to-end, but such a test cannot validate correctness — the
- *     "second tone" it detects is actually a spur/harmonic of the single
- *     real tone, so IM3 in that scenario is not physically meaningful (it
- *     can even degenerate to a clamped bin index at the spectrum edge).
- *
- * Future work required before relying on dual-tone results in production:
- *
- *   1. Capture (or synthesize) a real two-tone dataset with known F1/F2/IM3
- *      and add it to test/golden_raw_data/.
- *   2. Add scalar-result assertions (fund2_mhz/fund2_dbfs/im3_dbc/im3_mhz)
- *      and figure/marker assertions (F2 + IM3 markers present with correct
- *      values) to the regression suites.
- *
- * Do not treat the current absence of failures as proof of correctness —
- * it only proves the code path doesn't crash.
- * ═══════════════════════════════════════════════════════════════════════════════
+ * ─────────────────────────────────────────────────────────────────────────────
+ * FFT-based single/dual-tone sine analysis computing SNR, SNDR, ENOB, THD,
+ * SFDR, and noise metrics. Supports ADC codes, volts, or pre-computed
+ * single-sided power spectrum input, with windowing (rectangular, Hann,
+ * Hamming, Blackman, Blackman-Harris, Flat-Top, Kaiser), coherent-gain /
+ * ENBW / lobe-integration correction, and optional time-interleaved (TI)
+ * ADC mismatch characterisation and de-embedding.
+ *
+ * ALGORITHM
+ *   1. Ingest: waveform arrives as an IR WaveformPacket (codes or volts).
+ *      Auto-seeding switches input mode to volts and seeds Vfs from packet
+ *      metadata when the user left defaults.
+ *   2. FFT: per-frame windowed transform (fft.js for power-of-2 lengths,
+ *      O(N²) DFT fallback otherwise, with a user-visible warning), averaged
+ *      across numAveraging frames, folded to single-sided, and amplitude-
+ *      corrected by 1/√coherentGain.
+ *   3. Tone / spur separation:
+ *        • Fundamental(s): peak-bin search + lobe integration (±nHalfBins).
+ *        • Harmonics/IM: H2..Hk for single-tone; all m·F1+n·F2 combinations
+ *          up to the requested order for dual-tone, aliased into Nyquist.
+ *        • TI spurs: kL/kC/kR bin pattern around L/numCores multiples
+ *          (numberOfCores > 1 only), kept independent of IM classification.
+ *        • Noise: total − DC − fundamental(s) − harmonics − TI spurs
+ *          (subtraction method; ENBW is NOT re-applied here).
+ *   4. Metrics: SNR/SNDR/ENOB (carrier- and full-scale-referenced), THD,
+ *      Nrms, IM3 (dual-tone), and SFDR with configurable leakage-avoidance
+ *      blanking around DC/Nyquist/fundamental(s)/TI spurs, plus a
+ *      TI-de-embedded SFDR variant.
+ *   5. Spur minimum threshold: histogram σ-based auto-calc for display, with
+ *      optional explicit override that also filters noise for SNR.
+ *
+ * AUTO WINDOW MODE
+ *   'auto' runs rectangular as baseline, then every other candidate window.
+ *   If ALL windowed results beat rectangular ENOB → leakage is present and
+ *   the best windowed result is chosen. If ANY windowed result fails to beat
+ *   rectangular → coherent capture; rectangular is returned. The decision is
+ *   reported via `window_used` and `_autoLeakageDetected`.
+ *
+ * TI MISMATCH CORRECTION
+ *   Per-core offset (quantized to tiOffsetQuantLsb), gain (normalized to the
+ *   reference phase), and phase-skew are characterised via rectangular-
+ *   windowed sub-stream FFTs with Quinn first-estimator sub-bin interpolation
+ *   (ε) and analytic bias removal. Corrections apply in user-specified order
+ *   ('O,G,P'); phase correction rotates the sub-spectrum by the per-core
+ *   delta angle and inverse-FFTs back to time domain.
+ *
+ * ARCHITECTURE
+ *   A cached single-analysis kernel (getSmeasAnalysis → _smeasRunCore)
+ *   computes scalarResult + figureData + debugTables once per
+ *   (packet, params); run(), prepareDebugTables() (with requestedTableIds
+ *   cherry-picking) and prepareFigureData() all share that result.
+ *
+ * RENDERING
+ *   Three figures (spectrum, spectrum_ti_deembedded, spectrum_noise) are
+ *   rendered via an embedded canvas component (React) and a portable
+ *   DOM-free SVG renderer (renderSmeasFigureToSvg) for CLI export — both
+ *   consume the same PortableFigureDescription built from figureData.
+ *
+ * USAGE (syntax)
+ *   node usig.mjs -i <capture.csv> -plugin smeas \
+ *     -debug spectra,im_components \
+ *     -figure spectrum=/tmp/spec.svg,spectrum_noise=/tmp/noise.svg
+ *
+ *   Figures: spectrum | spectrum_ti_deembedded | spectrum_noise
+ *   Debug tables: spectra | timedomain | im_components | ti_spurs | ti_cal
+ *
+ * NOTE: This plugin will undergo a further revision to align its parameter
+ * naming, metric definitions, and reporting conventions with USB-IF SigTest
+ * methodology. Treat current outputs as baseline/reference until then.
  */
 
 import { type Plugin, type PluginManifest, type PluginFigure, type InferredParamField, type PortableFigureDescription } from '../../lib/pluginTypes';
 import smeasDoc from './smeasPlugin.doc';
-import { useState, useMemo, useRef, useEffect } from 'react';
+import { useRef, useEffect } from 'react';
 import FFT from 'fft.js';
-import {
-  ComposedChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
-  ReferenceLine, ReferenceArea, ResponsiveContainer, Legend,
-} from 'recharts';
+// import { ResponsiveContainer, ScatterChart, Scatter, XAxis, YAxis, ZAxis, CartesianGrid, Tooltip, Legend, ReferenceLine, ReferenceArea } from 'recharts';
 
 export interface SmeasParams {
   targetColumn: string;   // CSV column containing signal data - declared in paramFields
@@ -1966,7 +1255,7 @@ function analyzeFromPs(
       spursMinDbfsCalc = mean + spursMinCalcFactor * sd;
     }
   }
-  const spursMinDbfs = spursMinDbfsOverride !== 0 ? spursMinDbfsOverride : spursMinDbfsCalc;
+  const spursMinDbfs = Number(spursMinDbfsOverride !== 0 ? spursMinDbfsOverride : spursMinDbfsCalc);
 
   // ── TI spur bins ─────────────────────────────────────────────────────────
   interface TiSpurEntry { bin: number; mhz: number; dbfs: number; label: string; }
@@ -1978,7 +1267,7 @@ function analyzeFromPs(
     const kMax = Math.floor(intTiMax / 3);
     const seenTi = new Set<number>();
 
-    const addTi = (arr: TiSpurEntry[], rawBin: number, label: string, isSet2 = false) => {
+    const addTi = (arr: TiSpurEntry[], rawBin: number, label: string) => {
       const bin = Math.round(aliasedBinIndex(rawBin, L));
       if (bin <= 0 || bin >= S1len) return;
       if (bin === fundBin || (isDual && bin === fund2Bin)) return;
@@ -2003,10 +1292,10 @@ function analyzeFromPs(
 
     if (isDual) {
       for (let k = 1; k <= kMax; k++) {
-        addTi(tiSpurEntries2, (k * L / numberOfCores) - fund2Bin, `${k}L2`, true);
-        addTi(tiSpurEntries2, (k * L / numberOfCores) + fund2Bin, `${k}R2`, true);
+        addTi(tiSpurEntries2, (k * L / numberOfCores) - fund2Bin, `${k}L2`);
+        addTi(tiSpurEntries2, (k * L / numberOfCores) + fund2Bin, `${k}R2`);
       }
-      addTi(tiSpurEntries2, ((kMax + 1) * L / numberOfCores) - fund2Bin, `${kMax + 1}L2`, true);
+      addTi(tiSpurEntries2, ((kMax + 1) * L / numberOfCores) - fund2Bin, `${kMax + 1}L2`);
     }
   }
 
@@ -2097,8 +1386,7 @@ function analyzeFromPs(
   // const minRadiusMhz = (0.003 * fsHz) / 1e6;
   // const userRadiusMhz = Number(sfdrLeakageAvoidanceRadiusMhz) || 0;
   // const effectiveRadiusMhz = Math.max(minRadiusMhz, userRadiusMhz);
-  const userRadiusMhz = Number(sfdrLeakageAvoidanceRadiusMhz) || 0;
-  const effectiveRadiusMhz = userRadiusMhz;
+  const effectiveRadiusMhz = Number(sfdrLeakageAvoidanceRadiusMhz) || 0;
   const avoidBins = hzPerBin > 0 ? Math.ceil((effectiveRadiusMhz * 1e6) / hzPerBin) : 1;
 
   const blankAround = (arr: number[], center: number, halfBins: number) => {
@@ -2197,69 +1485,6 @@ function analyzeFromPs(
     samplesVolts: Array.from(samplesVolts),
     samplesCodes: Array.from(samplesCodes),
   };
-}
-
-
-// ── Shared dark tooltip ───────────────────────────────────────────────────────
-function SmeasTooltip({ active, payload, label }: any) {
-  if (!active || !payload?.length) return null;
-  // Only show tooltip for the spectrum line (key 'ps'), not marker series
-  const specEntry = payload.find((p: any) => p.dataKey === 'ps');
-  if (!specEntry || specEntry.value == null) return null;
-  return (
-    <div className="bg-gray-800 border border-gray-600 rounded px-3 py-2 text-xs shadow-xl">
-      <p className="text-gray-400 mb-1"><span className="font-mono text-white">{Number(label).toFixed(3)}</span> MHz</p>
-      <p style={{ color: specEntry.color ?? '#6366F1' }}>
-        {specEntry.name ?? 'PS'}: <span className="font-mono">{typeof specEntry.value === 'number' ? specEntry.value.toFixed(2) : specEntry.value} dBFS</span>
-      </p>
-    </div>
-  );
-}
-
-// ── Custom labeled dot renderer for point annotations ─────────────────────────
-// shape: 'circle' (default) | 'triangle' (TI spurs)
-// textRotate: true → render label vertically upward (dual-tone IM components)
-function MarkerDot(props: any) {
-  const { cx, cy, payload } = props;
-  if (cx == null || cy == null || !payload?._markers?.length) return null;
-  const entries: { label: string; color: string; shape: string; rotate: boolean; small: boolean }[] = payload._markers;
-
-  // Stack multiple markers at the same bin — each offset upward by 14px
-  return (
-    <g>
-      {entries.map((m, idx) => {
-        const dotY = cy - idx * 14;
-        const r = m.small ? 5.5 : 6;
-        const labelY = dotY - r - 4;
-        return (
-          <g key={idx}>
-            {m.shape === 'triangle' ? (
-              <polygon
-                points={`${cx},${dotY - 8} ${cx - 6},${dotY + 4} ${cx + 6},${dotY + 4}`}
-                fill={m.color} stroke="#111827" strokeWidth={1}
-              />
-            ) : (
-              <circle cx={cx} cy={dotY} r={r} fill={m.color} stroke="#111827" strokeWidth={1} />
-            )}
-            {m.rotate ? (
-              <text
-                x={cx} y={labelY}
-                textAnchor="start"
-                fill={m.color} fontSize={9} fontFamily="monospace"
-                transform={`rotate(-90, ${cx}, ${labelY})`}
-              >
-                {m.label}
-              </text>
-            ) : (
-              <text x={cx} y={labelY} textAnchor="middle" fill={m.color} fontSize={9} fontFamily="monospace">
-                {m.label}
-              </text>
-            )}
-          </g>
-        );
-      })}
-    </g>
-  );
 }
 
 // Stamp marker metadata onto the nearest index in chartData (in-place).
@@ -2406,22 +1631,6 @@ function applyZoomDomain(
     Math.max(fullMin, center - hw),
     Math.min(fullMax, center + hw),
   ];
-}
-
-/**
- * Filter a sorted chartData array to points within [xMin, xMax] with 1-point margin
- * on each side (so Recharts can draw lines reaching the edge).
- */
-function filterToWindow<T extends { f: number }>(arr: T[], xMin: number, xMax: number): T[] {
-  if (arr.length === 0) return arr;
-  // Binary search for first index >= xMin - margin
-  let lo = 0, hi = arr.length - 1;
-  while (lo < hi) { const mid = (lo + hi) >> 1; if (arr[mid].f < xMin) lo = mid + 1; else hi = mid; }
-  const start = Math.max(0, lo - 1);
-  let end = start;
-  while (end < arr.length && arr[end].f <= xMax) end++;
-  end = Math.min(arr.length - 1, end);
-  return arr.slice(start, end + 1);
 }
 
 // ─── Fast canvas spectrum renderer ───────────────────────────────────────────
@@ -2643,12 +1852,7 @@ function MainSpectrumFigure({ data, controls }: { data: unknown; controls: Recor
     const step = norm < 1.5 ? 1 : norm < 3.5 ? 2 : norm < 7.5 ? 5 : 10;
     return step * mag;
   }
-  // Axis label formatter: show Hz/kHz when xMax is sub-MHz
-  function fmtFreqTick(v: number): string {
-    if (xMax < 0.001) return `${(v * 1e6).toFixed(0)}`;
-    if (xMax < 1)     return `${(v * 1e3).toFixed(2)}`;
-    return v.toFixed(0);
-  }
+
   const xAxisUnit = xMax < 0.001 ? 'Hz' : xMax < 1 ? 'kHz' : 'MHz';
   // Label for a single frequency value in legend / annotations
   function fmtFreqLabel(v: number): string {
@@ -2980,6 +2184,438 @@ function NoiseSpectrumFigure({ data, controls }: { data: unknown; controls: Reco
 // PortableFigureDescription.markers/legend.items/x.ticks/y.ticks/resultsPanel
 // fields, rather than flattening everything into referenceLines. Drops only
 // genuinely canvas-only presentation details (rotate hints, zoom/pan state).
+/**
+ * app/lib/figureRenderSvg.mjs
+ * Plain-ESM, DOM-free SVG renderer for PortableFigureDescription objects
+ * (see app/lib/pluginTypes.ts for the type). No React, no Recharts, no
+ * browser APIs — safe to run directly under Node for the CLI.
+ *
+ * This is intentionally a small, hand-rolled scientific-plot renderer, not
+ * a general-purpose charting library. It aims for semantic fidelity with
+ * the current Recharts-based figures (title/axes/series/legend/reference
+ * lines/reference areas), not pixel-perfect parity.
+ *
+ * Ticks: when the description does not provide explicit tick values, this
+ * renderer derives its own "nice" ticks from the data domain.
+ *
+ * Heatmap support: `desc.heatmap` (a generic 2D grid, see pluginTypes.ts)
+ * is rasterized to a PNG (via `sharp`) and embedded as a base64 data-URI
+ * `<image>` element. This is why renderFigureToSvg() is async — its one
+ * call site (usig.mjs) awaits it.
+ */
+
+const DEFAULT_WIDTH = 960;
+const DEFAULT_HEIGHT = 560;
+
+const COLORS = {
+  bg: '#111827',
+  grid: '#1F2937',
+  axis: '#6B7280',
+  text: '#D1D5DB',
+  title: '#E5E7EB',
+  series: ['#6366F1', '#F59E0B', '#10B981', '#EC4899', '#3B82F6'],
+  referenceLine: '#EF4444',
+  referenceArea: 'rgba(251,191,36,0.14)',
+  // Semantic 'warning' style — analytical warning/constraint regions
+  // (e.g. SFDR avoidance zones), rendered more prominently than the
+  // default reference area.
+  referenceAreaWarning: 'rgba(251,191,36,0.35)',
+};
+
+function escapeXml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+/** Rough monospace text-width estimate in px for a given font size — used
+ * only for sizing the results-panel box so label/value text fits inside it.
+ * Purely typographic (no domain knowledge of what the text means). */
+function estimateTextWidth(s, fontSize) {
+  return String(s).length * fontSize * 0.62;
+}
+
+/** Simple "nice" tick generator — not exact d3-scale, but produces evenly
+ * spaced, readable tick values covering [min, max]. */
+function niceTicks(min, max, count = 6) {
+  if (!Number.isFinite(min) || !Number.isFinite(max) || min === max) {
+    return [min ?? 0, max ?? 0];
+  }
+  const span = max - min;
+  const rawStep = span / Math.max(count - 1, 1);
+  const magnitude = Math.pow(10, Math.floor(Math.log10(Math.abs(rawStep))));
+  const residual = rawStep / magnitude;
+  let niceResidual;
+  if (residual >= 5) niceResidual = 10;
+  else if (residual >= 2) niceResidual = 5;
+  else if (residual >= 1) niceResidual = 2;
+  else niceResidual = 1;
+  const step = niceResidual * magnitude;
+  const start = Math.floor(min / step) * step;
+  const ticks = [];
+  for (let v = start; v <= max + step * 0.5; v += step) {
+    ticks.push(Math.round(v / step) * step);
+  }
+  return ticks.filter((v) => v >= min - step * 0.001 && v <= max + step * 0.001);
+}
+
+function formatTick(v) {
+  if (Number.isInteger(v)) return String(v);
+  return v.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
+}
+
+function finiteValues(arr) {
+  return arr.filter((v) => typeof v === 'number' && Number.isFinite(v));
+}
+
+
+/**
+ * Rasterize a generic PortableFigureDescription heatmap grid into a PNG,
+ * returned as a base64 data URI ready for an SVG <image> element. Purely
+ * mechanical (normalize + colorize); has no knowledge of what the grid
+ * values represent. See pluginTypes.ts for the row-major/orientation
+ * convention (grid row 0 == extent[2]/yMin; last row == extent[3]/yMax).
+ */
+
+async function renderSmeasFigureToSvg(desc: PortableFigureDescription, opts: { width?: number; height?: number } = {}): Promise<string> {
+  const baseWidth = opts.width ?? DEFAULT_WIDTH;
+  const baseHeight = opts.height ?? DEFAULT_HEIGHT;
+
+  // Additive sections — only reserved when the description actually uses
+  // these optional fields, so figures that don't set them (e.g. SINL)
+  // render at exactly baseWidth x baseHeight, unchanged from before these
+  // fields existed.
+  const legendItems = desc.legend?.items ?? [];
+  const resultsPanel = desc.resultsPanel ?? [];
+  const legendCols = 4;
+  const legendRows = legendItems.length ? Math.ceil(legendItems.length / legendCols) : 0;
+  const legendSectionH = legendRows ? legendRows * 22 + 12 : 0;
+  // Results panel: a sidebar to the right of the plot (mirrors the legacy
+  // amber ResultsPanel), not a section stacked below the graph. Width is
+  // sized from the actual label/value text so nothing overflows the box.
+  const resultsRowFontSize = 9;
+  const resultsPanelInnerW = resultsPanel.length
+    ? Math.max(
+        estimateTextWidth('CARRIER / FS', resultsRowFontSize + 1),
+        ...resultsPanel.map(
+          (row) =>
+            estimateTextWidth(row.label, resultsRowFontSize) +
+            16 +
+            estimateTextWidth(row.value, resultsRowFontSize)
+        )
+      )
+    : 0;
+  const panelWidth = resultsPanel.length ? Math.min(360, Math.max(150, resultsPanelInnerW + 34)) : 0;
+
+  const width = baseWidth + panelWidth;
+  const height = baseHeight + legendSectionH;
+
+  const marginLeft = 70;
+  const marginRight = 24 + panelWidth;
+  const marginTop = desc.legend?.enabled ? 56 : 40;
+  const marginBottom = 56;
+
+  const plotW = width - marginLeft - marginRight;
+  const plotH = baseHeight - marginTop - marginBottom;
+
+  const xData = desc.x?.data ?? [];
+  const xFinite = finiteValues(xData);
+  let xMin = xFinite.length ? Math.min(...xFinite) : 0;
+  let xMax = xFinite.length ? Math.max(...xFinite) : 1;
+  const allY = [];
+  for (const s of desc.series ?? []) {
+    for (const v of s.y) if (typeof v === 'number' && Number.isFinite(v)) allY.push(v);
+  }
+  for (const rl of desc.referenceLines ?? []) {
+    if (rl.axis === 'y' && Number.isFinite(rl.value)) allY.push(rl.value);
+  }
+  for (const mk of desc.markers ?? []) {
+    if (Number.isFinite(mk.y)) allY.push(mk.y);
+  }
+  let yMin = allY.length ? Math.min(...allY) : -1;
+  let yMax = allY.length ? Math.max(...allY) : 1;
+  if (yMin === yMax) {
+    yMin -= 1;
+    yMax += 1;
+  } else {
+    const pad = (yMax - yMin) * 0.1;
+    yMin -= pad;
+    yMax += pad;
+  }
+  // Extra headroom above the highest marker so its label (drawn just above
+  // the point) doesn't get clipped by the plot's top edge.
+  if ((desc.markers ?? []).length) {
+    yMax += (yMax - yMin) * 0.08;
+  }
+  // A heatmap's extent is the authoritative domain (an exact data-space
+  // rectangle, e.g. an eye diagram's fixed voltage rails) — use it as-is,
+  // without the padding/headroom applied above for line-series domains.
+  if (desc.heatmap && Array.isArray(desc.heatmap.extent) && desc.heatmap.extent.length === 4) {
+    const [hx1, hx2, hy1, hy2] = desc.heatmap.extent;
+    xMin = hx1; xMax = hx2; yMin = hy1; yMax = hy2;
+  }
+
+  const xSpan = xMax - xMin || 1;
+  const ySpan = yMax - yMin || 1;
+
+  const toPx = (xv) => marginLeft + ((xv - xMin) / xSpan) * plotW;
+  const toPy = (yv) => marginTop + plotH - ((yv - yMin) / ySpan) * plotH;
+
+  const parts = [];
+  parts.push(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`
+  );
+  parts.push(`<rect x="0" y="0" width="${width}" height="${height}" fill="${COLORS.bg}"/>`);
+
+  // Title
+  if (desc.title) {
+    parts.push(
+      `<text x="${width / 2}" y="24" text-anchor="middle" font-size="16" font-family="sans-serif" fill="${COLORS.title}" font-weight="600">${escapeXml(
+        desc.title
+      )}</text>`
+    );
+  }
+
+  // Reference areas (drawn before grid/series so lines remain visible on
+  // top). These are plain translucent regions; their semantic meaning (e.g.
+  // "SFDR avoidance") is conveyed only via legend.items, never painted
+  // directly on the plot.
+  for (const area of desc.referenceAreas ?? []) {
+    const x1 = toPx(area.x1);
+    const x2 = toPx(area.x2);
+    const left = Math.min(x1, x2);
+    const w = Math.abs(x2 - x1);
+    const areaFill = area.style === 'warning' ? COLORS.referenceAreaWarning : COLORS.referenceArea;
+    parts.push(
+      `<rect x="${left.toFixed(2)}" y="${marginTop}" width="${w.toFixed(2)}" height="${plotH}" fill="${areaFill}"/>`
+    );
+  }
+
+  // Grid + ticks — honor explicit ticks when the plugin provides them;
+  // otherwise fall back to auto-derived "nice" ticks.
+  const xTicks = desc.x?.ticks?.length ? desc.x.ticks : niceTicks(xMin, xMax, 6);
+  const yTicks = desc.y?.ticks?.length ? desc.y.ticks : niceTicks(yMin, yMax, 6);
+
+  if (desc.grid?.x) {
+    for (const t of xTicks) {
+      const px = toPx(t);
+      parts.push(
+        `<line x1="${px.toFixed(2)}" y1="${marginTop}" x2="${px.toFixed(2)}" y2="${marginTop + plotH}" stroke="${COLORS.grid}" stroke-dasharray="3 3"/>`
+      );
+    }
+  }
+  if (desc.grid?.y) {
+    for (const t of yTicks) {
+      const py = toPy(t);
+      parts.push(
+        `<line x1="${marginLeft}" y1="${py.toFixed(2)}" x2="${marginLeft + plotW}" y2="${py.toFixed(2)}" stroke="${COLORS.grid}" stroke-dasharray="3 3"/>`
+      );
+    }
+  }
+
+  // Axes
+  parts.push(
+    `<line x1="${marginLeft}" y1="${marginTop + plotH}" x2="${marginLeft + plotW}" y2="${marginTop + plotH}" stroke="${COLORS.axis}"/>`
+  );
+  parts.push(`<line x1="${marginLeft}" y1="${marginTop}" x2="${marginLeft}" y2="${marginTop + plotH}" stroke="${COLORS.axis}"/>`);
+
+  for (const t of xTicks) {
+    const px = toPx(t);
+    parts.push(
+      `<text x="${px.toFixed(2)}" y="${marginTop + plotH + 16}" text-anchor="middle" font-size="10" font-family="sans-serif" fill="${COLORS.text}">${formatTick(t)}</text>`
+    );
+  }
+  for (const t of yTicks) {
+    const py = toPy(t);
+    parts.push(
+      `<text x="${marginLeft - 8}" y="${(py + 3).toFixed(2)}" text-anchor="end" font-size="10" font-family="sans-serif" fill="${COLORS.text}">${formatTick(t)}</text>`
+    );
+  }
+
+  // Axis labels. x-label is placed directly below the plot's tick text
+  // (inside the base canvas region), independent of the legend strip that
+  // follows — layout order: plot -> x-label -> legend -> (results panel
+  // as an independent right-side column).
+  if (desc.x?.label) {
+    parts.push(
+      `<text x="${marginLeft + plotW / 2}" y="${marginTop + plotH + 34}" text-anchor="middle" font-size="12" font-family="sans-serif" fill="${COLORS.text}">${escapeXml(
+        desc.x.label
+      )}</text>`
+    );
+  }
+  if (desc.y?.label) {
+    parts.push(
+      `<text x="16" y="${marginTop + plotH / 2}" text-anchor="middle" font-size="12" font-family="sans-serif" fill="${COLORS.text}" transform="rotate(-90 16 ${marginTop + plotH / 2})">${escapeXml(
+        desc.y.label
+      )}</text>`
+    );
+  }
+
+  // Data series (as polylines, breaking on null/NaN gaps)
+  desc.series?.forEach((series, idx) => {
+    const color = COLORS.series[idx % COLORS.series.length];
+    const dash = series.style === 'dashed' ? ' stroke-dasharray="6 3"' : '';
+    let segment = [];
+    const segments = [];
+    for (let i = 0; i < xData.length; i++) {
+      const yv = series.y[i];
+      if (typeof yv === 'number' && Number.isFinite(yv) && Number.isFinite(xData[i])) {
+        segment.push(`${toPx(xData[i]).toFixed(2)},${toPy(yv).toFixed(2)}`);
+      } else if (segment.length > 0) {
+        segments.push(segment);
+        segment = [];
+      }
+    }
+    if (segment.length > 0) segments.push(segment);
+    for (const seg of segments) {
+      if (seg.length < 2) continue;
+      parts.push(`<polyline points="${seg.join(' ')}" fill="none" stroke="${color}" stroke-width="1.5"${dash}/>`);
+    }
+  });
+
+  // Markers — discrete labeled points (e.g. spectral spurs). Drawn as a
+  // colored point exactly at (x, y) with its label immediately above; no
+  // connecting line to the axis (distinct from referenceLines).
+  for (const mk of desc.markers ?? []) {
+    if (!Number.isFinite(mk.x) || !Number.isFinite(mk.y)) continue;
+    const px = toPx(mk.x);
+    const py = toPy(mk.y);
+    const color = mk.color || COLORS.title;
+    if (mk.shape === 'triangle') {
+      const r = 5;
+      const p1 = `${px.toFixed(2)},${(py - r).toFixed(2)}`;
+      const p2 = `${(px - r).toFixed(2)},${(py + r).toFixed(2)}`;
+      const p3 = `${(px + r).toFixed(2)},${(py + r).toFixed(2)}`;
+      parts.push(`<polygon points="${p1} ${p2} ${p3}" fill="${color}"/>`);
+    } else {
+      parts.push(`<circle cx="${px.toFixed(2)}" cy="${py.toFixed(2)}" r="3.5" fill="${color}"/>`);
+    }
+    if (mk.label) {
+      const labelY = (py - 8).toFixed(2);
+      if (mk.textRotation) {
+        parts.push(
+          `<text x="${px.toFixed(2)}" y="${labelY}" text-anchor="start" font-size="9" font-family="monospace" fill="${color}" transform="rotate(${mk.textRotation} ${px.toFixed(2)} ${labelY})">${escapeXml(
+            mk.label
+          )}</text>`
+        );
+      } else {
+        parts.push(
+          `<text x="${px.toFixed(2)}" y="${labelY}" text-anchor="middle" font-size="10" font-family="sans-serif" fill="${color}">${escapeXml(
+            mk.label
+          )}</text>`
+        );
+      }
+    }
+  }
+
+  // Reference lines — drawn last (on top of series/markers) so a reference
+  // level (e.g. a spur minimum threshold) remains visible above the plotted
+  // trace, matching its role as a reference overlay rather than plotted data.
+  for (const rl of desc.referenceLines ?? []) {
+    if (rl.axis === 'y') {
+      const py = toPy(rl.value);
+      parts.push(
+        `<line x1="${marginLeft}" y1="${py.toFixed(2)}" x2="${marginLeft + plotW}" y2="${py.toFixed(2)}" stroke="${COLORS.referenceLine}" stroke-dasharray="4 4"/>`
+      );
+      if (rl.label) {
+        parts.push(
+          `<text x="${marginLeft + plotW - 4}" y="${(py - 4).toFixed(2)}" text-anchor="end" font-size="10" font-family="sans-serif" fill="${COLORS.referenceLine}">${escapeXml(
+            rl.label
+          )}</text>`
+        );
+      }
+    } else {
+      const px = toPx(rl.value);
+      parts.push(
+        `<line x1="${px.toFixed(2)}" y1="${marginTop}" x2="${px.toFixed(2)}" y2="${marginTop + plotH}" stroke="${COLORS.referenceLine}" stroke-dasharray="4 4"/>`
+      );
+      if (rl.label) {
+        parts.push(
+          `<text x="${(px + 4).toFixed(2)}" y="${marginTop + 12}" font-size="10" font-family="sans-serif" fill="${COLORS.referenceLine}">${escapeXml(
+            rl.label
+          )}</text>`
+        );
+      }
+    }
+  }
+
+  // Legend
+  if (desc.legend?.enabled && desc.series?.length) {
+    const legendY = marginTop - 24;
+    let legendX = marginLeft;
+    desc.series.forEach((series, idx) => {
+      const color = COLORS.series[idx % COLORS.series.length];
+      parts.push(`<line x1="${legendX}" y1="${legendY}" x2="${legendX + 16}" y2="${legendY}" stroke="${color}" stroke-width="2"${series.style === 'dashed' ? ' stroke-dasharray="6 3"' : ''}/>`);
+      parts.push(
+        `<text x="${legendX + 20}" y="${legendY + 4}" font-size="11" font-family="sans-serif" fill="${COLORS.text}">${escapeXml(series.name)}</text>`
+      );
+      legendX += 22 + series.name.length * 6.5 + 16;
+    });
+  }
+
+  // Legend-items strip — explicit legend entries (e.g. marker categories),
+  // drawn below the base canvas (after the plot + x-axis label). Additive:
+  // only rendered when the description provides legend.items.
+  if (legendItems.length) {
+    const stripTop = baseHeight + 6;
+    const colW = plotW / legendCols;
+    legendItems.forEach((item, idx) => {
+      const col = idx % legendCols;
+      const row = Math.floor(idx / legendCols);
+      const ix = marginLeft + col * colW;
+      const iy = stripTop + row * 22;
+      const color = item.color || COLORS.text;
+      if (item.shape === 'area') {
+        parts.push(`<rect x="${ix}" y="${iy - 9}" width="16" height="10" fill="${color}"/>`);
+      } else if (item.shape === 'triangle') {
+        parts.push(`<polygon points="${ix + 8},${iy - 9} ${ix},${iy + 1} ${ix + 16},${iy + 1}" fill="${color}"/>`);
+      } else if (item.shape === 'circle') {
+        parts.push(`<circle cx="${ix + 8}" cy="${iy - 4}" r="4" fill="${color}"/>`);
+      } else {
+        parts.push(`<line x1="${ix}" y1="${iy - 4}" x2="${ix + 16}" y2="${iy - 4}" stroke="${color}" stroke-width="2"/>`);
+      }
+      parts.push(
+        `<text x="${ix + 20}" y="${iy}" font-size="11" font-family="sans-serif" fill="${COLORS.text}">${escapeXml(item.label)}</text>`
+      );
+    });
+  }
+
+  // Results panel — amber sidebar to the right of the plot (mirrors the
+  // legacy ResultsPanel component). Additive: only rendered when provided.
+  if (resultsPanel.length) {
+    const panelX = marginLeft + plotW + 14;
+    const panelY = marginTop;
+    const panelW = panelWidth - 24;
+    const panelH = plotH;
+    const rowH = 13;
+    const headerH = 22;
+
+    parts.push(
+      `<rect x="${panelX}" y="${panelY}" width="${panelW}" height="${panelH}" rx="6" fill="rgba(120,53,15,0.2)" stroke="rgba(180,83,9,0.4)"/>`
+    );
+    parts.push(
+      `<text x="${panelX + 10}" y="${panelY + 16}" font-size="9" font-family="sans-serif" letter-spacing="0.05em" fill="#FCD34D" font-weight="600">CARRIER / FS</text>`
+    );
+    parts.push(
+      `<line x1="${panelX + 8}" y1="${panelY + headerH}" x2="${panelX + panelW - 8}" y2="${panelY + headerH}" stroke="rgba(180,83,9,0.4)"/>`
+    );
+    const maxRows = Math.max(0, Math.floor((panelH - headerH - 6) / rowH));
+    resultsPanel.slice(0, maxRows).forEach((row, idx) => {
+      const ry = panelY + headerH + 12 + idx * rowH;
+      parts.push(
+        `<text x="${panelX + 10}" y="${ry}" font-size="9" font-family="monospace" fill="rgba(252,211,77,0.7)">${escapeXml(row.label)}</text>`
+      );
+      parts.push(
+        `<text x="${panelX + panelW - 10}" y="${ry}" text-anchor="end" font-size="9" font-family="monospace" fill="#FEF3C7">${escapeXml(row.value)}</text>`
+      );
+    });
+  }
+
+  parts.push('</svg>');
+  return parts.join('\n');
+}
 
 const nnSmeas = (v: number): number | null => (isFinite(v) ? v : null);
 
@@ -3819,6 +3455,45 @@ function _smeasRunCore(
   };
 }
 
+// ── Cached single-analysis kernel ─────────────────────────────────────────────
+// One analysis per (packet, params) per invocation. run(), prepareDebugTables()
+// and prepareFigureData() all share this result — no duplicate computation.
+
+interface SmeasAnalysis {
+  scalarResult: Record<string, string | number>;
+  figureData: SmeasFigureData;
+  debugTables: import('../../lib/pluginTypes').PluginDebugTable[];
+}
+
+const smeasAnalysisCache = new WeakMap<
+  import('../../lib/ingest').WaveformPacket,
+  { paramsKey: string; analysis: SmeasAnalysis }
+>();
+
+function getSmeasAnalysis(
+  packet: import('../../lib/ingest').WaveformPacket,
+  params: SmeasParams,
+): SmeasAnalysis {
+  const paramsKey = JSON.stringify(params);
+  const cached = smeasAnalysisCache.get(packet);
+  if (cached && cached.paramsKey === paramsKey) return cached.analysis;
+
+  const fsHz = resolveFsHz(packet, params);
+  const result = _smeasRunCore(
+    packet.waveform,
+    fsHz,
+    packet.metadata.sourceFile ?? 'waveform',
+    params,
+  );
+  const analysis: SmeasAnalysis = {
+    scalarResult: result.scalarResult,
+    figureData: result.figureData,
+    debugTables: result.debugTables,
+  };
+  smeasAnalysisCache.set(packet, { paramsKey, analysis });
+  return analysis;
+}
+
 
 export const smeasPlugin: Plugin<SmeasParams> = {
   id: 'smeas',
@@ -4305,35 +3980,58 @@ export const smeasPlugin: Plugin<SmeasParams> = {
   },
 
   run: async (packet, params: SmeasParams): Promise<Record<string, string | number>> => {
-    // packet is already IR — no file handling, no ingestion, no format detection.
-    params = smeasAutoSeedFromPacket({
+    const seeded = smeasAutoSeedFromPacket({
       ...params,
       fftLength:     Math.max(4, Math.round(parseFftLength(params.fftLength) || 8192)),
       numAveraging:  Math.max(1, Math.round(Number(params.numAveraging)  || 1)),
       numberOfCores: Math.max(1, Math.round(Number(params.numberOfCores) || 1)),
     }, packet);
-    const fsHz = resolveFsHz(packet, params);
-    const { scalarResult } = _smeasRunCore(packet.waveform, fsHz, packet.metadata.sourceFile ?? 'waveform', params);
-    return scalarResult;
+    return getSmeasAnalysis(packet, seeded).scalarResult;
   },
 
-  prepareData: async (
+    prepareDebugTables: async (
     packet,
     params: SmeasParams,
-  ): Promise<{
-    figureData?: unknown;
-    debugTables?: import('../../lib/pluginTypes').PluginDebugTable[];
-  }> => {
-    params = smeasAutoSeedFromPacket({
+    requestedTableIds?: string[],
+  ): Promise<import('../../lib/pluginTypes').PluginDebugTable[]> => {
+    const seeded = smeasAutoSeedFromPacket({
       ...params,
       fftLength:     Math.max(4, Math.round(parseFftLength(params.fftLength) || 8192)),
       numAveraging:  Math.max(1, Math.round(Number(params.numAveraging)  || 1)),
       numberOfCores: Math.max(1, Math.round(Number(params.numberOfCores) || 1)),
     }, packet);
-    const fsHz = resolveFsHz(packet, params);
-    const { figureData, debugTables } = _smeasRunCore(packet.waveform, fsHz, packet.metadata.sourceFile ?? 'waveform', params);
-    return { figureData, debugTables };
+    const { debugTables } = getSmeasAnalysis(packet, seeded);
+    if (!requestedTableIds || requestedTableIds.includes('all')) {
+      return debugTables;
+    }
+    return debugTables.filter((table) => requestedTableIds.includes(table.id));
+  },
+
+  prepareFigureData: async (
+    packet,
+    params: SmeasParams,
+  ): Promise<SmeasFigureData> => {
+    const seeded = smeasAutoSeedFromPacket({
+      ...params,
+      fftLength:     Math.max(4, Math.round(parseFftLength(params.fftLength) || 8192)),
+      numAveraging:  Math.max(1, Math.round(Number(params.numAveraging)  || 1)),
+      numberOfCores: Math.max(1, Math.round(Number(params.numberOfCores) || 1)),
+    }, packet);
+    return getSmeasAnalysis(packet, seeded).figureData;
   },
 
   figures: smeasFigures,
+
+  renderFigureSvg: async (
+      figureId: string,
+      figureData: unknown,
+      controls: Record<string, number | boolean | string>,
+      ): Promise<string | undefined> => {
+    const figure = smeasFigures.find((f) => f.id === figureId);
+    if (!figure || typeof figure.getData !== 'function') return undefined;
+    const desc = figure.getData(figureData, controls);
+    if (!desc) return undefined;
+    return renderSmeasFigureToSvg(desc);
+    },
 };
+

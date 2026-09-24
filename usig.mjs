@@ -2425,6 +2425,9 @@ async function runConversionMode({
     metaToFilename,
   });
 
+  if (outputFile && !path.extname(outputFile)) {
+    outputFile = `${outputFile}.csv`;
+    }
   console.log(`[usig] wrote result to ${outputFile}`);
 }
 
@@ -3099,6 +3102,32 @@ function printDebugTableHead(table) {
 }
 
 
+/**
+ * Map a filesystem error to a user-meaningful message.
+ * @param err - The caught error.
+ * @returns A human-readable description of the failure.
+ */
+function describeFsError(err) {
+  if (err instanceof Error) {
+    if (err.code === 'ENOENT') {
+      const match =
+        err.message.match(/mkdir '([^']+)'/) ||
+        err.message.match(/open '([^']+)'/);
+      const missingPath = match ? match[1] : 'the target directory';
+      return `the output directory '${missingPath}' does not exist`;
+    }
+    if (err.code === 'EACCES' || err.code === 'EPERM') {
+      return 'permission denied';
+    }
+    if (err.code === 'EEXIST') {
+      return 'the target already exists';
+    }
+    return err.message;
+  }
+  return String(err);
+}
+
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Main
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3630,6 +3659,7 @@ if (args.length === 0) {
   const allResults = [];
   const allInputSummaries = {};  // keyed by plugin id
   const allParamSchemas = {};  // keyed by plugin id
+  let artifactError = null;
   const debugTablesToPrint = [];
   // File/figure write confirmations ("WROTE: ...") are collected here and
   // flushed at the very end (after the Inputs/Outputs report and debug
@@ -3746,36 +3776,44 @@ if (args.length === 0) {
     const figureRequests = invocation.figureRequests ?? [];
     if (debugRequests.length === 0 && figureRequests.length === 0) continue;
 
-    if (typeof plugin.prepareData !== 'function') {
-      if (debugRequests.length > 0) {
-        console.error(`[DEBUG] requested debug output for plugin ${resolvedPluginId}, but plugin has no prepareData()`);
-      }
-      if (figureRequests.length > 0) {
-        console.error(`[FIGURE] requested figure output for plugin ${resolvedPluginId}, but plugin has no prepareData()`);
-      }
-      process.exitCode = 2;
-      continue;
-    }
+    let debugTables = [];
+    let figureData;
 
-    let prep;
     try {
       console.log = (...parts) => console.error(...parts);
-      prep = await plugin.prepareData(frame.packet, finalParams);
+
+      if (debugRequests.length > 0) {
+        if (typeof plugin.prepareDebugTables === 'function') {
+          const requestedTableIds = debugRequests.some((r) => r.key === 'all')
+            ? ['all']
+            : debugRequests
+                .filter((r) => r.key !== 'list')
+                .map((r) => r.key);
+          debugTables = await plugin.prepareDebugTables(
+            frame.packet,
+            finalParams,
+            requestedTableIds,
+          );
+        } else {
+          console.error(`[DEBUG] requested debug output for plugin ${resolvedPluginId}, but plugin has no prepareDebugTables()`);
+        }
+      }
+
+      if (figureRequests.length > 0) {
+        if (typeof plugin.prepareFigureData === 'function') {
+          figureData = await plugin.prepareFigureData(frame.packet, finalParams);
+        } else {
+          console.error(`[FIGURE] requested figure output for plugin ${resolvedPluginId}, but plugin has no prepareFigureData()`);
+        }
+      }
     } catch (err) {
-      console.error(`[DEBUG] plugin.prepareData failed for ${resolvedPluginId}:`, err?.stack ?? err);
+      console.error(`[DEBUG/FIGURE] preparation failed for ${resolvedPluginId}:`, err?.stack ?? err);
       process.exitCode = 2;
       console.log = originalConsoleLog;
       continue;
     } finally {
       console.log = originalConsoleLog;
     }
-
-    const debugTables = (prep && Array.isArray(prep.debugTables))
-      ? prep.debugTables
-      : [];
-    const figureData = (prep && Object.prototype.hasOwnProperty.call(prep, 'figureData'))
-      ? prep.figureData
-      : undefined;
 
     // ── Debug table dispatch (unchanged behavior) ─────────────────────────
     if (debugRequests.length > 0) {
@@ -3874,7 +3912,9 @@ if (args.length === 0) {
             await writeStructuredRowsToFile(headers, rows, target, true);
             wroteMessages.push(`WROTE: ${target}`);
           } catch (err) {
-            console.error(`ERROR: writing ${target}:`, err?.stack ?? err);
+            artifactError =
+              `error: cannot write debug table '${table.id}' to '${target}': ` +
+              describeFsError(err);
             process.exitCode = 4;
           }
         }
@@ -3922,6 +3962,10 @@ if (args.length === 0) {
           } catch (e) {
             // ignore
           }
+        }
+
+        if (!path.extname(target)) {
+          target = `${target}.csv`;
         }
 
         try {
@@ -3994,10 +4038,9 @@ if (args.length === 0) {
           wroteMessages.push(`WROTE: ${target}`);
 
         } catch (err) {
-          console.error(
-            `ERROR: writing ${target}:`,
-            err?.stack ?? err
-          );
+          artifactError =
+            `error: cannot write debug table '${table.id}' to '${target}': ` +
+            describeFsError(err);
           process.exitCode = 4;
         }
       }
@@ -4043,7 +4086,9 @@ if (args.length === 0) {
           process.exitCode = 3;
           return;
         }
-        const svg = await renderFigureToSvg(desc);
+        const svg = typeof plugin.renderFigureSvg === 'function'
+          ? await plugin.renderFigureSvg(fig.id, figureData, {})
+          : await renderFigureToSvg(desc);
         const ext = (path.extname(targetPath).toLowerCase().replace('.', '')) || 'svg';
 
         const shouldWrite = await confirmOutputOverwrite(targetPath, overwrite);
@@ -4113,7 +4158,9 @@ if (args.length === 0) {
             try {
               await writeFigureArtifact(fig, target);
             } catch (err) {
-              console.error(`ERROR: writing figure ${figDecl.id}:`, err?.stack ?? err);
+              artifactError =
+                `error: cannot write figure '${figDecl.id}': ` +
+                describeFsError(err);
               process.exitCode = 4;
             }
           }
@@ -4149,7 +4196,9 @@ if (args.length === 0) {
         try {
           await writeFigureArtifact(fig, targetPath);
         } catch (err) {
-          console.error(`ERROR: writing figure ${req.key}:`, err?.stack ?? err);
+          artifactError =
+            `error: cannot write figure '${req.key}': ` +
+            describeFsError(err);
           process.exitCode = 4;
         }
       }
@@ -4180,7 +4229,13 @@ if (args.length === 0) {
     console.log('[DEBUG before formatReport] payload.results =', JSON.stringify(payload?.results, null, 2));
   }
   // Always emit the human-readable report to stdout
+  if (artifactError) {
+    console.error(artifactError);
+    process.exit(process.exitCode || 1);
+  }
+
   const humanReport = formatReport(payload, 'text', verbose);
+
   process.stdout.write(humanReport);
 
   // Debug tables are printed only after the normal Inputs/Outputs report.

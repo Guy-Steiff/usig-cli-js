@@ -347,6 +347,7 @@ def main():
         [
             node_executable,
             str(USIG_CLI),
+            "-y",
             "-i",
             str(golden_csv),
             "-plugin",
@@ -425,6 +426,7 @@ def main():
         [
             node_executable,
             str(USIG_CLI),
+            "-y",
             "-i",
             str(golden_csv),
             "-plugin",

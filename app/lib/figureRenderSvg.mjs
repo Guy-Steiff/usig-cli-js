@@ -1,4 +1,5 @@
 /**
+ * app/lib/figureRenderSvg.mjs
  * Plain-ESM, DOM-free SVG renderer for PortableFigureDescription objects
  * (see app/lib/pluginTypes.ts for the type). No React, no Recharts, no
  * browser APIs — safe to run directly under Node for the CLI.
