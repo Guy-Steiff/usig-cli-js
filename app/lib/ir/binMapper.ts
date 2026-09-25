@@ -490,7 +490,7 @@ export async function mapBinaryToIRCandidate({
   console.error('[DEBUG binMapper canonical output]', {
     metadata,
     channelLabels: metadata.channelLabels,
-    signalColumn: metadata.signalColumn,
+    targetColumn: metadata.targetColumn,
     channels: channels.map(channel => ({
       label: channel.label,
       waveformLength: channel.waveform?.length,

@@ -71,20 +71,16 @@
  * methodology. Treat current outputs as baseline/reference until then.
  */
 
-import { type Plugin, type PluginManifest, type PluginFigure, type InferredParamField, type PortableFigureDescription } from '../../lib/pluginTypes';
-import smeasDoc from './smeasPlugin.doc';
+import { type Plugin, type PluginManifest, type PluginFigure, type PortableFigureDescription } from '../../lib/pluginTypes';
 import { useRef, useEffect } from 'react';
 import FFT from 'fft.js';
 // import { ResponsiveContainer, ScatterChart, Scatter, XAxis, YAxis, ZAxis, CartesianGrid, Tooltip, Legend, ReferenceLine, ReferenceArea } from 'recharts';
 
 export interface SmeasParams {
-  targetColumn: string;   // CSV column containing signal data - declared in paramFields
-  fsGhzColumnRegex?: string;
-  fsGhzRegex?: string;
-  fsGhzReplace?: string;
+  targetColumn: string;   // CSV column containing signal data - declared in paramSchema
   fsGhz?: number | string;
-  toneMode?: string;                           // inferred per-file via inferredParamFields
-  sfdrLeakageAvoidanceRadiusMhz?: number | string; // inferred per-file via inferredParamFields
+  toneMode?: string;
+  sfdrLeakageAvoidanceRadiusMhz?: number | string;
   inputMode: 'time_domain_codes' | 'time_domain_volts' | 'single_sided_power_spectrum';
   fftLength: number;
   numAveraging: number;
@@ -158,24 +154,38 @@ const manifest: PluginManifest = {
        key: 'targetColumn',
        label: 'Sample Column',
        type: 'column-select',
-       required: true,
        description: 'Column containing ADC codes or voltages.',
+       default: '',
        aliases: ['sample', 'samples', 'adcCode', 'adcCodes', 'voltage', 'data'],
      },
      {
        key: 'fsGhz',
        label: 'Sampling Frequency (GHz)',
        type: 'number',
-       required: false,
        description: 'Sampling frequency in GHz. USIG can infer this from filename metadata such as fs2p25ghz; provide a value to override inference.',
+       default: 2.1,
        aliases: ['fs', 'fsghz', 'fsGhz', 'sampleRate', 'samplerate'],
-      },
+       unit: 'GHz',
+       defaultRegex: '(?:sample[_\\-]?rate|[Ff][Ss])[_\\-]?(\\d+(?:p\\d+)?(?:e[+\\-]?\\d+)?(?:GHz|MHz|kHz|Hz)?)',
+       defaultReplace: '',
+       transform: (raw: string) => {
+         if (!raw) return '';
+         const normalised = raw.replace(/p(?=\d)/gi, '.');
+         const lc = normalised.toLowerCase();
+         const parsed = parseFloat(normalised);
+         if (isNaN(parsed)) return '';
+         if (lc.includes('mhz')) return String(parsed / 1000);
+         if (lc.includes('khz')) return String(parsed / 1e6);
+         if (lc.includes('hz') && !lc.includes('ghz') && !lc.includes('mhz') && !lc.includes('khz')) return String(parsed / 1e9);
+         return String(parsed);
+         },
+     },
      {
        key: 'toneMode',
        label: 'Tone Mode',
        type: 'text',
-       required: false,
        description: 'Stimulus tone mode. USIG can infer this from filename metadata such as tonemode~single; provide a value to override inference.',
+       default: 'single',
        aliases: ['tone', 'tonemode', 'toneMode'],
        possibleValues: ['single', 'dual'],
      },
@@ -183,8 +193,8 @@ const manifest: PluginManifest = {
        key: 'inputMode',
        label: 'Input Mode',
        type: 'text',
-       required: false,
        description: '"time_domain_codes" (default) or "time_domain_volts".',
+       default: 'time_domain_codes',
        aliases: ['mode', 'inputType'],
        possibleValues: ['time_domain_codes', 'time_domain_volts', 'single_sided_power_spectrum'],
      },
@@ -192,85 +202,148 @@ const manifest: PluginManifest = {
         key: 'fftLength',
         label: 'FFT/DFT Length',
         type: 'number',
-        required: true,
         description: 'Number of samples per transform. Power-of-2 values use fast FFT; any other integer falls back to slower O(N²) DFT — a warning is shown in the plot.',
+        default: 8192,
       },
      {
        key: 'numAveraging',
        label: 'Number of Averages',
        type: 'number',
-       required: false,
        description: 'Default 1. Total samples = fftLength × numAveraging.',
+       default: 1,
      },
      {
        key: 'harmonicsToConsider',
        label: 'Harmonics (H2…Hk)',
        type: 'number',
-       required: false,
        description: 'Number of harmonics H2…Hk to detect and subtract from noise floor.',
+       default: 7,
      },
      {
        key: 'adcNumBits',
        label: 'ADC Bits',
        type: 'number',
-       required: false,
        description: 'ADC resolution in bits — used for codes↔volts conversion.',
+       default: 11,
      },
      {
        key: 'adcOffsetCode',
        label: 'ADC Offset Code / Volt',
        type: 'number',
-       required: false,
        description: 'Mid-scale offset code. Default 1023 = mid-scale for 11-bit (2^10 − 1).',
+       default: 1023,
      },
      {
        key: 'vfsPeakToPeak',
        label: 'Full-Scale Vpp',
        type: 'number',
-       required: true,
        description: 'Full-scale peak-to-peak voltage. Used for noise and power calculations.',
+       default: 2.0,
      },
       {
         key: 'window',
         label: 'Window Function',
         type: 'text',
-        required: false,
         description: '"rectangular" (default), "hann", "hamming", "blackman", "blackmanharris", "flattop", "kaiser". Use "kaiser" with kaiserBeta for tunable sidelobe control (β=8 per IEEE 1241).',
+        default: 'auto',
       },
      {
        key: 'sfdrLeakageAvoidanceRadiusMhz',
        label: 'SFDR Avoidance Radius',
        type: 'number',
-       required: false,
+       unit: 'MHz',
+       transform: (raw: string) => {
+         const val = parseFloat(raw.trim());
+         return isNaN(val) ? '' : String(val);
+         },
        description: 'Frequency radius around the fundamental to exclude when searching for the SFDR spur.',
+       default: 0
      },
      {
        key: 'numberOfCores',
        label: 'TI ADC Cores (1 - for disabling TI detections)',
        type: 'number',
-       required: false,
        description: 'Number of time-interleaved ADC cores. Set to 1 for non-TI ADCs. Higher values enable TI spur identification and de-embedding.',
+       default: 1
      },
      {
        key: 'spursMinThresholdEn',
        label: 'Enable Spur Min. Threshold',
        type: 'boolean',
-       required: false,
        description: 'Enable minimum threshold for spur detection (default true).',
+       default: true
      },
      {
        key: 'spursMinCalcFactor',
        label: 'Spur Min. Calc. Factor',
        type: 'number',
-       required: false,
        description: 'Histogram σ multiplier for spur min. threshold (default 1.0).',
+       default: 1.0
      },
      {
        key: 'spursMinDbfs',
        label: 'Spur Min. Threshold (dBFS)',
        type: 'number',
-       required: false,
        description: 'Manual override for spur min. threshold; 0 = use histogram auto-calc.',
+       default: 0
+     },
+     {
+       key: 'kaiserBeta',
+       label: 'Kaiser Beta',
+       type: 'number',
+       description: 'Kaiser window shape parameter beta (only active when Window = kaiser). Default 8 (IEEE 1241 ADC characterisation recommendation).',
+       default: 8
+     },
+     {
+       key: 'winCoherentGain',
+       label: 'Coherent Gain',
+       type: 'number',
+       description: 'Coherent power gain = (sum(w)/N)^2. -1 = use the IEEE table default for the selected window. Default 1.',
+       default: 1
+     },
+     {
+       key: 'winEnbw',
+       label: 'ENBW (bins)',
+       type: 'number',
+       description: 'Equivalent Noise Bandwidth in bins. -1 = use the IEEE table default for the selected window. Default 1.',
+       default: 1
+     },
+     {
+       key: 'winNHalfBins',
+       label: 'Lobe Half-bins',
+       type: 'number',
+       description: 'Lobe integration half-width in bins each side of the peak bin. -1 = use the IEEE table default for the selected window. Default 0.',
+       default: 0
+     },
+     {
+       key: 'tiCorrections',
+       label: 'TI Corrections',
+       type: 'text',
+       description: 'Which TI mismatch corrections to apply and in what order: none, O (offset), G (gain), P (phase-skew), or a comma-separated combination such as O,G,P. Default none.',
+       default: 'none',
+       aliases: ['ticorrections', 'tiCorrection'],
+       possibleValues: ['none', 'O', 'G', 'P', 'O,G', 'O,P', 'G,P', 'O,G,P', 'G,O,P', 'O,P,G'],
+       transform: (raw: string) => {
+         const trimmed = raw.trim();
+         if (!trimmed || /^none$/i.test(trimmed)) return 'none';
+         const letters = trimmed.toUpperCase().replace(/[^OGP]/g, '');
+         return letters ? letters.split('').join(',') : '';
+       },
+     },
+     {
+       key: 'tiRefPhase',
+       label: 'TI Reference Phase',
+       type: 'number',
+       description: 'Reference phase index (0-based). All other cores align their offset, gain, and phase to this core. Default 0.',
+       default: 0
+     },
+     {
+       key: 'tiOffsetQuantLsb',
+       label: 'TI Offset Quantization',
+       type: 'number',
+       unit: 'LSB',
+       description: 'Offset correction quantization step in LSBs. Prevents unrealistically perfect correction. Default 0.25.',
+       default: 0.25
      },
    ],
 
@@ -390,7 +463,7 @@ function normaliseFsToHz(fsGhz: number | string | undefined): number {
  */
 function smeasIngestHints(params: SmeasParams): import('../../lib/ingest').IngestHints {
   return {
-    signalColumn:       params.targetColumn?.trim() || undefined,
+    targetColumn:       params.targetColumn?.trim() || undefined,
     preserveBinIndex:   params.inputMode === 'single_sided_power_spectrum',
   };
 }
@@ -3500,7 +3573,6 @@ export const smeasPlugin: Plugin<SmeasParams> = {
   name: 'SMEAS — Sine Spectrum Analysis',
   description: manifest.description,
   manifest,
-  doc: smeasDoc,
 
   /**
    * Declare the fs (GHz) inferred parameter — the platform will:
@@ -3522,434 +3594,6 @@ export const smeasPlugin: Plugin<SmeasParams> = {
    * sample_rate_44p1kHz	44p1
    * fs_96000Hz	96000
    */
-  paramFields: [    // ── Column selection (type: 'column-select') ───────────────────────────────
-    // Auto-seeded with the column having most unique values; falls back to 'data'.
-    // Fully malleable: supports global ↔ per-file scope toggle like all params.
-    {
-      key: 'targetColumn',
-      label: 'Signal Column',
-      type: 'column-select' as const,
-      required: true,
-      defaultRegex: '',
-      defaultReplace: '',
-      defaultValue: 'data',
-      defaultScope: 'global' as const,
-      title: 'CSV column containing ADC codes or voltages.',
-      colorClass: 'text-teal-300',
-    },
-    // ── Per-file: extracted from filename ──────────────────────────────────────
-    {
-      key: 'fsGhz',
-      label: 'Sampling Rate (fs) [GHz]',
-      defaultRegex: '(?:sample[_\\-]?rate|[Ff][Ss])[_\\-]?(\\d+(?:p\\d+)?(?:e[+\\-]?\\d+)?(?:GHz|MHz|kHz|Hz)?)',
-      defaultReplace: '',
-      defaultValue: '',
-      defaultScope: 'global' as const,
-      unit: 'GHz',
-      colorClass: 'text-purple-300',
-      title: 'Sampling frequency in GHz. When typed manually, enter the value in GHz (e.g. 2.25 for 2250 MHz). When extracted from the filename, the regex capture group should include the unit suffix (e.g. 2250MHz) — the transform auto-converts to GHz.',
-      regexTitle: 'Regex to extract fs from filename. Capture group must include unit suffix for correct normalisation (e.g. 2250MHz → 2.25 GHz).',
-      replaceTitle: 'Replacement pairs: from=to,… (e.g. p=. converts 2p25 → 2.25)',
-      transform: (raw: string) => {
-        if (!raw) return '';
-        // Replace decimal encoding (p → .) before parsing
-        const normalised = raw.replace(/p(?=\d)/gi, '.');
-        const lc = normalised.toLowerCase();
-        const parsed = parseFloat(normalised);
-        if (isNaN(parsed)) return '';
-        if (lc.includes('mhz')) return parsed / 1000;
-        if (lc.includes('khz')) return parsed / 1e6;
-        if (lc.includes('hz') && !lc.includes('ghz') && !lc.includes('mhz') && !lc.includes('khz')) return parsed / 1e9;
-        // No unit or GHz → treat as GHz
-        return parsed;
-      },
-      columnRegexParamKey: 'fsGhzColumnRegex',
-      outputColumnName: 'fs_ghz',
-    } satisfies InferredParamField,
-
-    // ── Global by default: same for entire batch ───────────────────────────────
-    {
-      key: 'toneMode',
-      label: 'Tone Mode',
-      defaultRegex: '\\b(single|dual|two)(?:[_\\-]?tone)?\\b',
-      defaultReplace: 'two=dual',
-      defaultValue: 'single',
-      defaultScope: 'global' as const,
-      options: ['single', 'dual'],
-      colorClass: 'text-blue-300',
-      title: 'Single-tone or dual-tone analysis mode.',
-      regexTitle: 'Regex to detect tone mode in filename. Matches "single", "dual", or "two" (→ "dual").',
-      replaceTitle: 'Replacement pairs. Default: two=dual.',
-      transform: (raw: string) => {
-        const lc = raw.toLowerCase().trim();
-        if (lc === 'dual' || lc === 'two') return 'dual';
-        return 'single';
-      },
-      outputColumnName: 'tone_mode',
-    } satisfies InferredParamField,
-
-    {
-      key: 'inputMode',
-      label: 'Input Mode',
-      defaultRegex: '',
-      defaultReplace: '',
-      defaultValue: 'time_domain_codes',
-      defaultScope: 'global' as const,
-      options: ['time_domain_codes', 'time_domain_volts', 'single_sided_power_spectrum'],
-      title: 'Type of data in the selected column: ADC codes, voltages, or a pre-computed dBFS spectrum.',
-    } satisfies InferredParamField,
-
-    {
-      key: 'fftLength',
-      label: 'FFT/DFT Length',
-      defaultRegex: '',
-      defaultReplace: '',
-      defaultValue: 8192,
-      defaultScope: 'global' as const,
-      step: 1,
-      min: 4,
-      title: 'Number of samples per transform window. Power-of-2 (e.g. 4096, 8192) uses fast FFT. Any other integer triggers a slower O(N²) DFT — a warning is shown in the plot.',
-      // Warn visually when the value is not a power of 2 — signals the slow DFT path will be used.
-      warningIf: (value: unknown) => { const n = Number(value); return n > 0 && (n & (n - 1)) !== 0; },
-      outputColumnName: 'fft_length',
-    } satisfies InferredParamField,
-
-    {
-      key: 'numAveraging',
-      label: 'Averages',
-      defaultRegex: '',
-      defaultReplace: '',
-      defaultValue: 1,
-      defaultScope: 'global' as const,
-      min: 1,
-      step: 1,
-      title: 'Number of spectral averaging periods. Total signal consumed = fftLength × numAveraging.',
-      outputColumnName: 'num_averaging',
-    } satisfies InferredParamField,
-
-    {
-      key: 'harmonicsToConsider',
-      label: 'Harmonics (H2…Hk)',
-      defaultRegex: '',
-      defaultReplace: '',
-      defaultValue: 7,
-      defaultScope: 'global' as const,
-      min: 0,
-      max: 20,
-      step: 1,
-      title: 'Number of harmonics H2…Hk to detect and subtract from noise floor.',
-      outputColumnName: 'harmonics',
-    } satisfies InferredParamField,
-
-    {
-      key: 'adcNumBits',
-      label: 'ADC Bits',
-      defaultRegex: '',
-      defaultReplace: '',
-      defaultValue: 11,
-      defaultScope: 'global' as const,
-      min: 1,
-      max: 32,
-      step: 1,
-      title: 'ADC resolution in bits — used for codes↔volts conversion.',
-      outputColumnName: 'adc_bits',
-    } satisfies InferredParamField,
-
-    {
-      key: 'adcOffsetCode',
-      label: 'ADC Offset Code / Volt',
-      defaultRegex: '',
-      defaultReplace: '',
-      defaultValue: 1023,
-      defaultScope: 'global' as const,
-      step: 1,
-      title: 'Mid-scale offset code. Default 1023 = mid-scale for 11-bit (2^10 − 1).',
-      outputColumnName: 'adc_offset_code',
-    } satisfies InferredParamField,
-
-    {
-      key: 'vfsPeakToPeak',
-      label: 'Full-Scale Vpp',
-      defaultRegex: '',
-      defaultReplace: '',
-      defaultValue: 2.0,
-      defaultScope: 'global' as const,
-      unit: 'V',
-      title: 'Full-scale peak-to-peak voltage. Used for noise and power calculations.',
-      outputColumnName: 'vfs_pp',
-    } satisfies InferredParamField,
-
-    {
-      key: 'sfdrLeakageAvoidanceRadiusMhz',
-      label: 'SFDR Avoidance Radius',
-      defaultRegex: '',
-      defaultReplace: '',
-      defaultValue: 0,
-      defaultScope: 'global' as const,
-      unit: 'MHz',
-      title: [
-        'Extra frequency radius (MHz) blanked around every central point (DC, Nyquist, fundamental(s), TI spurs).',
-        'A minimum of 0.3% of fs is always enforced (e.g. 6.75 MHz at fs=2250 MHz) to prevent SFDR markers latching onto lobe leakage.',
-        'Set a larger value to widen the exclusion zone further. 0 = use the 0.3% fs minimum only.',
-      ].join(' '),
-      colorClass: 'text-blue-300',
-      regexTitle: 'Optional: regex to extract SFDR leakage radius from filename (MHz).',
-      replaceTitle: 'Replacement pairs applied to extracted value.',
-      transform: (raw: string) => {
-        const val = parseFloat(raw.trim());
-        return isNaN(val) ? 0 : val;
-      },
-      outputColumnName: 'sfdr_leakage_avoid_mhz',
-    } satisfies InferredParamField,
-
-    {
-      key: 'numberOfCores',
-      label: 'TI ADC Cores (1 - for disabling TI detections)',
-      defaultRegex: '',
-      defaultReplace: '',
-      defaultValue: 1,
-      defaultScope: 'global' as const,
-      min: 1,
-      step: 1,
-      title: 'Number of time-interleaved ADC cores. Set to 1 for non-TI ADCs. Higher values enable TI spur identification and de-embedding.',
-      outputColumnName: 'num_cores',
-    } satisfies InferredParamField,
-
-    {
-      key: 'window',
-      label: 'Window Function',
-      sectionHeader: 'Windowing & Correction Metrics',
-      scopeGroup: 'windowing',
-      defaultRegex: '',
-      defaultReplace: '',
-      defaultValue: 'auto',
-      defaultScope: 'global' as const,
-      options: ['auto', 'rectangular', 'hann', 'hamming', 'blackman', 'blackmanharris', 'flattop', 'kaiser'],
-      selectStyle: 'dropdown' as const,
-      recommendedOptions: ['auto', 'rectangular'],
-      disabledWhen: (p) => String(p.inputMode) === 'single_sided_power_spectrum',
-      title: [
-        'Window function applied to each FFT frame.',
-        '• auto (default) — tries every window. If ALL windowed results beat rectangular, picks the one with the best ENOB (leakage present → windowing helps). If ANY windowed result does NOT beat rectangular, returns rectangular (coherent capture → no leakage; windowing would only hurt). The chosen window is reported in the "window_used" output column.',
-        '• rectangular — no windowing; best SNR for coherent (integer-cycle) captures.',
-        '• hann — good sidelobe rejection (−31 dB); IEEE 1241 general-purpose default.',
-        '• hamming — slightly narrower lobe than Hann; −43 dB sidelobes.',
-        '• blackman — low sidelobes (−58 dB); ENBW 1.73 bins.',
-        '• blackman-harris — very low sidelobes (−92 dB); good for harmonic analysis.',
-        '• flat-top — IEEE 1241 amplitude-accuracy standard; widest lobe, best amplitude flatness.',
-        '• kaiser — tunable β tradeoff; β=8 matches IEEE 1241 ADC characterisation recommendation.',
-        '• [greyed out for single_sided_power_spectrum — spectrum is pre-computed, windowing has no effect]',
-      ].join('\n'),
-    } satisfies InferredParamField,
-
-    {
-      key: 'kaiserBeta',
-      label: 'Kaiser β',
-      scopeGroup: 'windowing',
-      defaultRegex: '',
-      defaultReplace: '',
-      defaultValue: 8,
-      defaultScope: 'global' as const,
-      step: 0.5,
-      min: 0,
-      max: 30,
-      title: [
-        'Kaiser window shape parameter β (only active when Window = kaiser).',
-        '  β = 0     → rectangular (no taper)',
-        '  β = 5     → similar to Hamming',
-        '  β = 8     → IEEE 1241 / ADC characterisation default (~92 dB sidelobes)',
-        '  β = 9.5   → similar to Blackman-Harris',
-        '  β = 13.3  → ~140 dB sidelobes; extreme dynamic range work',
-        'Higher β = lower sidelobes but wider main lobe (more spectral leakage of signal power across bins).',
-      ].join('\n'),
-      disabledWhen: (p) => String(p.window) !== 'kaiser' || String(p.inputMode) === 'single_sided_power_spectrum',
-    } satisfies InferredParamField,
-
-    // ── Window correction metrics (IEEE 1057 / Harris 1978) ───────────────────
-    // Shown next to the window dropdown; default to -1 = "use IEEE table value".
-    {
-      key: 'winCoherentGain',
-      label: 'Coherent Gain',
-      scopeGroup: 'windowing',
-      defaultRegex: '',
-      defaultReplace: '',
-      defaultValue: 1,
-      defaultScope: 'global' as const,
-      step: 0.0001,
-      min: -1,
-      disabledWhen: (p) => String(p.window) === 'rectangular' || String(p.window) === 'auto' || String(p.inputMode) === 'single_sided_power_spectrum',
-      title: [
-        'Coherent power gain = (Σw / N)². Signal amplitude is divided by √(coherentGain) to undo windowing attenuation.',
-        '-1 = use IEEE table default for the selected window:',
-        '  rectangular    → 1.0000',
-        '  hann           → 0.2500',
-        '  hamming        → 0.2700',
-        '  blackman       → 0.1736',
-        '  blackman-harris → 0.1360',
-        '  flat-top       → 0.04652',
-        '  kaiser (β=8)   → 0.4020',
-      ].join('\n'),
-      warningIf: (v) => { const n = Number(v); return n !== -1 && (n <= 0 || n > 1); },
-    } satisfies InferredParamField,
-
-    {
-      key: 'winEnbw',
-      label: 'ENBW (bins)',
-      scopeGroup: 'windowing',
-      defaultRegex: '',
-      defaultReplace: '',
-      defaultValue: 1,
-      defaultScope: 'global' as const,
-      step: 0.001,
-      min: -1,
-      disabledWhen: (p) => String(p.window) === 'rectangular' || String(p.window) === 'auto' || String(p.inputMode) === 'single_sided_power_spectrum',
-      title: [
-        'Equivalent Noise Bandwidth (bins) = N·Σw² / (Σw)². Noise power is divided by ENBW to compensate for spectral spreading.',
-        '-1 = use IEEE table default for the selected window:',
-        '  rectangular    → 1.000',
-        '  hann           → 1.500',
-        '  hamming        → 1.363',
-        '  blackman       → 1.727',
-        '  blackman-harris → 2.004',
-        '  flat-top       → 3.770',
-        '  kaiser (β=8)   → 2.390',
-      ].join('\n'),
-      warningIf: (v) => { const n = Number(v); return n !== -1 && n <= 0; },
-    } satisfies InferredParamField,
-
-    {
-      key: 'winNHalfBins',
-      label: 'Lobe Half-bins',
-      scopeGroup: 'windowing',
-      defaultRegex: '',
-      defaultReplace: '',
-      defaultValue: 0,
-      defaultScope: 'global' as const,
-      step: 1,
-      min: -1,
-      disabledWhen: (p) => String(p.window) === 'rectangular' || String(p.window) === 'auto' || String(p.inputMode) === 'single_sided_power_spectrum',
-      title: [
-        'Lobe integration half-width (bins each side of the peak bin). Tone power is summed over [peak − n … peak + n].',
-        '-1 = use IEEE table default for the selected window:',
-        '  rectangular    → 0  (single bin)',
-        '  hann           → 2',
-        '  hamming        → 2',
-        '  blackman       → 3',
-        '  blackman-harris → 4',
-        '  flat-top       → 4',
-        '  kaiser (β=8)   → 4',
-      ].join('\n'),
-      warningIf: (v) => { const n = Number(v); return n !== -1 && (n < 0 || !Number.isInteger(n)); },
-    } satisfies InferredParamField,
-
-
-    {
-      key: 'spursMinThresholdEn',
-      label: 'Enable Spur Min. Threshold',
-      defaultRegex: '',
-      defaultReplace: '',
-      defaultValue: 'true',   // 1 = enabled (boolean stored as number)
-      defaultScope: 'global' as const,
-      options: ['true', 'false'],
-      title: 'Enable minimum threshold for spur detection (default true).',
-    } satisfies InferredParamField,
-
-    {
-      key: 'spursMinCalcFactor',
-      label: 'Spur Min. Calc. Factor',
-      defaultRegex: '',
-      defaultReplace: '',
-      defaultValue: 1.0,
-      defaultScope: 'global' as const,
-      step: 0.1,
-      min: 0,
-      title: 'Histogram σ multiplier for spur min. threshold (default 1.0).',
-    } satisfies InferredParamField,
-
-    {
-      key: 'spursMinDbfs',
-      label: 'Spur Min. Threshold (dBFS)',
-      defaultRegex: '',
-      defaultReplace: '',
-      defaultValue: 0,
-      defaultScope: 'global' as const,
-      unit: 'dBFS',
-      title: 'Manual override for spur min. threshold; 0 = use histogram auto-calc.',
-    } satisfies InferredParamField,
-
-    // ── TI mismatch correction ────────────────────────────────────────────────
-    // Separator + master selector for which corrections to apply and in what order.
-    // Disabled entirely when inputMode=single_sided_power_spectrum or numberOfCores≤1.
-    {
-      key: 'tiCorrections',
-      label: 'TI Corrections  —  none or O,G,P recommended',
-      sectionHeader: 'TI Mismatch Correction',
-      defaultRegex: '',
-      defaultReplace: '',
-      defaultValue: 'none',
-      defaultScope: 'global' as const,
-      options: ['none', 'O', 'G', 'P', 'O,G', 'O,P', 'G,P', 'O,G,P', 'G,O,P', 'O,P,G'],
-      recommendedOptions: ['none', 'O,G,P'],
-      title: 'Select which corrections to apply and their order. O=Offset, G=Gain, P=Phase-skew. Empty = characterise only (no correction applied). Disabled for single_sided_power_spectrum — phase info is lost. Requires numberOfCores > 1.',
-      disabledWhen: (p) => String(p.inputMode) === 'single_sided_power_spectrum' || Number(p.numberOfCores ?? 1) <= 1,
-    } satisfies InferredParamField,
-
-    {
-      key: 'tiRefPhase',
-      label: 'TI Reference Phase',
-      defaultRegex: '',
-      defaultReplace: '',
-      defaultValue: 0,
-      defaultScope: 'global' as const,
-      min: 0,
-      step: 1,
-      title: 'Reference phase index (0-based). All other cores align their offset, gain, and phase to this core. Default 0.',
-      disabledWhen: (p) => String(p.inputMode) === 'single_sided_power_spectrum' || Number(p.numberOfCores ?? 1) <= 1,
-    } satisfies InferredParamField,
-
-    {
-      key: 'tiOffsetQuantLsb',
-      label: 'TI Offset Quantization',
-      defaultRegex: '',
-      defaultReplace: '',
-      defaultValue: 0.25,
-      defaultScope: 'global' as const,
-      step: 0.25,
-      min: 0.0625,
-      unit: 'LSB',
-      title: 'Offset correction quantization step in LSBs. Prevents unrealistically perfect correction (matches real DAC resolution). Default 0.25 LSB.',
-      disabledWhen: (p) => String(p.inputMode) === 'single_sided_power_spectrum' || Number(p.numberOfCores ?? 1) <= 1,
-    } satisfies InferredParamField,
-  ],
-
-  defaultParams: {
-    targetColumn: '',   // populated at runtime from columnRequirements selection
-    fsGhz: 2.1,
-    toneMode: 'single',
-    fsGhzColumnRegex: '',
-    fsGhzRegex: '(?:sample[_\\-]?rate|[Ff][Ss])[_\\-]?(\\d+(?:p\\d+)?(?:e[+\\-]?\\d+)?(?:GHz|MHz|kHz|Hz)?)',
-    fsGhzReplace: '',
-    inputMode: 'time_domain_codes' as const,
-    fftLength: 8192,
-    numAveraging: 1,
-    adcNumBits: 11,
-    adcOffsetCode: 1023,
-    vfsPeakToPeak: 2.0,
-    window: 'auto' as const,
-    kaiserBeta: 8,
-    winCoherentGain: 1,
-    winEnbw: 1,
-    winNHalfBins: 0,
-    harmonicsToConsider: 7,
-    numberOfCores: 1,
-    spursMinThresholdEn: true,
-    spursMinCalcFactor: 1.0,
-    spursMinDbfs: 0,
-    tiCorrections: 'none',
-    tiRefPhase: 0,
-    tiOffsetQuantLsb: 0.25,
-  },
-
 
   outputColumns: [
     'window_used',

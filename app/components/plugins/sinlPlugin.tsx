@@ -64,7 +64,6 @@ import {
   type WaveformPacket,
 } from '../../lib/pluginTypes';
 
-import sinlDoc from './sinlPlugin.doc';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
   ReferenceLine, ReferenceArea, ResponsiveContainer,
@@ -562,9 +561,9 @@ const manifest: PluginManifest = {
   description: 'Sine-histogram INL/DNL for clipped (saturated) sine waves — not for ENOB.',
   version: '1.0.0',
   author: 'Guy Steiff',
-  authorEmail: 'guy.steiff-sinlsuppport@bytz.me',
   github: '',
   linkedin: 'https://www.linkedin.com/in/guysteiff/',
+  authorEmail: 'a@a.com',
   website: '',
   pythonModule: 'sinl_tool',
   pythonFunction: 'run_sinl',
@@ -572,60 +571,59 @@ const manifest: PluginManifest = {
   category: 'signal',
   paramSchema: [
   {
-    key: 'sampleColumn',
+    key: 'targetColumn',
     label: 'Sample Column',
     type: 'column-select',
-    required: true,
     description: 'CSV column containing raw ADC codes or voltages.',
+    default: '',
     aliases: ['sample', 'samples', 'adcCode', 'adcCodes', 'voltage'],
   },
   {
     key: 'inputMode',
     label: 'Input Mode',
     type: 'text',
-    required: false,
     description: 'Input representation: "codes" (default) for raw ADC codes, or "voltage" for voltage samples normalised using minCode and maxCode.',
+    default: 'codes',
     aliases: ['mode', 'inputType'],
     possibleValues: ['codes', 'voltage'],
   },
-
   {
     key: 'minCode',
     label: 'Min code / voltage',
     type: 'number',
-    required: false,
     description: 'Theoretical minimum code (default 0) or minimum voltage.',
+    default: 0,
   },
   {
     key: 'maxCode',
     label: 'Max code / voltage',
     type: 'number',
-    required: true,
     description: 'Theoretical maximum code (e.g. 2047 for 11-bit) or maximum voltage.',
+    default: 2047,
   },
   {
     key: 'avoidanceRadius',
     label: 'Avoidance Radius',
     type: 'number',
-    required: false,
     description: 'Peak search radius for truncation (default 40).',
     min: 0,
+    default: 40,
   },
   {
     key: 'minSizeBin',
     label: 'Min Bin Size',
     type: 'number',
-    required: false,
     description: 'Min samples for a code to count as reachable (default 2).',
     min: 1,
+    default: 2,
   },
   {
     key: 'missingThreshold',
     label: 'Missing Code Threshold',
     type: 'number',
-    required: false,
     description: 'DNL threshold below which a code is missing (default -0.9).',
     max: 0,
+    default: -0.9,
   },
 ],
 
@@ -1091,17 +1089,6 @@ export const sinlPlugin: Plugin<SinlParams> = {
   name: 'SINL — Sine INL/DNL',
   description: manifest.description,
   manifest,
-  doc: sinlDoc,
-
-  defaultParams: {
-    sampleColumn: '',
-    avoidanceRadius: 40,
-    minSizeBin: 2,
-    missingThreshold: -0.9,
-    inputMode: 'codes',
-    minCode: 0,
-    maxCode: 2047,
-  },
 
   outputColumns: [
     'inl_codes_p2p', 'inl_max', 'code_inl_max', 'inl_min', 'code_inl_min',

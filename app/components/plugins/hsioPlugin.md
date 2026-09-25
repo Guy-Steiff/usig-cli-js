@@ -164,7 +164,7 @@ statically resolves it, keeping the browser bundle clean.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `signalColumn` | column-select | `voltage_v` | CSV column with time-domain voltage samples |
+| `targetColumn` | column-select | `voltage_v` | CSV column with time-domain voltage samples |
 | `uiRateGbps` | number | 10 | Nominal bit rate (Gbps) for UI folding; auto-extracted from `finused…MHz/GHz` or `fin…GHz` in filename |
 | `fsGhz` | number | 80 | Acquisition sample rate (GHz); auto-extracted from `fs…GHz` |
 | `signalType` | text/dropdown | `prbs2/clock` | `clock`, `prbs2`, or `prbsN` (N ≥ 3); auto-extracted from `prbsN` token |

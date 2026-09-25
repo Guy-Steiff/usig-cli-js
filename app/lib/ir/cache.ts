@@ -61,7 +61,6 @@ export function hintsKey(hints?: IngestHints): string {
    * interface, including:
    *
    *   sampleRateHz
-   *   fsGhzColumnRegex
    *   dtype
    *   encoding
    *   bytes_per_sample
@@ -84,7 +83,7 @@ export function hintsKey(hints?: IngestHints): string {
    * affect ingestion, add them here.
    */
   const hintKeys: (keyof IngestHints)[] = [
-    'signalColumn',
+    'targetColumn',
     'preserveBinIndex',
     'endianness',
     'headerBytes',

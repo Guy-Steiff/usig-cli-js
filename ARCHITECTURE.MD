@@ -66,7 +66,7 @@ Binary (ingestBin):
 
 CSV (ingestCsv):
   - Auto-detects delimiter: tab preferred over comma.
-  - Column selection: hints.signalColumn exact match, else most-unique-values heuristic.
+  - Column selection: hints.targetColumn exact match, else most-unique-values heuristic.
   - Optional fsGhzColumnRegex: extracts sample rate from a constant-valued column.
   - preserveBinIndex mode: keeps row order, substitutes -Infinity for non-numeric cells
     (used for single_sided_power_spectrum input mode in SMEAS).
@@ -105,7 +105,7 @@ User/pipeline overrides. Passed through from plugin.getIngestHints() via IREngin
 
   interface IngestHints {
     sampleRateHz?: number;        // override sample rate
-    signalColumn?: string;        // exact column name or 0-based index (TXT)
+    targetColumn?: string;        // exact column name or 0-based index (TXT)
     fsGhzColumnRegex?: string;    // regex to find fs column in CSV
     preserveBinIndex?: boolean;   // for single_sided_power_spectrum mode
     dtype?: string;               // for generic binary
@@ -162,7 +162,7 @@ The canonical IR unit. Each (file x hints) combination has exactly one SignalFra
   hintsKey(hints?: IngestHints): string
     -> '' for the base frame (no hints, heuristic column selection)
     -> stable JSON of active hint fields with sorted keys for any other frame
-    Fields considered: sampleRateHz, signalColumn, fsGhzColumnRegex,
+    Fields considered: sampleRateHz, targetColumn, fsGhzColumnRegex,
                        preserveBinIndex, dtype, endianness, headerBytes, units, maxSamples
 
   storeKey = fileFingerprint + '::' + hintsKey
@@ -360,7 +360,7 @@ Every plugin that uses a column-select parameter MUST implement getIngestHints s
 IR engine knows which column to extract as the signal waveform:
 
   getIngestHints: (params: SmeasParams): IngestHints => ({
-    signalColumn:     String(params.targetColumn || ''),
+    targetColumn:     String(params.targetColumn || ''),
     fsGhzColumnRegex: String(params.fsGhzColumnRegex || ''),
     preserveBinIndex: params.inputMode === 'single_sided_power_spectrum',
     sampleRateHz:     Number(params.fsGhz) * 1e9 || 0,

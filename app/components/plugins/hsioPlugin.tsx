@@ -67,7 +67,6 @@
 import {
   type Plugin,
   type PluginManifest,
-  type InferredParamField,
   type PluginFigure,
   type PluginDebugTable,
   type PortableFigureDescription,
@@ -75,7 +74,7 @@ import {
 } from '../../lib/pluginTypes';
 
 interface hsioParams {
-  signalColumn: string;
+  targetColumn: string;
   uiRateGbps: number | string;
   fsGhz: number | string;
   signalType: string;
@@ -89,12 +88,6 @@ interface hsioParams {
   // when the golden file was generated — they are NOT consumed by
   // analyzehsio()/computeJitter() and must never be confused with the
   // real computed jitter outputs (rjSigmaPs, pjFreqMhz, etc.).
-  rjStdTargetPs: number | string;
-  pjAmpTargetPs: number | string;
-  pjFreqTargetMhz: number | string;
-  sscAmpTargetPs: number | string;
-  sscFreqTargetKhz: number | string;
-  noiseStdTargetMv: number | string;
 }
 
 interface hsioFigureData {
@@ -146,7 +139,7 @@ interface hsioFigureData {
  * (mirrors smeasIngestHints / sinlPlugin's column-select convention). */
 function hsioIngestHints(params: hsioParams): import('../../lib/ingest').IngestHints {
   return {
-    signalColumn: params.signalColumn?.trim() || undefined,
+    targetColumn: params.targetColumn?.trim() || undefined,
   };
 }
 
@@ -161,23 +154,70 @@ const manifest: PluginManifest = {
   reportTitle: 'hsio Eye Diagram Analysis',
   category: 'signal',
   paramSchema: [
-    { key: 'signalColumn', label: 'Signal Column', type: 'column-select', required: true, description: 'CSV column with time-domain voltage samples.', aliases: ['sample', 'samples', 'voltage', 'voltageColumn'] },
-    { key: 'uiRateGbps', label: 'Bit Rate (Gbps)', type: 'number', required: true, description: 'Nominal bit rate used for UI folding.', aliases: ['bitRate', 'dataRate', 'uiRate', 'fin'], unit: 'Gbps' },
-    { key: 'fsGhz', label: 'Sample Rate (GHz)', type: 'number', required: true, description: 'Acquisition sample rate.', aliases: ['fs', 'samplingFrequency', 'sampleRate'], unit: 'GHz' },
-    { key: 'signalType', label: 'Signal Type', type: 'text', required: false, description: 'clock | prbs7 | prbs31 (or similar).', aliases: ['pattern', 'patternType', 'prbs'] },
-    { key: 'vtThreshold', label: 'Voltage Threshold (V)', type: 'number', required: false, description: 'Threshold for edge extraction. 0 = auto.', aliases: ['threshold', 'vth'], unit: 'V' },
-    { key: 'eyeSamples', label: 'Eye Fold Samples', type: 'number', required: false, description: 'Maximum samples folded into eye grid.', aliases: ['maxFoldSamples', 'nfft'] },
-    { key: 'berTarget', label: 'BER Target', type: 'text', required: false, description: 'Target bit-error-rate used for bathtub-curve extrapolation.', aliases: ['ber'] },
-    // Informational-only fields captured from golden HSIO filenames.
-    // These describe the synthetic jitter/noise injected when the golden
-    // file was generated. They are recognized/displayed but never fed
-    // into analyzehsio()/computeJitter() as analysis inputs.
-    { key: 'rjStdTargetPs', label: 'RJ Std (target, ps)', type: 'number', required: false, description: 'Informational: random-jitter sigma used to synthesize the golden file.', aliases: ['rjstd'], unit: 'ps' },
-    { key: 'pjAmpTargetPs', label: 'PJ Amplitude (target, ps)', type: 'number', required: false, description: 'Informational: periodic-jitter amplitude used to synthesize the golden file.', aliases: ['pjamp'], unit: 'ps' },
-    { key: 'pjFreqTargetMhz', label: 'PJ Frequency (target, MHz)', type: 'number', required: false, description: 'Informational: periodic-jitter frequency used to synthesize the golden file.', aliases: ['pjfreq'], unit: 'MHz' },
-    { key: 'sscAmpTargetPs', label: 'SSC Amplitude (target, ps)', type: 'number', required: false, description: 'Informational: spread-spectrum-clocking wander amplitude used to synthesize the golden file.', aliases: ['sscamp'], unit: 'ps' },
-    { key: 'sscFreqTargetKhz', label: 'SSC Frequency (target, kHz)', type: 'number', required: false, description: 'Informational: spread-spectrum-clocking modulation frequency used to synthesize the golden file.', aliases: ['sscfreq'], unit: 'kHz' },
-    { key: 'noiseStdTargetMv', label: 'Noise Std (target, mV)', type: 'number', required: false, description: 'Informational: additive-noise sigma used to synthesize the golden file.', aliases: ['noisestd'], unit: 'mV' },
+    { key: 'targetColumn',
+      label: 'Signal Column',
+      type: 'column-select',
+      description: 'CSV column with time-domain voltage samples.',
+      default: '',
+      aliases: ['sample', 'samples', 'voltage', 'voltageColumn']
+    },
+    { key: 'uiRateGbps',
+      label: 'Bit Rate (Gbps)',
+      type: 'number',
+      description: 'Nominal bit rate used for UI folding.',
+      default: 10,
+      aliases: ['bitRate', 'dataRate', 'uiRate', 'fin'],
+      unit: 'Gbps',
+      defaultRegex: 'finused(\\d+)p(\\d+)(mhz|ghz)',
+      defaultReplace: '',
+      transform: (raw: string) => {
+      const n = parseFloat(raw);
+      if (isNaN(n)) return raw;
+      return n < 1000 ? String(n / 1000) : String(n);
+    }
+    },
+    {
+      key: 'fsGhz',
+      label: 'Sample Rate (GHz)',
+      type: 'number',
+      description: 'Acquisition sample rate.',
+      default: 80,
+      aliases: ['fs', 'samplingFrequency', 'sampleRate'],
+      unit: 'GHz',
+      defaultRegex: 'fs(\\d+)p(\\d+)ghz',
+      defaultReplace: ''
+    },
+    {
+      key: 'signalType',
+      label: 'Signal Type',
+      type: 'text',
+      description: 'clock | prbs7 | prbs31 (or similar).',
+      default: 'prbs2/clock',
+      aliases: ['pattern', 'patternType', 'prbs'],
+      defaultRegex: '(clock|prbs\\d+)',
+      defaultReplace: '$1'
+    },
+    { key: 'vtThreshold',
+      label: 'Voltage Threshold (V)',
+      type: 'number',
+      description: 'Threshold for edge extraction. 0 = auto.',
+      default: 0,
+      aliases: ['threshold', 'vth'],
+      unit: 'V'
+    },
+    { key: 'eyeSamples',
+      label: 'Eye Fold Samples',
+      type: 'number',
+      description: 'Maximum samples folded into eye grid.',
+      default: 1000,
+      aliases: ['maxFoldSamples', 'nfft']
+    },
+    { key: 'berTarget',
+      label: 'BER Target',
+      type: 'text',
+      description: 'Target bit-error-rate used for bathtub-curve extrapolation.',
+      default: 1e-12,
+      aliases: ['ber'] },
   ],
 
   // Declarative debug table capabilities. Lightweight metadata only —
@@ -252,195 +292,6 @@ const manifest: PluginManifest = {
       description: 'Spread-spectrum-clocking / wander profile (ps vs. time), with SSC swing (ppm) in the results panel.',
     },
   ],
-};
-
-const paramFields: InferredParamField[] = [
-  {
-    key: 'signalColumn',
-    label: 'Signal Column',
-    type: 'column-select',
-    required: true,
-    defaultScope: 'per-file',
-    defaultRegex: '',
-    defaultReplace: '',
-    defaultValue: 'voltage_v',
-    title: 'CSV column containing time-domain samples',
-  },
-  {
-    key: 'uiRateGbps',
-    label: 'Bit Rate',
-    defaultScope: 'global',
-    // finused599p93mhz → two groups "599"+"93" → joined "599.93" → transform ÷1000 → 0.59993 Gbps
-    // Also handles non-p-decimal: finused10ghz → group "10" → transform: GHz branch
-    defaultRegex: 'finused(\\d+)p(\\d+)(mhz|ghz)',
-    defaultReplace: '',
-    defaultValue: 10,
-    min: 0.1,
-    max: 224,
-    step: 0.1,
-    unit: 'Gbps',
-    aliases: ['fin'],
-    title: 'Nominal bit rate used to fold the eye. Auto-extracted from finused…MHz/GHz in filename, or fin…ghz (e.g. fin0p59993ghz → 0.59993 Gbps).',
-    transform: (raw: string) => {
-      // raw is "digits.digits unit" e.g. "599.93mhz" or "10.00ghz"
-      // applyRegexToFilename joins group1.group2 then appends group3 if available
-      // Actually with 3 capture groups, applyRegexToFilename only uses groups 1 and 2.
-      // So raw = "599.93" (MHz). We divide by 1000 to get Gbps.
-      const n = parseFloat(raw);
-      if (isNaN(n)) return raw;
-      // If the value looks like it's in MHz range (< 1000), divide by 1000
-      return n < 1000 ? String(n / 1000) : String(n);
-    },
-  },
-  {
-    key: 'fsGhz',
-    label: 'Sample Rate',
-    defaultScope: 'global',
-    // fs100p00ghz → two groups "100"+"00" → joined "100.00"
-    defaultRegex: 'fs(\\d+)p(\\d+)ghz',
-    defaultReplace: '',
-    defaultValue: 80,
-    min: 1,
-    max: 500,
-    step: 1,
-    unit: 'GHz',
-    aliases: ['fs'],
-    title: 'Acquisition sample rate. Auto-extracted from fs…GHz in filename.',
-  },
-  {
-    key: 'signalType',
-    label: 'Signal Type',
-    defaultScope: 'global',
-    defaultRegex: '(clock|prbs\\d+)',
-    defaultReplace: '$1',
-    defaultValue: 'prbs2/clock',
-    options: [
-      'prbs2/clock',
-      ...Array.from({ length: 29 }, (_, i) => `prbs${i + 3}`),
-    ],
-    selectStyle: 'dropdown' as const,
-    aliases: ['prbs'],
-    title: 'prbs2/clock: rising edges only (1010… pattern). PRBS-N (N≥3): both edges. Auto-extracted from the filename\'s prbsN token (e.g. prbs2 → "prbs2"); analyzehsio() already normalizes prbs2/clock/"prbs2" identically.',
-  },
-  {
-    key: 'vtThreshold',
-    label: 'Threshold',
-    defaultScope: 'global',
-    defaultRegex: '',
-    defaultReplace: '',
-    defaultValue: 0,
-    unit: 'V',
-    title: '0 enables auto-threshold from histogram midpoint',
-  },
-  {
-    key: 'eyeSamples',
-    label: 'Eye Samples',
-    defaultScope: 'global',
-    defaultRegex: '',
-    defaultReplace: '',
-    defaultValue: 200000,
-    min: 1000,
-    max: 2000000,
-    step: 10000,
-    aliases: ['nfft'],
-    title: 'Upper bound on folded eye samples. Auto-extracted from nfft… in filename.',
-  },
-  {
-    key: 'berTarget',
-    label: 'BER Target',
-    defaultScope: 'global',
-    defaultRegex: '',
-    defaultReplace: '',
-    defaultValue: '1e-12',
-    aliases: ['ber'],
-    title: 'Target bit-error-rate used for dual-Dirac bathtub-curve extrapolation.',
-  },
-  // ── Informational-only fields extracted from golden HSIO filenames ──────
-  // These describe the synthetic jitter/noise injected when the golden
-  // file was generated. Recognized/displayed only — never fed into
-  // analyzehsio()/computeJitter() as analysis inputs.
-  {
-    key: 'rjStdTargetPs',
-    label: 'RJ Std (target)',
-    defaultScope: 'global',
-    defaultRegex: '',
-    defaultReplace: '',
-    defaultValue: 0,
-    unit: 'ps',
-    aliases: ['rjstd'],
-    title: 'Informational: random-jitter sigma used to synthesize the golden file.',
-  },
-  {
-    key: 'pjAmpTargetPs',
-    label: 'PJ Amplitude (target)',
-    defaultScope: 'global',
-    defaultRegex: '',
-    defaultReplace: '',
-    defaultValue: 0,
-    unit: 'ps',
-    aliases: ['pjamp'],
-    title: 'Informational: periodic-jitter amplitude used to synthesize the golden file.',
-  },
-  {
-    key: 'pjFreqTargetMhz',
-    label: 'PJ Frequency (target)',
-    defaultScope: 'global',
-    defaultRegex: '',
-    defaultReplace: '',
-    defaultValue: 0,
-    unit: 'MHz',
-    aliases: ['pjfreq'],
-    title: 'Informational: periodic-jitter frequency used to synthesize the golden file.',
-  },
-  {
-    key: 'sscAmpTargetPs',
-    label: 'SSC Amplitude (target)',
-    defaultScope: 'global',
-    defaultRegex: '',
-    defaultReplace: '',
-    defaultValue: 0,
-    unit: 'ps',
-    aliases: ['sscamp'],
-    title: 'Informational: spread-spectrum-clocking wander amplitude used to synthesize the golden file.',
-  },
-  {
-    key: 'sscFreqTargetKhz',
-    label: 'SSC Frequency (target)',
-    defaultScope: 'global',
-    defaultRegex: '',
-    defaultReplace: '',
-    defaultValue: 0,
-    unit: 'kHz',
-    aliases: ['sscfreq'],
-    title: 'Informational: spread-spectrum-clocking modulation frequency used to synthesize the golden file.',
-  },
-  {
-    key: 'noiseStdTargetMv',
-    label: 'Noise Std (target)',
-    defaultScope: 'global',
-    defaultRegex: '',
-    defaultReplace: '',
-    defaultValue: 0,
-    unit: 'mV',
-    aliases: ['noisestd'],
-    title: 'Informational: additive-noise sigma used to synthesize the golden file.',
-  },
-];
-
-const defaultParams: hsioParams = {
-  signalColumn: 'voltage_v',
-  uiRateGbps: 10,
-  fsGhz: 80,
-  signalType: 'prbs2/clock',
-  vtThreshold: 0,
-  eyeSamples: 200000,
-  berTarget: '1e-12',
-  rjStdTargetPs: 0,
-  pjAmpTargetPs: 0,
-  pjFreqTargetMhz: 0,
-  sscAmpTargetPs: 0,
-  sscFreqTargetKhz: 0,
-  noiseStdTargetMv: 0,
 };
 
 function median(vals: number[]): number {
@@ -1240,7 +1091,7 @@ async function analyzehsio(samples: number[], params: hsioParams, fileName: stri
 
   let vth = Number(params.vtThreshold ?? 0);
   if (!isFinite(vth) || vth === 0) vth = autoDetectVth(samples);
-
+  // console.error('[hsio DEBUG] samples range:', Math.min(...samples.slice(0, 100000)), '→', Math.max(...samples.slice(0, 100000)), '| vth:', vth, '| n:', samples.length);
   // extractEdgesWithPolarity is numerically identical to extractEdges (same
   // threshold-crossing / linear-interpolation arithmetic) but additionally
   // returns per-edge polarity, needed by computeJitter for DCD/DDJ.
@@ -2341,8 +2192,6 @@ export const hsioPlugin: Plugin<hsioParams> = {
   name: 'hsio — HSIO Eye Diagram',
   description: manifest.description,
   manifest,
-  paramFields,
-  defaultParams,
   getIngestHints: (params: hsioParams) => hsioIngestHints(params),
   outputColumns: [
     'status',

@@ -1361,7 +1361,8 @@ function describeSource(key, detail) {
   const value = formatInputValue(detail.value);
 
   if (detail.source === 'override') {
-    return `${key} = ${value} << overridden from user input`;
+    return `${key} = ${value} << overridden from user input${detail.matchedAlias ? ` (from alias "${detail.matchedAlias}")` : ''}`;
+    // return `${key} = ${value} << overridden from user input`;
   }
 
   if (detail.source === 'filename') {
@@ -1430,8 +1431,6 @@ function inferStrictMetadataFromFilename(filename) {
 
 function collectDisplayFields(plugin) {
   const all = [
-    ...(plugin.paramFields ?? []),
-    ...(plugin.inferredParamFields ?? []),
     ...(plugin.manifest?.paramSchema ?? []),
   ];
   const seen = new Set();
@@ -1521,10 +1520,12 @@ function resolveFilenameTokenForField(field, filename) {
     //     signals a non-numeric field (numeric paramFields never set
     //     `options`/a string defaultValue).
     const isTextLikeField =
-      field.type === 'text' ||
+      (!field.transform && field.type === 'text') ||
       field.type === 'boolean' ||
-      (Array.isArray(field.options) && field.options.length > 0) ||
-      typeof field.defaultValue === 'string';
+      (!field.transform &&
+        !field.unit &&
+        ((Array.isArray(field.options) && field.options.length > 0) ||
+          typeof field.defaultValue === 'string'));
     const usedExplicitSeparator = token.token.includes('~');
     if (isTextLikeField && !usedExplicitSeparator) {
       return {
@@ -1575,17 +1576,20 @@ function resolveFieldValue(
   derivedHints = {},
   pluginDefaultParams = {}
 ) {
-  const hasOverride =
-    Object.prototype.hasOwnProperty.call(
-      explicitParams,
-      field.key
-    );
+  // 1. Explicit -p always wins — matched by canonical key or any declared alias.
+  const overrideKey = [
+    field.key,
+    ...(Array.isArray(field.aliases) ? field.aliases : []),
+  ].find((name) =>
+    Object.prototype.hasOwnProperty.call(explicitParams, name)
+  );
 
-  // 1. Explicit -p always wins.
-  if (hasOverride) {
+  if (overrideKey !== undefined) {
     return {
-      value: explicitParams[field.key],
+      value: explicitParams[overrideKey],
       source: 'override',
+      matchedAlias:
+        overrideKey !== field.key ? overrideKey : undefined,
     };
   }
 
@@ -1642,6 +1646,7 @@ function resolveFieldValue(
   // 4. Legacy field-specific filename regex.
   const filenamePattern =
     field.defaultPattern ??
+    field.defaultRegex ??
     pluginDefaultParams?.[
       `${field.key}Regex`
     ] ??
@@ -1649,6 +1654,7 @@ function resolveFieldValue(
 
   const filenameReplacements =
     field.defaultReplacements ??
+    field.defaultReplace ??
     pluginDefaultParams?.[
       `${field.key}Replace`
     ] ??
@@ -1716,7 +1722,7 @@ function buildInputSummary(
     {
       inputFileName,
       pluginDefaultParams:
-        plugin?.defaultParams,
+        getSchemaDefaults(plugin),
       explicitParams,
       strictFilenameInference,
     }
@@ -1743,7 +1749,7 @@ function buildInputSummary(
       inputFileName,
       headers,
       derivedHints,
-      plugin?.defaultParams ?? {}
+      getSchemaDefaults(plugin)
     );
 
   let value = resolved.value;
@@ -1774,6 +1780,7 @@ function buildInputSummary(
   summary.push({
     key: field.key,
     value,
+    matchedAlias: resolved.matchedAlias,
     source,
     ...(resolved.token
       ? { token: resolved.token }
@@ -2461,6 +2468,7 @@ async function ingestInputToIR({
   const hints = {
     ...(params ?? {}),
   };
+  console.error('[ingest DEBUG] hints:', JSON.stringify(hints));
 
   const IREngine = irMod?.IREngine;
   if (!IREngine) {
@@ -2539,7 +2547,7 @@ async function ingestInputToIR({
       [{
         label:
           packet.metadata?.channelLabels?.[0] ??
-          packet.metadata?.signalColumn ??
+          packet.metadata?.targetColumn ??
           packet.channels?.[0]?.label ??
           packet.arrays?.[0]?.label,
         units: packet.metadata?.units,
@@ -2728,6 +2736,14 @@ function levenshteinDistance(a, b) {
   return dp[m][n];
 }
 
+function getSchemaDefaults(plugin) {
+  const defaults = {};
+  for (const field of plugin?.manifest?.paramSchema ?? []) {
+    if (field.default !== undefined) defaults[field.key] = field.default;
+  }
+  return defaults;
+}
+
 // Combines plugin.manifest.paramSchema (typed/validated fields) with
 // plugin.paramFields (InferredParamField — also valid -p keys, e.g.
 // toneMode, tiCorrections, fsGhz) into a single de-duplicated map keyed by
@@ -2736,7 +2752,6 @@ function levenshteinDistance(a, b) {
 function collectKnownParamFields(plugin) {
   const fields = [
     ...(plugin?.manifest?.paramSchema ?? []),
-    ...(plugin?.paramFields ?? []),
   ];
   const byKey = new Map();
   for (const field of fields) {
@@ -2835,15 +2850,10 @@ function printPluginHelp(pluginId, plugin) {
       }
 
       if (
-        plugin?.defaultParams &&
-        Object.prototype.hasOwnProperty.call(
-          plugin.defaultParams,
-          field.key
-        )
+        schemaEntry &&
+        schemaEntry.default !== undefined
       ) {
-        console.log(
-          `    Default: ${plugin.defaultParams[field.key]}`
-        );
+        console.log(`    Default: ${schemaEntry.default}`);
       }
 
       if (
@@ -3517,9 +3527,10 @@ if (args.length === 0) {
       );
 
     const ingestionParamsForSpec = {
-      ...(firstPlugin?.defaultParams ?? {}),
+      ...(getSchemaDefaults(firstPlugin)),
       ...filenameParamHintsForSpec,
       ...(params ?? {}),
+      ...(spec.pluginInvocations?.[0]?.params ?? {}),
     };
 
     let hintsForSpec =
@@ -3527,6 +3538,10 @@ if (args.length === 0) {
       typeof firstPlugin.getIngestHints === 'function'
         ? firstPlugin.getIngestHints(ingestionParamsForSpec)
         : undefined;
+
+    // console.error('[usig DEBUG] firstPlugin:', firstPlugin?.id,
+    //   '| hintsForSpec:', JSON.stringify(hintsForSpec),
+    //   '| ingestionParamsForSpec.targetColumn:', ingestionParamsForSpec.targetColumn);
 
     if (Number.isInteger(spec.startSample) || Number.isInteger(spec.endSample)) {
       hintsForSpec = {
@@ -3575,7 +3590,7 @@ if (args.length === 0) {
           : [{
               label:
                 packet.metadata?.channelLabels?.[0] ??
-                packet.metadata?.signalColumn ??
+                packet.metadata?.targetColumn ??
                 canonicalFrame?.headers?.[0],
               units: packet.metadata?.units,
               waveform,
@@ -3715,7 +3730,7 @@ if (args.length === 0) {
     validateKnownParams(resolvedPluginId, plugin, mergedExplicitParams);
 
     let finalParams = {
-      ...plugin.defaultParams,
+      ...getSchemaDefaults(plugin),
       ...filenameParamHints,
       ...mergedExplicitParams,
     };
@@ -3727,7 +3742,7 @@ if (args.length === 0) {
       inputFileName,
       plugin: resolvedPluginId,
       strictFilenameInference,
-      pluginDefaultParams: plugin.defaultParams,
+      pluginSchemaDefaults: getSchemaDefaults(plugin),
       explicitParams: mergedExplicitParams,
     });
 
@@ -3819,16 +3834,16 @@ if (args.length === 0) {
     if (debugRequests.length > 0) {
     // Handle discovery request '-debug list'
     if (debugRequests.some(r => r.key === 'list')) {
-
       console.error(`DEBUG TABLES: ${resolvedPluginId}`);
-      if (debugTables.length === 0) {
-        console.error('(no debug tables produced)');
+      const declaredTables = plugin.manifest?.debugTables ?? [];
+      if (declaredTables.length === 0) {
+        console.error('(no debug tables declared)');
       } else {
-        for (const t of debugTables) {
-          const cols = Object.keys(t.columns || {});
+        for (const t of declaredTables) {
           console.error('');
           console.error(t.id);
           if (t.label) console.error(t.label);
+          const cols = t.columns ?? [];
           if (cols.length > 0) console.error(`columns: ${cols.join(', ')}`);
         }
       }

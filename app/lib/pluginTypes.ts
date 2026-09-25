@@ -41,20 +41,25 @@ import type { IngestHints } from './ingest';
 export type { WaveformPacket } from './ingest';
 
 
-/** A JSON-serialisable description of a single plugin parameter. */
 export interface ParamSchema {
   key: string;
   label: string;
   type: 'column-select' | 'text' | 'number' | 'boolean';
-  required: boolean;
   description?: string;
-
+  default: string | number | boolean;
   aliases?: string[];
   possibleValues?: string[];
   min?: number;
   max?: number;
   unit?: string;
   unitOptions?: string[];
+
+  /** Filename regex: the capture group is normalised through `transform`. */
+  defaultRegex?: string;
+  /** Replacement pairs applied to the regex capture before `transform` (e.g. 'p=,.'). */
+  defaultReplace?: string;
+  /** Normalise a filename capture into the field's declared unit/value. */
+  transform?: (raw: string) => string;
 }
 
 /** Self-describing metadata about a plugin — safe to serialise & transmit. */
@@ -497,12 +502,6 @@ export interface InferredParamField {
    */
   scopeGroup?: string;
   /**
-   * Optional column regex: if provided, the platform will exclude any CSV headers
-   * matching this regex from the extra-column suggestions (they are consumed by the plugin).
-   * The value is taken from `params[columnRegexParamKey]` at runtime.
-   */
-  columnRegexParamKey?: string;
-  /**
    * Optional: suggested output column name when the user enables "add as column".
    * Defaults to `key` if omitted.
    */
@@ -526,7 +525,6 @@ export interface Plugin<P = Record<string, string>> {
   name: string;
   description: string;
   manifest?: PluginManifest;   // optional for backward compat; all new plugins must include it
-  defaultParams: P;
   paramFields?: InferredParamField[];
   /** @deprecated Use `paramFields` instead. Kept for backward compatibility. */
   inferredParamFields?: InferredParamField[];

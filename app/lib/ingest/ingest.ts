@@ -40,7 +40,7 @@ import type { WaveformPacket, WaveformMetadata } from './types';
 
 export interface IngestHints {
   /** For CSV/TXT: which column contains the signal data. */
-  signalColumn?: string;
+  targetColumn?: string;
   /**
    * When true (single_sided_power_spectrum mode): keep row order intact and
    * substitute -Infinity for unparseable cells instead of skipping them.
@@ -274,10 +274,10 @@ function ingestCsv(file: File, text: string, hints: IngestHints): WaveformPacket
 
   // Column selection: hint > most-unique-values heuristic
   let colIdx = -1;
-  if (hints.signalColumn) {
-    colIdx = headers.indexOf(hints.signalColumn.trim());
+  if (hints.targetColumn) {
+    colIdx = headers.indexOf(hints.targetColumn.trim());
     if (colIdx === -1) throw new Error(
-      `Column "${hints.signalColumn}" not found in "${file.name}". Available: [${headers.join(', ')}]`
+      `Column "${hints.targetColumn}" not found in "${file.name}". Available: [${headers.join(', ')}]`
     );
   } else {
     const uniqueCounts = headers.map((_, ci) => new Set(dataRows.map(r => r[ci]?.trim() ?? '')).size);
@@ -286,20 +286,35 @@ function ingestCsv(file: File, text: string, hints: IngestHints): WaveformPacket
   }
 
   const inferred: string[] = [];
-  if (!hints.signalColumn) inferred.push('signalColumn');
+  if (!hints.targetColumn) inferred.push('targetColumn');
 
   const preserveBinIndex = hints.preserveBinIndex ?? false;
-  const samples: number[] = [];
-  for (const row of dataRows) {
-    const cell = stripCell(row[colIdx] ?? '');
-    const v    = parseNumericCell(cell);
-    if (isNaN(v)) {
-      if (preserveBinIndex) samples.push(-Infinity);
-      // else: skip (time-domain — a missing code is dropped)
-    } else {
-      samples.push(v);
+
+  // Parse EVERY column so multi-column plugins (e.g. dcinl: codes + volts)
+  // can access secondary columns via packet.arrays, while `waveform`
+  // remains the primary column selected by hints.targetColumn.
+  const columnSamples = headers.map((_, ci) => {
+    const col: number[] = [];
+    for (const row of dataRows) {
+      const v = parseNumericCell(stripCell(row[ci] ?? ''));
+      if (isNaN(v)) {
+        if (preserveBinIndex) col.push(-Infinity);
+        // else: skip (time-domain — a missing code is dropped)
+      } else {
+        col.push(v);
+      }
     }
-  }
+    return col;
+  });
+
+  const arrays = headers
+    .map((name, ci) => ({
+      label: name,
+      waveform: new Float32Array(columnSamples[ci]),
+    }))
+    .filter((_, ci) => columnSamples[ci].length > 0);
+
+  const samples = columnSamples[colIdx];
   if (samples.length === 0) throw new Error(
     `No numeric samples found in column "${headers[colIdx]}" of "${file.name}".`
   );
@@ -311,14 +326,19 @@ function ingestCsv(file: File, text: string, hints: IngestHints): WaveformPacket
           `ingested column "${headers[colIdx]}" from CSV "${file.name}"`
       ],
       inferredFields: inferred,
-      userOverrides: hints.signalColumn
-          ? { signalColumn: hints.signalColumn }
+      userOverrides: hints.targetColumn
+          ? { targetColumn: hints.targetColumn }
           : undefined,
       channelLabels: [headers[colIdx]],
   };
   return {
       waveform: new Float32Array(samples),
-      metadata,
+      arrays,
+      channels: arrays,
+      metadata: {
+          ...metadata,
+          columnLabels: headers,
+      },
   };
 }
 
@@ -334,12 +354,12 @@ async function ingestXlsx(file: File, hints: IngestHints): Promise<WaveformPacke
 
   let colIdx = -1;
 
-  if (hints.signalColumn) {
-    colIdx = headers.indexOf(hints.signalColumn.trim());
+  if (hints.targetColumn) {
+    colIdx = headers.indexOf(hints.targetColumn.trim());
 
     if (colIdx === -1) {
       throw new Error(
-        `Column "${hints.signalColumn}" not found in "${file.name}". ` +
+        `Column "${hints.targetColumn}" not found in "${file.name}". ` +
         `Available: [${headers.join(', ')}]`
       );
     }
@@ -362,8 +382,8 @@ async function ingestXlsx(file: File, hints: IngestHints): Promise<WaveformPacke
 
   const inferred: string[] = [];
 
-  if (!hints.signalColumn) {
-    inferred.push('signalColumn');
+  if (!hints.targetColumn) {
+    inferred.push('targetColumn');
   }
 
   const preserveBinIndex = hints.preserveBinIndex ?? false;
@@ -402,9 +422,9 @@ async function ingestXlsx(file: File, hints: IngestHints): Promise<WaveformPacke
 
     inferredFields: inferred,
 
-    userOverrides: hints.signalColumn
+    userOverrides: hints.targetColumn
       ? {
-          signalColumn: hints.signalColumn,
+          targetColumn: hints.targetColumn,
         }
       : undefined,
 
@@ -428,7 +448,7 @@ async function ingestXlsx(file: File, hints: IngestHints): Promise<WaveformPacke
 //   • Optional header row                     first non-comment line with non-numeric tokens
 //   • Comment lines stripped                  lines starting with # (Python/numpy convention)
 //   • Delimiters: whitespace (space/tab), comma, semicolon — auto-detected
-//   • signalColumn hint: column name from header  OR  0-based column index as string
+//   • targetColumn hint: column name from header  OR  0-based column index as string
 //
 // Mirrors unified_signal TXTParser (text.py): np.loadtxt semantics.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -501,16 +521,16 @@ function ingestTxt(file: File, text: string, hints: IngestHints): WaveformPacket
 
   let colIdx = 0;
 
-  if (hints.signalColumn) {
+  if (hints.targetColumn) {
     const byName = colNames.indexOf(
-      hints.signalColumn.trim()
+      hints.targetColumn.trim()
     );
 
     if (byName !== -1) {
       colIdx = byName;
     } else {
       const byIndex = parseInt(
-        hints.signalColumn.trim(),
+        hints.targetColumn.trim(),
         10
       );
 
@@ -520,7 +540,7 @@ function ingestTxt(file: File, text: string, hints: IngestHints): WaveformPacket
         colIdx = byIndex;
       } else {
         throw new Error(
-          `Column "${hints.signalColumn}" not found in "${file.name}". ` +
+          `Column "${hints.targetColumn}" not found in "${file.name}". ` +
           `Available: [${colNames.join(', ')}]`
         );
       }
@@ -544,8 +564,8 @@ function ingestTxt(file: File, text: string, hints: IngestHints): WaveformPacket
 
   const inferred: string[] = [];
 
-  if (!hints.signalColumn) {
-    inferred.push('signalColumn');
+  if (!hints.targetColumn) {
+    inferred.push('targetColumn');
   }
 
   const preserveBinIndex = hints.preserveBinIndex ?? false;
@@ -585,9 +605,9 @@ function ingestTxt(file: File, text: string, hints: IngestHints): WaveformPacket
 
     inferredFields: inferred,
 
-    userOverrides: hints.signalColumn
+    userOverrides: hints.targetColumn
       ? {
-          signalColumn: hints.signalColumn,
+          targetColumn: hints.targetColumn,
         }
       : undefined,
 

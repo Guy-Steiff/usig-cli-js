@@ -223,7 +223,7 @@ Every plugin that uses a numeric parameter which can be filename-inferred must:
 
 3. Implement getIngestHints(params) so the IR engine knows which column to ingest:
      getIngestHints: (params) => ({
-       signalColumn: String(params.targetColumn || ''),
+       targetColumn: String(params.targetColumn || ''),
        sampleRateHz: Number(params.fsGhz) * 1e9 || 0,
      })
 
