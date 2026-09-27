@@ -61,7 +61,6 @@ export function hintsKey(hints?: IngestHints): string {
    * interface, including:
    *
    *   sampleRateHz
-   *   fsGhzColumnRegex
    *   dtype
    *   encoding
    *   bytes_per_sample
@@ -84,7 +83,7 @@ export function hintsKey(hints?: IngestHints): string {
    * affect ingestion, add them here.
    */
   const hintKeys: (keyof IngestHints)[] = [
-    'signalColumn',
+    'targetColumn',
     'preserveBinIndex',
     'endianness',
     'headerBytes',
@@ -236,7 +235,7 @@ export class IRCache {
             frame.cacheKey.split(':')[0],
           numSamples,
           sampleRateHz,
-          units: metadata.units,
+          units: typeof metadata.units === "string" ? metadata.units : undefined,
           headers: frame.headers,
           ingestedAt: frame.ingestedAt,
           schemaVersion: frame.schemaVersion,

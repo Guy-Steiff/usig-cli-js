@@ -201,32 +201,50 @@ export function deserializeFrameBundle(
   return metas.map((meta, i) => deserializeFrame(meta, waveforms[i]));
 }
 
-export function unpackSerializedIR(buf: Buffer) {
-  const magic = Buffer.from('USIGIR1\n', 'ascii');
+export function unpackSerializedIR(
+  bytes: Uint8Array | ArrayBuffer,
+): {
+  meta: string;
+  waveform: ArrayBuffer;
+} {
+  const data = bytes instanceof Uint8Array
+    ? bytes
+    : new Uint8Array(bytes);
 
-  if (buf.length < 12 || !buf.subarray(0, 8).equals(magic)) {
-    throw new Error('Not a USIG IR binary container.');
+  const magic = new TextEncoder().encode("USIGIR1\n");
+
+  if (data.length < 12) {
+    throw new Error("Not a USIG IR binary container.");
   }
 
-  const metaLen = buf.readUInt32LE(8);
+  for (let index = 0; index < magic.length; index += 1) {
+    if (data[index] !== magic[index]) {
+      throw new Error("Not a USIG IR binary container.");
+    }
+  }
 
+  const view = new DataView(
+    data.buffer,
+    data.byteOffset,
+    data.byteLength,
+  );
+
+  const metaLength = view.getUint32(8, true);
   const metaStart = 12;
-  const metaEnd = metaStart + metaLen;
+  const metaEnd = metaStart + metaLength;
 
-  if (metaEnd > buf.length) {
-    throw new Error('Corrupt USIG IR container.');
+  if (metaEnd > data.length) {
+    throw new Error("Corrupt USIG IR container.");
   }
 
-  const waveformBuffer = Buffer.from(
-  buf.subarray(metaEnd)
-);
+  const meta = new TextDecoder("utf-8").decode(
+    data.subarray(metaStart, metaEnd),
+  );
+
+  const waveformBytes = data.slice(metaEnd);
 
   return {
-    meta: buf.subarray(metaStart, metaEnd).toString('utf8'),
-
-    waveform: waveformBuffer.buffer.slice(
-      waveformBuffer.byteOffset,
-      waveformBuffer.byteOffset + waveformBuffer.byteLength
-    ) as ArrayBuffer,
+    meta,
+    waveform: waveformBytes.buffer,
   };
 }

@@ -1361,7 +1361,8 @@ function describeSource(key, detail) {
   const value = formatInputValue(detail.value);
 
   if (detail.source === 'override') {
-    return `${key} = ${value} << overridden from user input`;
+    return `${key} = ${value} << overridden from user input${detail.matchedAlias ? ` (from alias "${detail.matchedAlias}")` : ''}`;
+    // return `${key} = ${value} << overridden from user input`;
   }
 
   if (detail.source === 'filename') {
@@ -1430,8 +1431,6 @@ function inferStrictMetadataFromFilename(filename) {
 
 function collectDisplayFields(plugin) {
   const all = [
-    ...(plugin.paramFields ?? []),
-    ...(plugin.inferredParamFields ?? []),
     ...(plugin.manifest?.paramSchema ?? []),
   ];
   const seen = new Set();
@@ -1521,10 +1520,12 @@ function resolveFilenameTokenForField(field, filename) {
     //     signals a non-numeric field (numeric paramFields never set
     //     `options`/a string defaultValue).
     const isTextLikeField =
-      field.type === 'text' ||
+      (!field.transform && field.type === 'text') ||
       field.type === 'boolean' ||
-      (Array.isArray(field.options) && field.options.length > 0) ||
-      typeof field.defaultValue === 'string';
+      (!field.transform &&
+        !field.unit &&
+        ((Array.isArray(field.options) && field.options.length > 0) ||
+          typeof field.defaultValue === 'string'));
     const usedExplicitSeparator = token.token.includes('~');
     if (isTextLikeField && !usedExplicitSeparator) {
       return {
@@ -1575,17 +1576,20 @@ function resolveFieldValue(
   derivedHints = {},
   pluginDefaultParams = {}
 ) {
-  const hasOverride =
-    Object.prototype.hasOwnProperty.call(
-      explicitParams,
-      field.key
-    );
+  // 1. Explicit -p always wins — matched by canonical key or any declared alias.
+  const overrideKey = [
+    field.key,
+    ...(Array.isArray(field.aliases) ? field.aliases : []),
+  ].find((name) =>
+    Object.prototype.hasOwnProperty.call(explicitParams, name)
+  );
 
-  // 1. Explicit -p always wins.
-  if (hasOverride) {
+  if (overrideKey !== undefined) {
     return {
-      value: explicitParams[field.key],
+      value: explicitParams[overrideKey],
       source: 'override',
+      matchedAlias:
+        overrideKey !== field.key ? overrideKey : undefined,
     };
   }
 
@@ -1642,6 +1646,7 @@ function resolveFieldValue(
   // 4. Legacy field-specific filename regex.
   const filenamePattern =
     field.defaultPattern ??
+    field.defaultRegex ??
     pluginDefaultParams?.[
       `${field.key}Regex`
     ] ??
@@ -1649,6 +1654,7 @@ function resolveFieldValue(
 
   const filenameReplacements =
     field.defaultReplacements ??
+    field.defaultReplace ??
     pluginDefaultParams?.[
       `${field.key}Replace`
     ] ??
@@ -1716,7 +1722,7 @@ function buildInputSummary(
     {
       inputFileName,
       pluginDefaultParams:
-        plugin?.defaultParams,
+        getSchemaDefaults(plugin),
       explicitParams,
       strictFilenameInference,
     }
@@ -1743,7 +1749,7 @@ function buildInputSummary(
       inputFileName,
       headers,
       derivedHints,
-      plugin?.defaultParams ?? {}
+      getSchemaDefaults(plugin)
     );
 
   let value = resolved.value;
@@ -1774,6 +1780,7 @@ function buildInputSummary(
   summary.push({
     key: field.key,
     value,
+    matchedAlias: resolved.matchedAlias,
     source,
     ...(resolved.token
       ? { token: resolved.token }
@@ -2425,6 +2432,9 @@ async function runConversionMode({
     metaToFilename,
   });
 
+  if (outputFile && !path.extname(outputFile)) {
+    outputFile = `${outputFile}.csv`;
+    }
   console.log(`[usig] wrote result to ${outputFile}`);
 }
 
@@ -2458,6 +2468,7 @@ async function ingestInputToIR({
   const hints = {
     ...(params ?? {}),
   };
+  console.error('[ingest DEBUG] hints:', JSON.stringify(hints));
 
   const IREngine = irMod?.IREngine;
   if (!IREngine) {
@@ -2483,8 +2494,8 @@ async function ingestInputToIR({
     const mapperMod = await loadBinMapperModule();
 
     const packet = await mapperMod.mapBinaryToIRCandidate({
-      inputPath: inputFile,
       filename: inputFileName,
+      bytes: new Uint8Array(raw),
       hints,
     });
 
@@ -2536,7 +2547,7 @@ async function ingestInputToIR({
       [{
         label:
           packet.metadata?.channelLabels?.[0] ??
-          packet.metadata?.signalColumn ??
+          packet.metadata?.targetColumn ??
           packet.channels?.[0]?.label ??
           packet.arrays?.[0]?.label,
         units: packet.metadata?.units,
@@ -2725,6 +2736,14 @@ function levenshteinDistance(a, b) {
   return dp[m][n];
 }
 
+function getSchemaDefaults(plugin) {
+  const defaults = {};
+  for (const field of plugin?.manifest?.paramSchema ?? []) {
+    if (field.default !== undefined) defaults[field.key] = field.default;
+  }
+  return defaults;
+}
+
 // Combines plugin.manifest.paramSchema (typed/validated fields) with
 // plugin.paramFields (InferredParamField — also valid -p keys, e.g.
 // toneMode, tiCorrections, fsGhz) into a single de-duplicated map keyed by
@@ -2733,7 +2752,6 @@ function levenshteinDistance(a, b) {
 function collectKnownParamFields(plugin) {
   const fields = [
     ...(plugin?.manifest?.paramSchema ?? []),
-    ...(plugin?.paramFields ?? []),
   ];
   const byKey = new Map();
   for (const field of fields) {
@@ -2832,15 +2850,10 @@ function printPluginHelp(pluginId, plugin) {
       }
 
       if (
-        plugin?.defaultParams &&
-        Object.prototype.hasOwnProperty.call(
-          plugin.defaultParams,
-          field.key
-        )
+        schemaEntry &&
+        schemaEntry.default !== undefined
       ) {
-        console.log(
-          `    Default: ${plugin.defaultParams[field.key]}`
-        );
+        console.log(`    Default: ${schemaEntry.default}`);
       }
 
       if (
@@ -3096,6 +3109,32 @@ function printDebugTableHead(table) {
   }
 
   console.error('');
+}
+
+
+/**
+ * Map a filesystem error to a user-meaningful message.
+ * @param err - The caught error.
+ * @returns A human-readable description of the failure.
+ */
+function describeFsError(err) {
+  if (err instanceof Error) {
+    if (err.code === 'ENOENT') {
+      const match =
+        err.message.match(/mkdir '([^']+)'/) ||
+        err.message.match(/open '([^']+)'/);
+      const missingPath = match ? match[1] : 'the target directory';
+      return `the output directory '${missingPath}' does not exist`;
+    }
+    if (err.code === 'EACCES' || err.code === 'EPERM') {
+      return 'permission denied';
+    }
+    if (err.code === 'EEXIST') {
+      return 'the target already exists';
+    }
+    return err.message;
+  }
+  return String(err);
 }
 
 
@@ -3488,9 +3527,10 @@ if (args.length === 0) {
       );
 
     const ingestionParamsForSpec = {
-      ...(firstPlugin?.defaultParams ?? {}),
+      ...(getSchemaDefaults(firstPlugin)),
       ...filenameParamHintsForSpec,
       ...(params ?? {}),
+      ...(spec.pluginInvocations?.[0]?.params ?? {}),
     };
 
     let hintsForSpec =
@@ -3498,6 +3538,10 @@ if (args.length === 0) {
       typeof firstPlugin.getIngestHints === 'function'
         ? firstPlugin.getIngestHints(ingestionParamsForSpec)
         : undefined;
+
+    // console.error('[usig DEBUG] firstPlugin:', firstPlugin?.id,
+    //   '| hintsForSpec:', JSON.stringify(hintsForSpec),
+    //   '| ingestionParamsForSpec.targetColumn:', ingestionParamsForSpec.targetColumn);
 
     if (Number.isInteger(spec.startSample) || Number.isInteger(spec.endSample)) {
       hintsForSpec = {
@@ -3546,7 +3590,7 @@ if (args.length === 0) {
           : [{
               label:
                 packet.metadata?.channelLabels?.[0] ??
-                packet.metadata?.signalColumn ??
+                packet.metadata?.targetColumn ??
                 canonicalFrame?.headers?.[0],
               units: packet.metadata?.units,
               waveform,
@@ -3630,6 +3674,7 @@ if (args.length === 0) {
   const allResults = [];
   const allInputSummaries = {};  // keyed by plugin id
   const allParamSchemas = {};  // keyed by plugin id
+  let artifactError = null;
   const debugTablesToPrint = [];
   // File/figure write confirmations ("WROTE: ...") are collected here and
   // flushed at the very end (after the Inputs/Outputs report and debug
@@ -3685,7 +3730,7 @@ if (args.length === 0) {
     validateKnownParams(resolvedPluginId, plugin, mergedExplicitParams);
 
     let finalParams = {
-      ...plugin.defaultParams,
+      ...getSchemaDefaults(plugin),
       ...filenameParamHints,
       ...mergedExplicitParams,
     };
@@ -3697,7 +3742,7 @@ if (args.length === 0) {
       inputFileName,
       plugin: resolvedPluginId,
       strictFilenameInference,
-      pluginDefaultParams: plugin.defaultParams,
+      pluginSchemaDefaults: getSchemaDefaults(plugin),
       explicitParams: mergedExplicitParams,
     });
 
@@ -3746,23 +3791,38 @@ if (args.length === 0) {
     const figureRequests = invocation.figureRequests ?? [];
     if (debugRequests.length === 0 && figureRequests.length === 0) continue;
 
-    if (typeof plugin.prepareData !== 'function') {
-      if (debugRequests.length > 0) {
-        console.error(`[DEBUG] requested debug output for plugin ${resolvedPluginId}, but plugin has no prepareData()`);
-      }
-      if (figureRequests.length > 0) {
-        console.error(`[FIGURE] requested figure output for plugin ${resolvedPluginId}, but plugin has no prepareData()`);
-      }
-      process.exitCode = 2;
-      continue;
-    }
+    let debugTables = [];
+    let figureData;
 
-    let prep;
     try {
       console.log = (...parts) => console.error(...parts);
-      prep = await plugin.prepareData(frame.packet, finalParams);
+
+      if (debugRequests.length > 0) {
+        if (typeof plugin.prepareDebugTables === 'function') {
+          const requestedTableIds = debugRequests.some((r) => r.key === 'all')
+            ? ['all']
+            : debugRequests
+                .filter((r) => r.key !== 'list')
+                .map((r) => r.key);
+          debugTables = await plugin.prepareDebugTables(
+            frame.packet,
+            finalParams,
+            requestedTableIds,
+          );
+        } else {
+          console.error(`[DEBUG] requested debug output for plugin ${resolvedPluginId}, but plugin has no prepareDebugTables()`);
+        }
+      }
+
+      if (figureRequests.length > 0) {
+        if (typeof plugin.prepareFigureData === 'function') {
+          figureData = await plugin.prepareFigureData(frame.packet, finalParams);
+        } else {
+          console.error(`[FIGURE] requested figure output for plugin ${resolvedPluginId}, but plugin has no prepareFigureData()`);
+        }
+      }
     } catch (err) {
-      console.error(`[DEBUG] plugin.prepareData failed for ${resolvedPluginId}:`, err?.stack ?? err);
+      console.error(`[DEBUG/FIGURE] preparation failed for ${resolvedPluginId}:`, err?.stack ?? err);
       process.exitCode = 2;
       console.log = originalConsoleLog;
       continue;
@@ -3770,27 +3830,20 @@ if (args.length === 0) {
       console.log = originalConsoleLog;
     }
 
-    const debugTables = (prep && Array.isArray(prep.debugTables))
-      ? prep.debugTables
-      : [];
-    const figureData = (prep && Object.prototype.hasOwnProperty.call(prep, 'figureData'))
-      ? prep.figureData
-      : undefined;
-
     // ── Debug table dispatch (unchanged behavior) ─────────────────────────
     if (debugRequests.length > 0) {
     // Handle discovery request '-debug list'
     if (debugRequests.some(r => r.key === 'list')) {
-
       console.error(`DEBUG TABLES: ${resolvedPluginId}`);
-      if (debugTables.length === 0) {
-        console.error('(no debug tables produced)');
+      const declaredTables = plugin.manifest?.debugTables ?? [];
+      if (declaredTables.length === 0) {
+        console.error('(no debug tables declared)');
       } else {
-        for (const t of debugTables) {
-          const cols = Object.keys(t.columns || {});
+        for (const t of declaredTables) {
           console.error('');
           console.error(t.id);
           if (t.label) console.error(t.label);
+          const cols = t.columns ?? [];
           if (cols.length > 0) console.error(`columns: ${cols.join(', ')}`);
         }
       }
@@ -3874,7 +3927,9 @@ if (args.length === 0) {
             await writeStructuredRowsToFile(headers, rows, target, true);
             wroteMessages.push(`WROTE: ${target}`);
           } catch (err) {
-            console.error(`ERROR: writing ${target}:`, err?.stack ?? err);
+            artifactError =
+              `error: cannot write debug table '${table.id}' to '${target}': ` +
+              describeFsError(err);
             process.exitCode = 4;
           }
         }
@@ -3922,6 +3977,10 @@ if (args.length === 0) {
           } catch (e) {
             // ignore
           }
+        }
+
+        if (!path.extname(target)) {
+          target = `${target}.csv`;
         }
 
         try {
@@ -3994,10 +4053,9 @@ if (args.length === 0) {
           wroteMessages.push(`WROTE: ${target}`);
 
         } catch (err) {
-          console.error(
-            `ERROR: writing ${target}:`,
-            err?.stack ?? err
-          );
+          artifactError =
+            `error: cannot write debug table '${table.id}' to '${target}': ` +
+            describeFsError(err);
           process.exitCode = 4;
         }
       }
@@ -4043,7 +4101,9 @@ if (args.length === 0) {
           process.exitCode = 3;
           return;
         }
-        const svg = await renderFigureToSvg(desc);
+        const svg = typeof plugin.renderFigureSvg === 'function'
+          ? await plugin.renderFigureSvg(fig.id, figureData, {})
+          : await renderFigureToSvg(desc);
         const ext = (path.extname(targetPath).toLowerCase().replace('.', '')) || 'svg';
 
         const shouldWrite = await confirmOutputOverwrite(targetPath, overwrite);
@@ -4113,7 +4173,9 @@ if (args.length === 0) {
             try {
               await writeFigureArtifact(fig, target);
             } catch (err) {
-              console.error(`ERROR: writing figure ${figDecl.id}:`, err?.stack ?? err);
+              artifactError =
+                `error: cannot write figure '${figDecl.id}': ` +
+                describeFsError(err);
               process.exitCode = 4;
             }
           }
@@ -4149,7 +4211,9 @@ if (args.length === 0) {
         try {
           await writeFigureArtifact(fig, targetPath);
         } catch (err) {
-          console.error(`ERROR: writing figure ${req.key}:`, err?.stack ?? err);
+          artifactError =
+            `error: cannot write figure '${req.key}': ` +
+            describeFsError(err);
           process.exitCode = 4;
         }
       }
@@ -4180,7 +4244,13 @@ if (args.length === 0) {
     console.log('[DEBUG before formatReport] payload.results =', JSON.stringify(payload?.results, null, 2));
   }
   // Always emit the human-readable report to stdout
+  if (artifactError) {
+    console.error(artifactError);
+    process.exit(process.exitCode || 1);
+  }
+
   const humanReport = formatReport(payload, 'text', verbose);
+
   process.stdout.write(humanReport);
 
   // Debug tables are printed only after the normal Inputs/Outputs report.

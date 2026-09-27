@@ -41,20 +41,25 @@ import type { IngestHints } from './ingest';
 export type { WaveformPacket } from './ingest';
 
 
-/** A JSON-serialisable description of a single plugin parameter. */
 export interface ParamSchema {
   key: string;
   label: string;
   type: 'column-select' | 'text' | 'number' | 'boolean';
-  required: boolean;
   description?: string;
-
+  default: string | number | boolean;
   aliases?: string[];
   possibleValues?: string[];
   min?: number;
   max?: number;
   unit?: string;
   unitOptions?: string[];
+
+  /** Filename regex: the capture group is normalised through `transform`. */
+  defaultRegex?: string;
+  /** Replacement pairs applied to the regex capture before `transform` (e.g. 'p=,.'). */
+  defaultReplace?: string;
+  /** Normalise a filename capture into the field's declared unit/value. */
+  transform?: (raw: string) => string;
 }
 
 /** Self-describing metadata about a plugin — safe to serialise & transmit. */
@@ -497,12 +502,6 @@ export interface InferredParamField {
    */
   scopeGroup?: string;
   /**
-   * Optional column regex: if provided, the platform will exclude any CSV headers
-   * matching this regex from the extra-column suggestions (they are consumed by the plugin).
-   * The value is taken from `params[columnRegexParamKey]` at runtime.
-   */
-  columnRegexParamKey?: string;
-  /**
    * Optional: suggested output column name when the user enables "add as column".
    * Defaults to `key` if omitted.
    */
@@ -526,7 +525,6 @@ export interface Plugin<P = Record<string, string>> {
   name: string;
   description: string;
   manifest?: PluginManifest;   // optional for backward compat; all new plugins must include it
-  defaultParams: P;
   paramFields?: InferredParamField[];
   /** @deprecated Use `paramFields` instead. Kept for backward compatibility. */
   inferredParamFields?: InferredParamField[];
@@ -565,13 +563,16 @@ export interface Plugin<P = Record<string, string>> {
    * Optional canonical prepareData counterpart.
    * Same as prepareData() but receives a WaveformPacket instead of a File.
    */
-  prepareData?: (
+  prepareDebugTables?: (
       packet: WaveformPacket,
       params: P,
-    ) => Promise<{
-      figureData?: unknown;
-      debugTables?: PluginDebugTable[];
-    }>;
+      requestedTableIds?: string[],
+    ) => Promise<PluginDebugTable[]>;
+
+  prepareFigureData?: (
+      packet: WaveformPacket,
+      params: P,
+    ) => Promise<unknown>;
 
   /**
    * Declared output column names — keys that run() will produce.
@@ -581,8 +582,21 @@ export interface Plugin<P = Record<string, string>> {
    */
   outputColumns?: string[];
 
-  /** Figures this plugin can draw — shown as plot buttons after a successful run. */
+    /** Figures this plugin can draw — shown as plot buttons after a successful run. */
   figures?: PluginFigure[];
+
+  /**
+   * Optional plugin-owned SVG assembly for a declared figure.
+   * When present, the CLI/web client calls this instead of its own
+   * figureRenderSvg renderer. Returns final SVG markup, or undefined
+   * if the figure is not applicable for the given figureData.
+   */
+
+  renderFigureSvg?: (
+      figureId: string,
+      figureData: unknown,
+      controls: FigureControlValues,
+    ) => Promise<string | undefined>;
 
   /**
    * Optional markdown documentation string. When provided, a collapsed "📖 plugin docs"

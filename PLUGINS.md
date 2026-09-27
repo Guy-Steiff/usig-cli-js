@@ -767,7 +767,7 @@ print(f"Processed {len(results_df)} files. Results saved to results.csv")
 When your plugin runs alongside others in the same pipeline:
 
 - **Conflicting output keys are auto-postfixed** — if both your plugin and another return `snr`, the pipeline writes `snr_yourpluginid` and `snr_otherpluginid`. The user sees a warning and can rename either.
-- **`column-select` param keys must be globally unique** — if your plugin has a `column-select` field keyed `data`, and another plugin also has `data`, the pipeline cannot distinguish them. Use a descriptive key like `sampleColumn`, `signalColumn`, `inputColumn`, etc.
+- **`column-select` param keys must be globally unique** — if your plugin has a `column-select` field keyed `data`, and another plugin also has `data`, the pipeline cannot distinguish them. Use a descriptive key like `sampleColumn`, `targetColumn`, `inputColumn`, etc.
 - **Declare `outputColumns`** so the conflict detector can warn users at configuration time, before they run anything.
 - **Avoid shadowing well-known keys** — `filename`, `snr`, `thd`, `inl`, `dnl` are common; prefix with your plugin id if you expect cohabitation (e.g. `smeas_snr`), or accept that auto-postfixing will occur.
 
@@ -831,7 +831,7 @@ Debug tables returned by `prepareData()` are **accumulated across all active plu
 
 ### `column-select` param causes false conflict warning
 
-If the pipeline warns about a conflict on a column name that is actually a **parameter key** (e.g. `data`), it means two plugins have a `column-select` field with the same `key`. Fix: rename the `key` in `paramFields` to something unique (e.g. `sampleColumn`, `signalColumn`).
+If the pipeline warns about a conflict on a column name that is actually a **parameter key** (e.g. `data`), it means two plugins have a `column-select` field with the same `key`. Fix: rename the `key` in `paramFields` to something unique (e.g. `sampleColumn`, `targetColumn`).
 
 ### Figures don't render
 

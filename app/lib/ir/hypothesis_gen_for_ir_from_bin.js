@@ -17,7 +17,6 @@
 //
 // This module intentionally does not assume
 // a binary file format.
-import path from "node:path";
 
 // ------------------------------------------------------------
 // Constants
@@ -35,12 +34,77 @@ const JSON_START_TOKENS = [
     '{'
 ];
 
+const utf8Decoder = new TextDecoder("utf-8");
+const utf8Encoder = new TextEncoder();
+
+// ------------------------------------------------------------
+// Portable binary helpers
+// ------------------------------------------------------------
+
+function toUint8Array(data) {
+    if (data instanceof Uint8Array) {
+        return data;
+    }
+
+    if (data instanceof ArrayBuffer) {
+        return new Uint8Array(data);
+    }
+
+    throw new TypeError(
+        "Expected binary data as Uint8Array or ArrayBuffer"
+    );
+}
+
+function basename(filename) {
+    return String(filename)
+        .replaceAll("\\", "/")
+        .split("/")
+        .pop() || "binary";
+}
+
+function indexOfBytes(data, needle, start = 0) {
+    if (needle.length === 0) {
+        return Math.min(start, data.length);
+    }
+
+    const lastStart =
+        data.length - needle.length;
+
+    for (
+        let offset = Math.max(0, start);
+        offset <= lastStart;
+        offset++
+    ) {
+        let matches = true;
+
+        for (
+            let index = 0;
+            index < needle.length;
+            index++
+        ) {
+            if (
+                data[offset + index] !==
+                needle[index]
+            ) {
+                matches = false;
+                break;
+            }
+        }
+
+        if (matches) {
+            return offset;
+        }
+    }
+
+    return -1;
+}
+
 // ------------------------------------------------------------
 // IO
 // ------------------------------------------------------------
 
-function safeDecodeUtf8(buffer) {
-    return buffer.toString("utf8");
+function safeDecodeUtf8(data) {
+    return utf8Decoder.decode(data);
 }
 
 // ------------------------------------------------------------
@@ -83,12 +147,15 @@ function detectEmbeddedMetadata(data) {
 // ------------------------------------------------------------
 
 function extractJsonRegion(data) {
-
     const text =
-        data.toString(
-            "utf8",
-            0,
-            Math.min(data.length, 65536)
+        safeDecodeUtf8(
+            data.subarray(
+                0,
+                Math.min(
+                    data.length,
+                    65536
+                )
+            )
         );
 
     const starts = [];
@@ -96,6 +163,7 @@ function extractJsonRegion(data) {
     for (const token of JSON_START_TOKENS) {
         const index =
             text.indexOf(token);
+
         if (index >= 0) {
             starts.push(index);
         }
@@ -103,7 +171,7 @@ function extractJsonRegion(data) {
 
     for (
         const start of starts.sort(
-            (a,b)=>a-b
+            (a, b) => a - b
         )
     ) {
         let depth = 0;
@@ -111,11 +179,10 @@ function extractJsonRegion(data) {
         let escape = false;
 
         for (
-            let i=start;
-            i<text.length;
+            let i = start;
+            i < text.length;
             i++
         ) {
-
             const c = text[i];
 
             if (inString) {
@@ -140,7 +207,6 @@ function extractJsonRegion(data) {
                     depth--;
 
                     if (depth === 0) {
-
                         const candidate =
                             text.substring(
                                 start,
@@ -148,31 +214,20 @@ function extractJsonRegion(data) {
                             );
 
                         try {
-
                             return JSON.parse(
                                 candidate
                             );
-
                         }
-
-                        catch(e) {
-
+                        catch (e) {
                             break;
-
                         }
-
                     }
-
                 }
-
             }
-
         }
-
     }
 
     return null;
-
 }
 
 // ------------------------------------------------------------
@@ -181,21 +236,18 @@ function extractJsonRegion(data) {
 
 function flattenJson(
     obj,
-    prefix=""
+    prefix = ""
 ) {
-
     const output = [];
 
     if (
         obj &&
         typeof obj === "object"
     ) {
-
         for (
-            const [key,value]
+            const [key, value]
             of Object.entries(obj)
         ) {
-
             const current =
                 prefix
                     ? `${prefix}.${key}`
@@ -205,47 +257,35 @@ function flattenJson(
                 value &&
                 typeof value === "object"
             ) {
-
                 output.push(
                     ...flattenJson(
                         value,
                         current
                     )
                 );
-
             }
-
             else {
-
                 output.push({
-
                     path:
                         current,
                     value,
                     source:
                         "embedded_metadata"
-
                 });
-
             }
-
         }
-
     }
 
     return output;
-
 }
+
 // ------------------------------------------------------------
 // Encoding normalization
 // ------------------------------------------------------------
 
 function normalizeEncoding(value) {
-
     if (!value) {
-
         return null;
-
     }
 
     const v =
@@ -255,29 +295,22 @@ function normalizeEncoding(value) {
     if (
         v.includes("float32")
     ) {
-
         return "float32";
-
     }
 
     if (
         v.includes("int16")
     ) {
-
         return "int16";
-
     }
 
     if (
         v.includes("float64")
     ) {
-
         return "float64";
-
     }
 
     return v;
-
 }
 
 // ------------------------------------------------------------
@@ -288,46 +321,36 @@ function buildReconstructionInstructions(
     metadataFields,
     inferredCandidate = null
 ) {
-
     const lookup = {};
 
     for (const field of metadataFields) {
-
         lookup[
             field.path.toLowerCase()
         ] =
             field.value;
-
     }
-    function find(names) {
 
+    function find(names) {
         for (
             const key of Object.keys(lookup)
         ) {
-
             for (
                 const name of names
             ) {
-
                 if (
                     key.endsWith(
                         name.toLowerCase()
                     )
                 ) {
-
                     return lookup[key];
-
                 }
-
             }
-
         }
 
         return null;
-
     }
-    const instructions = {
 
+    const instructions = {
         encoding:
             normalizeEncoding(
                 find([
@@ -361,106 +384,81 @@ function buildReconstructionInstructions(
                 "offset_value",
                 "offsetvalue"
             ])
-
     };
+
     if (inferredCandidate) {
-
         if (!instructions.encoding) {
-
             instructions.encoding =
                 inferredCandidate.encoding;
-
         }
-        if (!instructions.endianness) {
 
+        if (!instructions.endianness) {
             instructions.endianness =
                 inferredCandidate.endianness;
-
         }
-        if (!instructions.samples) {
 
+        if (!instructions.samples) {
             instructions.samples =
                 inferredCandidate.length;
-
         }
+
         instructions.offset =
             inferredCandidate.offset ?? 0;
-
     }
-    if (!instructions.encoding) {
 
+    if (!instructions.encoding) {
         instructions.encoding =
             "float32";
-
     }
-    if (!instructions.endianness) {
 
+    if (!instructions.endianness) {
         instructions.endianness =
             "little";
-
     }
-    if (!instructions.bytes_per_sample) {
 
+    if (!instructions.bytes_per_sample) {
         if (
             instructions.encoding === "float32"
         ) {
-
             instructions.bytes_per_sample = 4;
-
         }
-
         else if (
             instructions.encoding === "float64"
         ) {
-
             instructions.bytes_per_sample = 8;
-
         }
-
         else if (
             instructions.encoding === "int16"
         ) {
-
             instructions.bytes_per_sample = 2;
-
         }
-
     }
+
     if (
         instructions.scale === null ||
         instructions.scale === undefined
     ) {
-
         instructions.scale = 1.0;
-
     }
+
     if (
         instructions.offset_value === null ||
         instructions.offset_value === undefined
     ) {
-
         instructions.offset_value = 0.0;
-
     }
-    return instructions;
 
+    return instructions;
 }
+
 // ------------------------------------------------------------
 // Parse embedded metadata
 // ------------------------------------------------------------
 
 function parseEmbeddedMetadata(data) {
-
     const metadata =
         extractJsonRegion(data);
 
-    const jsonText =
-    JSON.stringify(metadata);
-
-    const jsonOffset =
-        data.indexOf(
-            Buffer.from(jsonText)
-        );
     const result = {
         metadata_fields: [],
         channel_labels: [],
@@ -468,80 +466,96 @@ function parseEmbeddedMetadata(data) {
     };
 
     if (!metadata) {
-
         return result;
-
     }
+
+    const jsonText =
+        JSON.stringify(metadata);
+
+    const jsonOffset =
+        indexOfBytes(
+            data,
+            utf8Encoder.encode(
+                jsonText
+            )
+        );
+
     const fields =
         flattenJson(
             metadata
         );
+
     result.metadata_fields =
         fields;
+
     const channelLabels = [];
 
     for (const field of fields) {
         if (
-            field.path === "metadata.channelLabels.0" ||
-            field.path.startsWith("metadata.channelLabels.")
+            field.path ===
+                "metadata.channelLabels.0" ||
+            field.path.startsWith(
+                "metadata.channelLabels."
+            )
         ) {
             const match =
-                field.path.match(/^metadata\.channelLabels\.(\d+)$/);
+                field.path.match(
+                    /^metadata\.channelLabels\.(\d+)$/
+                );
 
             if (
                 match &&
                 typeof field.value === "string" &&
                 field.value.trim()
             ) {
-                channelLabels[Number(match[1])] =
+                channelLabels[
+                    Number(match[1])
+                ] =
                     field.value.trim();
             }
         }
     }
 
-    result.channel_labels = channelLabels.filter(
-        label => typeof label === "string" && label.length > 0
-    );
+    result.channel_labels =
+        channelLabels.filter(
+            label =>
+                typeof label === "string" &&
+                label.length > 0
+        );
 
     let waveformLength = null;
-
     let waveformByteLength = null;
-
     let waveformEncoding = null;
-    for (const field of fields) {
 
+    for (const field of fields) {
         if (
             field.path.endsWith(
                 "waveformLength"
             )
         ) {
-
             waveformLength =
                 field.value;
-
         }
+
         if (
             field.path.endsWith(
                 "waveformByteLength"
             )
         ) {
-
             waveformByteLength =
                 field.value;
-
         }
+
         if (
             field.path.endsWith(
                 "waveformEncoding"
             )
         ) {
-
             waveformEncoding =
                 field.value;
-
         }
-
     }
+
     if (
         waveformLength &&
         waveformByteLength
@@ -556,12 +570,13 @@ function parseEmbeddedMetadata(data) {
                 waveformEncoding ||
                 "Float32Array",
             offset:
-                jsonOffset + jsonText.length,
+                jsonOffset + jsonText.length
         };
     }
 
     return result;
 }
+
 // ------------------------------------------------------------
 // Float32 statistics
 // ------------------------------------------------------------
@@ -570,56 +585,55 @@ function floatStats(
     data,
     offset
 ) {
-
     const values = [];
+
+    const view =
+        new DataView(
+            data.buffer,
+            data.byteOffset,
+            data.byteLength
+        );
 
     const count =
         Math.floor(
             (data.length - offset) / 4
         );
+
     if (count < 64) {
-
         return null;
-
     }
+
     for (
         let i = 0;
         i < count;
         i++
     ) {
-
         let value;
 
         try {
-
             value =
-                data.readFloatLE(
-                    offset + i * 4
+                view.getFloat32(
+                    offset + i * 4,
+                    true
                 );
-
         }
-
-        catch(e) {
-
+        catch (e) {
             break;
-
         }
+
         if (
             Number.isFinite(value)
         ) {
-
             values.push(value);
-
         }
-
     }
+
     if (
         values.length < 64
     ) {
-
         return null;
-
     }
+
     let min =
         values[0];
 
@@ -627,32 +641,27 @@ function floatStats(
         values[0];
 
     let sum = 0;
+
     for (const value of values) {
-
         if (value < min) {
-
             min = value;
-
         }
+
         if (value > max) {
-
             max = value;
-
         }
+
         sum += value;
-
     }
-    return {
 
+    return {
         count:
             values.length,
         min,
         max,
         mean:
             sum / values.length
-
     };
-
 }
 
 // ------------------------------------------------------------
@@ -660,8 +669,8 @@ function floatStats(
 // ------------------------------------------------------------
 
 function findWaveformCandidate(data) {
-
     let best = null;
+
     for (
         let offset = 0;
         offset < Math.min(
@@ -670,37 +679,33 @@ function findWaveformCandidate(data) {
         );
         offset += 4
     ) {
-
         const stats =
             floatStats(
                 data,
                 offset
             );
+
         if (!stats) {
-
             continue;
-
         }
+
         let confidence =
             0.5;
+
         if (
             stats.min > -10 &&
             stats.max < 10
         ) {
-
             confidence += 0.4;
-
         }
+
         if (
             Math.abs(stats.mean) < 1
         ) {
-
             confidence += 0.099;
-
         }
-        const candidate =
-        {
 
+        const candidate = {
             type:
                 "waveform_candidate",
             offset,
@@ -717,32 +722,33 @@ function findWaveformCandidate(data) {
                     confidence,
                     0.999
                 )
-
         };
+
         if (
             !best ||
             candidate.confidence >
-            best.confidence
+                best.confidence
         ) {
-
             best = candidate;
-
         }
-
     }
-    return best;
 
+    return best;
 }
+
 // ------------------------------------------------------------
 // Generate IR ingestion hypothesis
 // ------------------------------------------------------------
 
-export function generateHypothesis(data, filename = "binary") {
-    const result =
-    {
+export function generateHypothesis(
+    data,
+    filename = "binary"
+) {
+    data = toUint8Array(data);
 
+    const result = {
         file:
-            path.basename(
+            basename(
                 filename
             ),
         size_bytes:
@@ -755,12 +761,13 @@ export function generateHypothesis(data, filename = "binary") {
             null,
         decision:
             {}
-
     };
+
     const metadataDetection =
         detectEmbeddedMetadata(
             data
         );
+
     // --------------------------------------------------------
     // Path 1:
     // Embedded metadata reconstruction
@@ -769,18 +776,21 @@ export function generateHypothesis(data, filename = "binary") {
     if (
         metadataDetection.detected
     ) {
-
         const parsed =
             parseEmbeddedMetadata(data);
+
         result.metadata_fields =
             parsed.metadata_fields;
+
         result.channel_labels =
             parsed.channel_labels;
+
         result.reconstruction_instructions =
             buildReconstructionInstructions(
                 result.metadata_fields,
                 parsed.reconstruction_instructions_source
             );
+
         if (
             !result.reconstruction_instructions.samples ||
             !result.reconstruction_instructions.bytes_per_sample ||
@@ -789,24 +799,23 @@ export function generateHypothesis(data, filename = "binary") {
             result.decision = {
                 can_create_ir: false,
                 confidence: 0,
-                mode: "incomplete_reconstruction_instructions",
-                error: "Embedded metadata found but waveform reconstruction information is incomplete"
+                mode:
+                    "incomplete_reconstruction_instructions",
+                error:
+                    "Embedded metadata found but waveform reconstruction information is incomplete"
             };
 
             return result;
         }
 
-result.decision =
-{
-    can_create_ir: true,
-            confidence:
-                1.0,
+        result.decision = {
+            can_create_ir: true,
+            confidence: 1.0,
             mode:
                 "embedded_reconstruction_instructions"
-
         };
-        return result;
 
+        return result;
     }
 
     // --------------------------------------------------------
@@ -818,32 +827,27 @@ result.decision =
         findWaveformCandidate(
             data
         );
+
     if (candidate) {
-
-        result.arrays =
-        [
-
+        result.arrays = [
             candidate
-
         ];
+
         result.reconstruction_instructions =
             buildReconstructionInstructions(
                 [],
                 candidate
             );
-        result.decision =
-        {
 
-            can_create_ir:
-                true,
+        result.decision = {
+            can_create_ir: true,
             confidence:
                 candidate.confidence,
             mode:
                 "heuristic_reconstruction_instructions"
-
         };
-        return result;
 
+        return result;
     }
 
     // --------------------------------------------------------
@@ -851,24 +855,14 @@ result.decision =
     // Unknown binary
     // --------------------------------------------------------
 
-    result.decision =
-    {
-        can_create_ir:
-            false,
-        confidence:
-            0,
+    result.decision = {
+        can_create_ir: false,
+        confidence: 0,
         mode:
             "unknown_binary_layout",
         error:
             "Unable to determine waveform reconstruction instructions"
-
     };
+
     return result;
 }
-// ------------------------------------------------------------
-// Export
-// ------------------------------------------------------------
-//
-// module.exports = {
-//     generateHypothesis
-// };

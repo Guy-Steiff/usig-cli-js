@@ -141,7 +141,7 @@ export class IREngine {
     if (fileName.endsWith('.bin') || fileName.endsWith('.raw')) {
       const mapped = await mapBinaryToIRCandidate({
         filename: file.name,
-        data: Buffer.from(await file.arrayBuffer()),
+        bytes: new Uint8Array(await file.arrayBuffer()),
         hints: hints as Record<string, unknown>,
       });
 
