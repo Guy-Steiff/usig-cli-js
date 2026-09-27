@@ -52,6 +52,7 @@ const manifest: PluginManifest = {
 };
 
 export const dcinlPlugin: Plugin<DcinlParams> = {
+  manifest,
   id: 'dcinl',
   name: 'dcinl — DC INL/DNL (placeholder)',
   description: 'Multi-column ingestion placeholder: verifies codes + volts columns reach the plugin.',
