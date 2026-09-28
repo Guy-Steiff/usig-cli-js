@@ -298,22 +298,22 @@ const manifest: PluginManifest = {
        key: 'winCoherentGain',
        label: 'Coherent Gain',
        type: 'number',
-       description: 'Coherent power gain = (sum(w)/N)^2. -1 = use the IEEE table default for the selected window. Default 1.',
-       default: 1
+       description: 'Coherent power gain = (sum(w)/N)^2. -1 = use the IEEE table default for the selected window. Default -1.',
+       default: -1
      },
      {
        key: 'winEnbw',
        label: 'ENBW (bins)',
        type: 'number',
-       description: 'Equivalent Noise Bandwidth in bins. -1 = use the IEEE table default for the selected window. Default 1.',
-       default: 1
+       description: 'Equivalent Noise Bandwidth in bins. -1 = use the IEEE table default for the selected window. Default -1.',
+       default: -1
      },
      {
        key: 'winNHalfBins',
        label: 'Lobe Half-bins',
        type: 'number',
-       description: 'Lobe integration half-width in bins each side of the peak bin. -1 = use the IEEE table default for the selected window. Default 0.',
-       default: 0
+       description: 'Lobe integration half-width in bins each side of the peak bin. -1 = use the IEEE table default for the selected window. Default -1.',
+       default: -1
      },
      {
        key: 'tiCorrections',

@@ -2850,10 +2850,9 @@ function printPluginHelp(pluginId, plugin) {
       }
 
       if (
-        schemaEntry &&
-        schemaEntry.default !== undefined
+        field.default !== undefined
       ) {
-        console.log(`    Default: ${schemaEntry.default}`);
+        console.log(`    Default: ${field.default}`);
       }
 
       if (
